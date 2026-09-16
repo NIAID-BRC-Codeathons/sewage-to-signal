@@ -1,0 +1,89 @@
+# Build sae.sif on a native amd64 runner and publish it to GHCR.
+#
+# Why this exists: `apptainer build` needs root or --fakeroot, and HPC sites
+# commonly disable fakeroot — so on the cluster `pull` may be the only route
+# that works at all. Building here also spares every team member a local build
+# (~40 min under emulation on an Apple Silicon laptop; minutes natively here).
+#
+# The 3.2 GB of this image is almost entirely the CUDA stack; our own code is
+# 188 KB. So the trigger is deliberately narrow: only the files that change the
+# *environment* rebuild it. Code changes ride along via SAE_CODE, which shadows
+# the baked-in copy at run time — see container/README.md.
+name: container
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - requirements.txt
+      - container/sae.def
+      - .github/workflows/container.yml
+  pull_request:
+    paths:
+      - requirements.txt
+      - container/sae.def
+      - .github/workflows/container.yml
+  workflow_dispatch:
+
+env:
+  APPTAINER_VERSION: "1.5.3"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # A 5.6 GB sandbox plus a 3.2 GB SIF does not fit in the runner's stock
+      # free space. Without this the build fails late, with a confusing error.
+      - name: Free disk space
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/local/.ghcup \
+                      /usr/share/swift "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}"
+          sudo apt-get clean
+          df -h / | tail -1
+
+      - name: Install Apptainer
+        run: |
+          curl -fsSLO "https://github.com/apptainer/apptainer/releases/download/v${APPTAINER_VERSION}/apptainer_${APPTAINER_VERSION}_amd64.deb"
+          sudo apt-get update
+          sudo apt-get install -y "./apptainer_${APPTAINER_VERSION}_amd64.deb"
+          apptainer --version
+
+      # sae/ carries multi-GB parquet tables that are gitignored. Building from
+      # the working tree would sweep them in, so stage tracked files only —
+      # the same thing container/build.sh does, and it pins the image to a commit.
+      - name: Stage build context
+        run: |
+          mkdir -p /tmp/ctx
+          git archive HEAD | tar -x -C /tmp/ctx
+          du -sh /tmp/ctx
+
+      - name: Build
+        working-directory: /tmp/ctx
+        run: sudo apptainer build sae.sif container/sae.def
+
+      - name: Test
+        run: sudo apptainer test /tmp/ctx/sae.sif
+
+      - name: Image size
+        run: ls -lh /tmp/ctx/sae.sif | awk '{print $5}'
+
+      - name: Publish to GHCR
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # GHCR paths must be lowercase; the org name is not.
+          image="ghcr.io/$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')/sae"
+          echo "$GH_TOKEN" | sudo apptainer registry login \
+            --username "${{ github.actor }}" --password-stdin oras://ghcr.io
+          sudo apptainer push /tmp/ctx/sae.sif "oras://${image}:${GITHUB_SHA}"
+          sudo apptainer push /tmp/ctx/sae.sif "oras://${image}:latest"
+          echo "pushed ${image}:${GITHUB_SHA} and :latest"
+          echo "  container/build.sh pull   # to fetch it" >> "$GITHUB_STEP_SUMMARY"

@@ -3,9 +3,14 @@
 # what they allow.
 #
 #   container/build.sh              # pick the best available route
+#   container/build.sh pull         # fetch the prebuilt image from GHCR
 #   container/build.sh apptainer    # native, needs root or --fakeroot
 #   container/build.sh nested       # Apptainer inside Docker, for macOS
 #   container/build.sh remote       # Sylabs remote builder (needs `apptainer remote login`)
+#
+# On a cluster, prefer `pull`. Building needs root or --fakeroot and HPC sites
+# commonly disable fakeroot, so pulling may be the only route that works there.
+# CI publishes the image on changes to requirements.txt or sae.def.
 #
 # sae.def is the only recipe. Apptainer cannot build on macOS, so the nested
 # route runs Apptainer in a Docker container and produces the same .sif the
@@ -17,6 +22,8 @@ REPO="$(cd "$HERE/.." && pwd)"
 SIF="$HERE/sae.sif"
 # Carries Apptainer only; it is not a second recipe for this project.
 AP_IMAGE="${SAE_APPTAINER_IMAGE:-quay.io/singularity/singularity:v4.1.0}"
+# Published by .github/workflows/container.yml. GHCR paths are lowercase.
+ORAS="${SAE_ORAS:-oras://ghcr.io/niaid-brc-codeathons/sewage-to-signal/sae:latest}"
 
 route="${1:-auto}"
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -51,6 +58,19 @@ if [ "$route" = auto ]; then
 fi
 
 case "$route" in
+  pull)
+    if have apptainer || have singularity; then
+      AP=apptainer; have apptainer || AP=singularity
+      echo "[build] pull $ORAS"
+      "$AP" pull --force "$SIF" "$ORAS"
+    elif have docker; then
+      echo "[build] pull $ORAS (via apptainer in docker)"
+      docker run --rm --privileged --platform "${SAE_PLATFORM:-linux/amd64}" \
+        -v "$HERE:/out" "$AP_IMAGE" pull --force /out/sae.sif "$ORAS"
+    else
+      echo "error: need apptainer, singularity or docker on PATH." >&2; exit 127
+    fi
+    ;;
   apptainer)
     AP=apptainer; have apptainer || AP=singularity
     stage_context
@@ -84,11 +104,11 @@ esac
 if [ -f "$SIF" ]; then
   echo "[build] wrote $SIF ($(du -h "$SIF" | cut -f1))"
   echo "[build] self-check:"
-  if [ "$route" = nested ]; then
+  if have apptainer || have singularity; then
+    ${AP:-apptainer} test "$SIF" || echo "  (test reported problems — see above)"
+  else
     docker run --rm --privileged --platform "${SAE_PLATFORM:-linux/amd64}" \
       -v "$HERE:/mnt/sif" "$AP_IMAGE" test "/mnt/sif/$(basename "$SIF")" \
       || echo "  (test reported problems — see above)"
-  else
-    ${AP:-apptainer} test "$SIF" || echo "  (test reported problems — see above)"
   fi
 fi

@@ -34,6 +34,40 @@ actually being deployed to.
 So the Mac now runs Apptainer *inside* Docker and produces the same `.sif` the
 cluster runs. Docker is a host for Apptainer, never a second image format.
 
+## Getting the image
+
+On a cluster, **pull rather than build**. `apptainer build` needs root or
+`--fakeroot`, and HPC sites commonly disable fakeroot — so pulling may be the
+only route that works there at all.
+
+```bash
+container/build.sh pull         # fetch the prebuilt image from GHCR
+```
+
+`.github/workflows/container.yml` builds on a native amd64 runner and publishes
+to `ghcr.io/niaid-brc-codeathons/sewage-to-signal/sae`, tagged with the commit
+SHA and `latest`. `SAE_ORAS` points the pull somewhere else.
+
+The image is 3.21 GB, which rules out the usual GitHub routes — the 100 MB file
+limit for the repo itself, and the 2 GB per-file ceiling on both Git LFS and
+release assets. GHCR has no such limit and Apptainer speaks ORAS natively, so a
+`.sif` is a first-class registry artifact.
+
+Almost all of that size is the CUDA stack, and almost none of it is ours:
+
+| | uncompressed |
+|---|---|
+| `nvidia/*` (16 CUDA wheels) | 2.7 GB |
+| `torch` | 1.1 GB |
+| `triton` | 639 MB |
+| bioconda (megahit, mmseqs2, fastp) | 595 MB |
+| **this project's code** | **188 KB** |
+
+That ratio sets the rebuild policy. CI triggers only on `requirements.txt` and
+`sae.def` — the files that change the *environment* — because rebuilding and
+pushing 3.2 GB for a 188 KB code change is waste. Code changes ride along at
+run time via `SAE_CODE`, which shadows the baked-in copy.
+
 ## Build
 
 ```bash

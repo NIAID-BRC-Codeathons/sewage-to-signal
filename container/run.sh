@@ -53,7 +53,8 @@ if [ ! -f "$SIF" ]; then
   cat >&2 <<EOT
 error: image not found: $SIF
 
-  build it:        container/build.sh
+  fetch it:        container/build.sh pull     (prebuilt, from GHCR)
+  or build it:     container/build.sh
   or point at one: SAE_SIF=/shared/images/sae.sif container/run.sh ...
 EOT
   exit 1
