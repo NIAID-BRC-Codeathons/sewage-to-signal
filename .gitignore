@@ -19,6 +19,9 @@ data/fastq_rnaseq/.both
 # Pipeline outputs — all derived, regenerate with pipeline/run.py
 work/
 
+# Uploads staged by the web UI (sae/web/server.py --uploads)
+uploads/
+
 # Model weights live in ~/.cache/huggingface, but catch a local override too
 **/hf_cache/
 *.safetensors

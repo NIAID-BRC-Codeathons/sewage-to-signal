@@ -3,6 +3,7 @@
 #
 #   container/run.sh pipeline --fastq /data/fastq_rnaseq/x_1.fastq.gz \
 #                             --fastq2 /data/fastq_rnaseq/x_2.fastq.gz --sample S1
+#   container/run.sh web                 # progress UI on http://127.0.0.1:8765
 #   container/run.sh query --fasta /data/contig.fna --top-k 8
 #   container/run.sh manifest            # package versions baked into the image
 #   container/run.sh test                # self-check
@@ -35,6 +36,8 @@ ATLAS="${SAE_ATLAS:-$REPO/sae}"
 PY=/opt/venv/bin/python
 APP_PIPELINE="$PY /opt/sae/sae/pipeline/run.py"
 APP_QUERY="$PY /opt/sae/sae/sae_testing_script.py"
+APP_WEB="$PY /opt/sae/sae/web/server.py"
+PORT="${SAE_PORT:-8765}"
 
 RUNNER="${SAE_RUNTIME:-}"
 if [ -z "$RUNNER" ]; then
@@ -80,6 +83,12 @@ EOT
   case "$cmd" in
     pipeline) exec docker run "${ARGS[@]}" "$IMAGE" $APP_PIPELINE --work /work "$@" ;;
     query)    exec docker run "${ARGS[@]}" "$IMAGE" $APP_QUERY "$@" ;;
+    web)
+      # The server binds 0.0.0.0 inside its own network namespace; publish it
+      # to the host's loopback only, never 0.0.0.0 on the host.
+      echo "  http://127.0.0.1:$PORT" >&2
+      exec docker run "${ARGS[@]}" -p "127.0.0.1:$PORT:8765" \
+        "$IMAGE" $APP_WEB --port 8765 "$@" ;;
     manifest) exec docker run "${ARGS[@]}" "$IMAGE" cat /opt/image-manifest.txt ;;
     shell)    exec docker run "${ARGS[@]}" "$IMAGE" /bin/bash ;;
     test)
@@ -99,7 +108,7 @@ print(\"pyrodigal\", pyrodigal.__version__)"
           "import common, s01_qc, s02_assemble, s03_genes, s04_derep, \
 s05_prefilter, s06_embed, s07_match, run; print(\"all stages import\")"' ;;
     help|*)
-      sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
       echo "runtime: docker (image $IMAGE)" ;;
   esac
   exit $?
@@ -129,6 +138,7 @@ BINDS=(-B "$DATA:/data" -B "$HF:/hf" -B "$WORK:/work" -B "$ATLAS:/atlas")
 case "$cmd" in
   pipeline) exec $RUNNER run $NV "${BINDS[@]}" --app pipeline "$SIF" --work /work "$@" ;;
   query)    exec $RUNNER run $NV "${BINDS[@]}" --app query    "$SIF" "$@" ;;
+  web)      exec $RUNNER run     "${BINDS[@]}" --app web      "$SIF" --port "$PORT" "$@" ;;
   manifest) exec $RUNNER run     "${BINDS[@]}" --app manifest "$SIF" ;;
   test)     exec $RUNNER test    "$SIF" ;;
   shell)    exec $RUNNER shell   $NV "${BINDS[@]}" "$SIF" ;;

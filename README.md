@@ -76,6 +76,16 @@ python run.py --fastq ../../data/fastq_rnaseq/SRR38294894_1.fastq.gz \
 python run.py --contigs contigs.fa --sample S1 --from s03_genes
 ```
 
+Or drive it from a browser — progress for every run, plus upload-and-launch:
+
+```bash
+python sae/web/server.py      # http://127.0.0.1:8765
+container/run.sh web          # the same UI from inside the container
+```
+
+It reads the manifests each stage already writes, so runs started from the CLI
+show up too. See **[sae/web/README.md](sae/web/README.md)**.
+
 ## Layout
 
 ```
@@ -92,6 +102,7 @@ sae/
   README.md                   caveats, benchmarks, model choice
   codeathon_proposal.html     project proposal
   pipeline/                   s01…s07 + run.py, README
+  web/                        progress dashboard + run launcher (stdlib only)
 chicago_wastewater_sra*.{md,csv,txt}   cohort definition and accession list
 ```
 
