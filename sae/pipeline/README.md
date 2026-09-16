@@ -6,7 +6,7 @@ manifest, and is idempotent — re-running resumes rather than recomputes.
 
 ```
 s01_qc → s02_assemble → s03_genes → s04_derep → s05_prefilter → s06_embed → s07_match
- reads     contigs        proteins     nr.faa      dark.faa       parquet     clusters
+ reads     contigs        proteins     nr.faa     analyze.faa     parquet     clusters
 ```
 
 ## Why this shape
@@ -18,9 +18,48 @@ the measured 0.107 M seq/day would take ~12,000 years.
 
 So the pipeline is a funnel, and **s05_prefilter is the main lever**. Homology
 search is orders of magnitude cheaper than an ESMC-6B forward pass, and a
-protein with a confident family hit does not need an SAE to identify it. The
-SAE earns its cost only on the unannotated remainder, which is also the part
-you actually care about for surveillance.
+protein that is *fully explained* by a known family does not need an SAE. The
+SAE earns its cost on everything else, which is also the part you actually care
+about for surveillance.
+
+### The three classes
+
+A binary known/dark split discards too much. A hit can be statistically
+overwhelming and still explain almost none of the protein, so s05 sorts on
+**coverage** as well as significance:
+
+| Class | Test | Fate |
+|---|---|---|
+| `known` | confident hit **and** covers ≥ `--min-coverage` of the sequence | discarded |
+| `partial` | a hit exists, but it is weak **or** incomplete | analysed, **with** its family label |
+| `dark` | no significant hit | analysed, no prior |
+
+`known.faa`, `partial.faa` and `dark.faa` are all written for audit;
+`analyze.faa` (= partial + dark) is what flows to s06. A
+`classification.tsv` records `gene_id, category, family, family_acc, evalue,
+coverage, n_domains, aa_len` for every protein.
+
+Coverage is the union of *all* significant domain envelopes across *all*
+families, so a genuine multi-domain protein is correctly called complete rather
+than penalised for matching several models.
+
+The `partial` class is the interesting one. Those proteins carry a family
+label, which is the conditioning key for reference-relative comparison — "is
+this Spike unusual *for a Spike*" — as opposed to `dark`, which has no prior
+and can only be compared against the global atlas.
+
+Worked example, against a 150 aa HMM built from Spike residues 301–450:
+
+```
+gene_id        category  family         evalue     coverage  aa_len
+NC_045512.2_3  partial   SpikeFragment  7.17e-105  0.1178    1273
+```
+
+E=7e-105 is far past any confidence threshold, yet 88% of the protein is
+unaccounted for. Under the old binary rule this was `known` and thrown away.
+
+With Pfam-A, prefer `--bit-cutoffs gathering` — Pfam's curated per-family
+thresholds are a better significance test than any flat E-value.
 
 ## Usage
 
@@ -46,7 +85,7 @@ python s03_genes.py contigs.fa --sample S1      # stages run standalone too
 | s02_assemble | MEGAHIT / metaSPAdes | **requires external binary** |
 | s03_genes | pyrodigal | works, pure wheel |
 | s04_derep | exact hash; MMseqs2 if present | works (exact only without MMseqs2) |
-| s05_prefilter | pyhmmer (`--hmm`) or pyswrd (`--ref`) | works; pass-through if neither given |
+| s05_prefilter | pyhmmer (`--hmm`) or pyswrd (`--ref`) | works; three-class triage; pass-through if neither given |
 | s06_embed | ESMC + SAE | works |
 | s07_match | pyarrow join | works |
 
@@ -78,6 +117,12 @@ to run s06 over the 7.7 M atlas representatives once and build a real
 feature → cluster index. At the measured 300M throughput that is ~4 days on
 this Mac, far less on a GPU, and it replaces the 2.3% bridge with full
 coverage. **This is the highest-value next step.**
+
+**The `--ref`/pyswrd backend does not run on Apple Silicon.** `pyswrd.search`
+raises `RuntimeError: no supported SIMD backend available` via pyopal on arm64,
+so `--hmm` is the only working prefilter backend on this machine. When pyswrd
+does run, it yields coverage only if its result type carries query bounds;
+without them coverage stays `None` and the protein is never discarded.
 
 **Retrieval and interpretation need different models.** Matching a query to
 clusters only requires both sides use the *same* SAE — ESMC-300M is fine and

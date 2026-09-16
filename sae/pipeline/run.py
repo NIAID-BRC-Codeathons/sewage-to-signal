@@ -37,6 +37,10 @@ def main():
     p.add_argument("--min-aa", type=int, default=60)
     p.add_argument("--hmm", type=Path)
     p.add_argument("--ref", type=Path)
+    p.add_argument("--evalue", type=float, default=1e-5)
+    p.add_argument("--confident-evalue", type=float, default=1e-20)
+    p.add_argument("--min-coverage", type=float, default=0.80)
+    p.add_argument("--bit-cutoffs", choices=["gathering", "noise", "trusted"])
     p.add_argument("--top-k", type=int, default=16)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--limit", type=int, help="cap proteins sent to the GPU stage")
@@ -79,7 +83,10 @@ def main():
                 r = s04_derep.run(current, wd(stage), a.sample, force=a.force)
             elif stage == "s05_prefilter":
                 r = s05_prefilter.run(current, wd(stage), a.sample,
-                                      hmm=a.hmm, ref=a.ref, force=a.force)
+                                      hmm=a.hmm, ref=a.ref, evalue=a.evalue,
+                                      confident_evalue=a.confident_evalue,
+                                      min_coverage=a.min_coverage,
+                                      bit_cutoffs=a.bit_cutoffs, force=a.force)
             elif stage == "s06_embed":
                 r = s06_embed.run(current, wd(stage), a.sample, top_k=a.top_k,
                                   batch_size=a.batch_size, limit=a.limit,
