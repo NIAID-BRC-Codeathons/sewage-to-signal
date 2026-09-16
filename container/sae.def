@@ -73,7 +73,7 @@ From: ubuntu:24.04
       echo "micromamba: $(/usr/local/bin/micromamba --version 2>&1)"
       echo "--- bioconda ---"
       /usr/local/bin/micromamba list -p /opt/conda \
-        | awk 'NF>=2 && $1!="Name" && $1 !~ /^[-\xe2]/ {printf "%s==%s\n", $1, $2}'
+        | awk '$2 ~ /^[0-9]/ {printf "%s==%s\n", $1, $2}'
       echo
       echo "--- python packages ---"
       uv pip freeze --python /opt/venv/bin/python
