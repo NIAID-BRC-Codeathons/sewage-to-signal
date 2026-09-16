@@ -10,10 +10,32 @@ tells you what is present; each row names the target that fetches it.
 | ESMC-6B + SAE | 25 GB | `model-6b` | HF `biohub/ESMC-6B`, `…-sae-layer60-k64-codebook16384` |
 | SARS-CoV-2 amplicon FASTQ | 2.4 GB | `reads` | NCBI SRA via `data/fetch_fastq.sh` |
 | CASPER metagenome subsample | 100 MB | `rnaseq` | ENA stream via `data/subsample_rnaseq.sh` |
+| Pfam-A HMMs | 399 MB gz | `pfam` | EBI `ftp.ebi.ac.uk/pub/databases/Pfam/current_release` |
 | ESM Atlas cluster tables | 28.6 GB | `atlas` | AWS S3 `esm-protein-atlas` (public, unauthenticated) |
 
 Model weights go to `~/.cache/huggingface`, which is shared between checkouts,
 so a second clone of this repo re-downloads nothing.
+
+## Pfam-A
+
+`s05_prefilter` is a **pass-through without an HMM set** — every protein counts
+as dark and goes to the GPU stage, which is the expensive path the funnel exists
+to avoid. So this is not an optional extra for any real run:
+
+```bash
+./setup.sh pfam
+python run.py ... --hmm data/pfam/Pfam-A.hmm --bit-cutoffs gathering
+```
+
+Pfam-A is the right default because s05 asks *"is this already explained"* —
+breadth beats specificity, and a viral-only set such as VOGdb would leave every
+bacterial protein dark and flood s06. Pfam also ships curated per-family
+gathering thresholds, which `--bit-cutoffs gathering` uses in place of a flat
+E-value.
+
+The download is 399 MB compressed and is decompressed on arrival, since pyhmmer
+reads it uncompressed. `current_release` moves, so `relnotes.txt` is kept
+alongside to record which release was taken.
 
 ## Minimum to be useful
 

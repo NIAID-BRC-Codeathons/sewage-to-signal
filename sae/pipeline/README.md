@@ -18,7 +18,15 @@ CASPER alone is ~60.7 Tbp ≈ 400 billion reads, which at the measured
 
 So the pipeline is a funnel, and **s05_prefilter is the main lever**: homology
 search is orders of magnitude cheaper than an ESMC forward pass, and a protein
-*fully explained* by a known family does not need an SAE.
+*fully explained* by a known family does not need an SAE. It is also nearly
+free — the cost is scanning the HMM database, not the proteins, so 1148
+proteins took 10.1 s against 9.8 s for nine (Pfam-A 38.2, 30,134 models,
+4 threads).
+
+How much it actually removes depends entirely on the sample. On SARS-CoV-2 it
+discards 89%; on a real wastewater metagenome only **12.6%**, because most of
+what is there has no complete Pfam match. Do not plan a GPU budget assuming
+Pfam will do the work.
 
 ### The three classes
 
@@ -32,15 +40,18 @@ overwhelming and still explain almost none of the protein — so s05 sorts on
 | `partial` | a hit exists, but weak **or** incomplete | analysed, **with** its family label |
 | `dark` | no significant hit | analysed, no prior |
 
-Against a 150 aa HMM built from Spike residues 301–450:
+Measured against Pfam-A 38.2 with `--bit-cutoffs gathering`:
 
-```
-gene_id        category  family         evalue     coverage  aa_len
-NC_045512.2_3  partial   SpikeFragment  7.17e-105  0.1178    1273
-```
+| Sample | proteins | known | partial | dark |
+|---|---|---|---|---|
+| SARS-CoV-2 reference | 9 | 8 | 1 | 0 |
+| CHI-A wastewater contigs | 1148 | 145 (12.6%) | 295 | 708 |
 
-E=7e-105 is past any confidence threshold, yet 88% of the protein is
-unaccounted for. A binary rule calls that `known` and throws it away.
+The single SARS-CoV-2 `partial` is ORF1a: 17 Pfam domains, union coverage
+0.7553. A polyprotein matches many families and is still a quarter
+unaccounted for, so it goes to the SAE while the structural proteins —
+Spike at `CoV_S2` 0.8413, nucleocapsid at `CoV_nucleocap` 0.8854 — are
+discarded. A significance-only rule would have discarded ORF1a too.
 
 Coverage is the union of *all* significant domain envelopes across *all*
 families, so a genuine multi-domain protein is called complete rather than

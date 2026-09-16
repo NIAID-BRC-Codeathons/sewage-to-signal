@@ -9,6 +9,7 @@
 #   ./setup.sh model-6b     # ESMC-6B + SAE                   (~25 GB)
 #   ./setup.sh reads        # SARS-CoV-2 amplicon FASTQ       (~2.4 GB)
 #   ./setup.sh rnaseq       # CASPER metagenome subsample     (~100 MB)
+#   ./setup.sh pfam         # Pfam-A HMMs for the s05 triage  (~400 MB)
 #   ./setup.sh atlas        # ESM Atlas cluster tables        (~27 GB)
 #   ./setup.sh quickstart   # env + features + model-small + rnaseq  (~2 GB)
 #   ./setup.sh all          # everything except atlas
@@ -174,6 +175,38 @@ t_rnaseq() {
   fi
 }
 
+# --- Pfam ------------------------------------------------------------------
+# Without an HMM set, s05_prefilter is a pass-through: every protein counts as
+# dark and goes to the GPU stage, which is the expensive path. Pfam-A is the
+# right default because s05 asks "is this already explained", so breadth beats
+# specificity — a viral-only set would leave every bacterial protein dark.
+PFAM_URL="https://ftp.ebi.ac.uk/pub/databases/Pfam/current_release"
+PFAM_DIR="$ROOT/data/pfam"
+
+t_pfam() {
+  head2 "Pfam-A HMMs (~400 MB compressed)"
+  mkdir -p "$PFAM_DIR"
+  if [ -s "$PFAM_DIR/Pfam-A.hmm" ]; then
+    ok "Pfam-A.hmm present ($(human "$(wc -c <"$PFAM_DIR/Pfam-A.hmm" | tr -d ' ')"))"
+    return 0
+  fi
+  if [ ! -s "$PFAM_DIR/Pfam-A.hmm.gz" ]; then
+    say "  get  Pfam-A.hmm.gz"
+    curl -fL --retry 3 -o "$PFAM_DIR/Pfam-A.hmm.gz.part" "$PFAM_URL/Pfam-A.hmm.gz" \
+      || { bad "download failed"; rm -f "$PFAM_DIR/Pfam-A.hmm.gz.part"; return 1; }
+    mv "$PFAM_DIR/Pfam-A.hmm.gz.part" "$PFAM_DIR/Pfam-A.hmm.gz"
+  fi
+  # Keep the release notes: "current_release" moves, so record what was taken.
+  curl -fsL -o "$PFAM_DIR/relnotes.txt" "$PFAM_URL/relnotes.txt" 2>/dev/null || true
+  say "  decompress (pyhmmer needs it uncompressed)"
+  gzip -dc "$PFAM_DIR/Pfam-A.hmm.gz" > "$PFAM_DIR/Pfam-A.hmm.part" \
+    || { bad "decompress failed"; rm -f "$PFAM_DIR/Pfam-A.hmm.part"; return 1; }
+  mv "$PFAM_DIR/Pfam-A.hmm.part" "$PFAM_DIR/Pfam-A.hmm"
+  rm -f "$PFAM_DIR/Pfam-A.hmm.gz"
+  ok "Pfam-A.hmm ($(human "$(wc -c <"$PFAM_DIR/Pfam-A.hmm" | tr -d ' ')"))"
+  say "  ${D}use it: run.py --hmm data/pfam/Pfam-A.hmm --bit-cutoffs gathering${N}"
+}
+
 # --- ESM Atlas tables -------------------------------------------------------
 # Public, unauthenticated bucket. Object names and exact byte sizes are pinned
 # in data/atlas_manifest.tsv, so verification is exact rather than a size
@@ -293,6 +326,9 @@ t_status() {
   big_enough "$ROOT/data/fastq_rnaseq/SRR38294894_1.fastq.gz" 10000000 \
     && ok "CASPER subsample    present" || miss "CASPER subsample    ./setup.sh rnaseq"
 
+  big_enough "$ROOT/data/pfam/Pfam-A.hmm" 100000000 \
+    && ok "Pfam-A HMMs         present" || miss "Pfam-A HMMs         ./setup.sh pfam  (else s05 is a pass-through)"
+
   if [ -f "$MANIFEST" ]; then
     local atotal apend
     atotal=$(awk -F'\t' 'NR>1 && $1!=""' "$MANIFEST" | wc -l | tr -d ' ')
@@ -325,6 +361,7 @@ case "${1:-status}" in
   model-6b)    t_model_6b ;;
   reads)       t_reads ;;
   rnaseq)      t_rnaseq ;;
+  pfam)        t_pfam ;;
   atlas)       t_atlas ;;
   quickstart)  t_env; t_features; t_model_small; t_rnaseq; t_status ;;
   all)         t_env; t_features; t_model_small; t_model_6b; t_reads; t_rnaseq; t_status ;;

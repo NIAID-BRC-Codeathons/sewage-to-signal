@@ -16,6 +16,9 @@ data/fastq_rnaseq/.n1
 data/fastq_rnaseq/.n2
 data/fastq_rnaseq/.both
 
+# Pfam-A — ~400 MB compressed, larger on disk; fetch with ./setup.sh pfam
+data/pfam/
+
 # Pipeline outputs — all derived, regenerate with pipeline/run.py
 work/
 
