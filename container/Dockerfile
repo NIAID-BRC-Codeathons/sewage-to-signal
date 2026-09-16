@@ -5,7 +5,7 @@
 #       apptainer build sae.sif docker-archive://sae-docker.tar
 #   * local smoke-testing on a machine without Apptainer.
 # Keep the two files in step: same base, same install order, same paths.
-FROM --platform=linux/amd64 ubuntu:24.04
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     MAMBA_ROOT_PREFIX=/opt/conda \
@@ -24,8 +24,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Bioinformatics binaries: mmseqs2 is not in the Ubuntu archive, so bioconda
 # provides one resolver for all three.
 RUN mkdir -p /opt/conda \
-    && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
-       | tar -xvj -C /usr/local bin/micromamba \
+    && curl -fL -o /usr/local/bin/micromamba \
+         https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-linux-64 \
+    && chmod +x /usr/local/bin/micromamba \
     && /usr/local/bin/micromamba install -y -p /opt/conda \
          -c conda-forge -c bioconda megahit=1.2.9 mmseqs2=18.8cc5c fastp=1.3.7 \
     && /usr/local/bin/micromamba clean -y --all
@@ -43,7 +44,8 @@ COPY data/fetch_fastq.sh data/subsample_rnaseq.sh data/atlas_manifest.tsv /opt/s
 
 RUN { echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
       echo "python: $(/opt/venv/bin/python -V 2>&1)"; echo; \
-      echo "--- bioconda ---"; \
+echo "micromamba: $(/usr/local/bin/micromamba --version 2>&1)"; \
+            echo "--- bioconda ---"; \
       /usr/local/bin/micromamba list -p /opt/conda | awk 'NR>2 && $1!="" {printf "%s==%s\n", $1, $2}'; \
       echo; echo "--- pip ---"; /opt/venv/bin/python -m pip freeze 2>/dev/null; \
     } > /opt/image-manifest.txt \
