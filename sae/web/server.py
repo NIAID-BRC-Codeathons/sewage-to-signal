@@ -212,7 +212,8 @@ def preview(p: Path, limit: int) -> dict:
 
 # One definition of "read s06 output" and "normalise it", shared with the
 # reference-map builder so a run is projected exactly as the corpus was fitted.
-from launcher import NO_SCHEDULER, Job, failure_hint, make_launcher  # noqa: E402
+from launcher import (NO_SCHEDULER, Job, failure_hint,  # noqa: E402
+                      load_jobs, make_launcher, save_job)
 from reference_map import load as load_reference          # noqa: E402
 from reference_map import normalise, sparse_features      # noqa: E402
 
@@ -316,15 +317,20 @@ def stage_from_log(log: Path, live: bool) -> str | None:
 class Jobs:
     """Registry over a launcher. Submission and polling are the launcher's."""
 
-    def __init__(self, launcher):
+    def __init__(self, launcher, log_dir: Path):
         self.launcher = launcher
-        self._jobs: dict[str, Job] = {}
+        self.log_dir = log_dir
         self._lock = threading.Lock()
+        # Adopt anything from a previous session; the scheduler still knows
+        # about it, and its state is refreshed from there on the next poll.
+        self._jobs: dict[str, Job] = {
+            j.id: j for j in (load_jobs(log_dir) if launcher else [])}
 
     def submit(self, argv: list[str], sample: str, cwd: Path) -> Job:
         if self.launcher is None:
             raise RuntimeError(NO_SCHEDULER)
         job = self.launcher.submit(argv, sample, cwd)
+        save_job(job, self.log_dir)
         with self._lock:
             self._jobs[job.id] = job
         return job
@@ -873,7 +879,7 @@ def main():
         "jobs": Jobs(make_launcher(
             uploads / ".logs", partition=a.partition,
             account=a.account, cpus=a.job_cpus, mem=a.job_mem,
-            time_limit=a.job_time, gres=a.job_gres)),
+            time_limit=a.job_time, gres=a.job_gres), uploads / ".logs"),
     }
 
     where = f"{'docker' if IN_DOCKER else 'apptainer'} container" \

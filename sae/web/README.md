@@ -129,6 +129,11 @@ GET  /api/state      -> .launcher tells you which backend is in use
 POST /api/cancel?id= -> scancel, or terminate for a local fork
 ```
 
+Jobs survive a restart of the server. Each submission records its identity
+next to its log, and on start-up those are adopted and their state refreshed
+from the scheduler — otherwise restarting orphans a running job, which looks
+exactly like a failure even though the scheduler is still running it.
+
 Forking was wrong on a cluster twice over: the run died with the server, and it
 was confined to the *UI's* allocation, so a dashboard sized for browsing could
 never start real work. Submitting removes both problems and the sizing question

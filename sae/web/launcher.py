@@ -18,6 +18,7 @@ launch, which is a missing capability rather than a second code path.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -153,6 +154,41 @@ class SlurmLauncher:
                 "cpus": self.cpus, "mem": self.mem, "time": self.time_limit,
                 "gres": self.gres,
                 "queue": shutil.which("sbatch")}
+
+
+def save_job(job: Job, log_dir: Path) -> None:
+    """Record enough to adopt this job after a restart.
+
+    The scheduler outlives the server, so a job held only in memory is orphaned
+    by a restart: still running, but invisible — which looks exactly like a
+    failure.
+    """
+    try:
+        (log_dir / f"{job.id}.json").write_text(json.dumps({
+            "id": job.id, "sample": job.sample, "argv": job.argv,
+            "log": str(job.log), "started": job.started,
+            "backend": job.backend, "backend_id": job.backend_id,
+        }))
+    except OSError:
+        pass                      # losing the record must not fail the submit
+
+
+def load_jobs(log_dir: Path, limit: int = 200) -> list[Job]:
+    """Jobs from previous sessions, newest first. State is refreshed from the
+    scheduler afterwards, so what is stored here is only identity."""
+    out: list[Job] = []
+    if not log_dir.is_dir():
+        return out
+    for f in sorted(log_dir.glob("*.json"), key=lambda p: p.stat().st_mtime,
+                    reverse=True)[:limit]:
+        try:
+            d = json.loads(f.read_text())
+            out.append(Job(d["id"], d["sample"], d["argv"], Path(d["log"]),
+                           d["started"], d.get("backend", "slurm"),
+                           backend_id=d.get("backend_id")))
+        except (json.JSONDecodeError, OSError, KeyError, TypeError):
+            continue
+    return out
 
 
 def failure_hint(job: Job) -> str | None:
