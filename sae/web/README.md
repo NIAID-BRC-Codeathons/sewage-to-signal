@@ -26,6 +26,34 @@ Two sources, because neither alone is enough:
 So a run started from the CLI shows accurate completed stages but no live
 cursor; a run started from the UI shows both.
 
+## Viewing stage outputs
+
+Expanding a run lists the files in each stage directory; clicking one previews
+it. The point of the design is that **the frontend never learns a stage's
+schema.** The server normalises every artifact into one of three shapes:
+
+| shape | from | rendered as |
+|---|---|---|
+| `table` | `.parquet`, `.tsv`, `.csv` | columns + rows, whatever they are |
+| `json` | `.json` | pretty-printed |
+| `text` | `.faa`, `.fastq`, `.txt`, `.md`, `.log`, … | head of the file |
+
+So `s07_match` can add, drop or rename a column in `clusters.parquet` and the
+UI keeps working — it renders whatever columns come back. A new stage needs no
+frontend change either. And a stage that wants a curated summary rather than
+its raw output just drops a `.md` or `.tsv` into its work directory; it appears
+automatically, with arbitrary content.
+
+`.gz` is transparent, and the suffix underneath decides the shape, so
+`foo.tsv.gz` is still a table. Anything unrecognised is reported as `binary`
+with its size and no preview. Previews are bounded — 200 lines or 100 rows by
+default, `&limit=` to raise it, capped at 5000 — so opening a 30 GB FASTQ is
+cheap.
+
+Parquet needs `pyarrow`, which is a *pipeline* dependency, not a web one. It is
+imported only when a parquet is actually requested, so the server still runs
+where it is absent; you get a message in place of the table.
+
 ## Host vs container
 
 Paths, interpreter and bind address all differ, and the server detects which it
@@ -71,6 +99,8 @@ bound to localhost, and should not be exposed. Beyond that:
 |---|---|
 | `GET /api/state` | runs, jobs, stage list, roots, environment |
 | `GET /api/inputs` | files eligible to start a run |
+| `GET /api/artifacts?run=` | files in each stage directory, with shape and size |
+| `GET /api/preview?run=&stage=&file=&limit=` | one artifact as text, table or json |
 | `GET /api/log?id=` | tail of a job's log |
 | `POST /api/upload?name=` | raw body is the file; no multipart, so no `cgi` |
 | `POST /api/run` | JSON `{sample, input_kind, input_path, input_path2?, options}` |

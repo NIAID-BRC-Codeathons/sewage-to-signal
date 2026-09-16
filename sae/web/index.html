@@ -73,6 +73,22 @@
   .empty{color:var(--dim);font-size:13px;font-style:italic}
   details summary{cursor:pointer;color:var(--dim);font-size:12px;
                   font-family:var(--mono);margin-top:6px}
+  .files{display:flex;gap:5px;flex-wrap:wrap;padding:4px 0 8px}
+  .chip{font:11px var(--mono);padding:3px 8px;border-radius:4px;cursor:pointer;
+        border:1px solid var(--line);background:var(--bg);color:var(--dim)}
+  .chip:hover{color:var(--ink);border-color:var(--dim)}
+  .chip.on{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+  .chip.binary{opacity:.5;cursor:not-allowed}
+  .preview{margin-top:10px;border-top:1px dashed var(--line);padding-top:10px}
+  .preview .cap{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;
+                margin-bottom:6px}
+  .scroll{overflow:auto;max-height:340px;border:1px solid var(--line);
+          border-radius:5px;background:var(--bg)}
+  .scroll table{font-size:11.5px}
+  .scroll td,.scroll th{padding:4px 10px 4px 6px;white-space:nowrap;
+                        max-width:340px;overflow:hidden;text-overflow:ellipsis}
+  .scroll th{position:sticky;top:0;background:var(--panel)}
+  .scroll pre{border:0;margin:0;max-height:none}
 </style>
 </head>
 <body>
@@ -143,6 +159,14 @@
 <script>
 const $ = id => document.getElementById(id);
 let STAGES = [], openRun = null, openJob = null, readOnly = false;
+// Artifact browsing. The server normalises every file to text / table / json,
+// so nothing here knows a stage's schema — a stage can change its columns, or
+// a new stage appear, with no change to this file.
+let artifacts = {}, pendingArtifacts = {}, sel = null, selData = null;
+
+const esc = v => String(v == null ? "" : v)
+  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  .replace(/"/g, "&quot;");
 
 const fmtBytes = n => n == null ? "—" :
   n < 1024 ? n + " B" : n < 1048576 ? (n/1024).toFixed(1) + " KB" :
@@ -168,17 +192,82 @@ function stageCells(run, activeStage) {
   }).join("");
 }
 
+function renderFiles(runId, stage) {
+  const files = (artifacts[runId] || {})[stage];
+  if (!files) return "";
+  return `<div class="files">` + files.map(f => {
+    const on = sel && sel.run === runId && sel.stage === stage && sel.file === f.name;
+    const cls = "chip" + (f.kind === "binary" ? " binary" : "") + (on ? " on" : "");
+    return `<span class="${cls}" data-run="${esc(runId)}" data-stage="${esc(stage)}" ` +
+           `data-file="${esc(f.name)}" title="${esc(f.kind)} · ${fmtBytes(f.bytes)}">` +
+           `${esc(f.name)}</span>`;
+  }).join("") + `</div>`;
+}
+
+function renderPreview() {
+  if (!sel) return "";
+  const head = `<div class="cap"><span class="name">${esc(sel.file)}</span>` +
+    (selData ? `<span class="sub">${esc(selData.kind)} · ${fmtBytes(selData.bytes)}` +
+      (selData.kind === "table"
+        ? ` · showing ${selData.rows.length}` +
+          (selData.total_rows ? ` of ${selData.total_rows}` : "") + ` rows`
+        : "") + `</span>` : `<span class="sub">loading…</span>`) + `</div>`;
+  if (!selData) return `<div class="preview">${head}</div>`;
+  let body;
+  if (selData.kind === "table") {
+    body = `<div class="scroll"><table><tr>` +
+      selData.columns.map(c => `<th>${esc(c)}</th>`).join("") + `</tr>` +
+      selData.rows.map(r => `<tr>` +
+        r.map(v => `<td title="${esc(v)}">${esc(v)}</td>`).join("") + `</tr>`).join("") +
+      `</table></div>`;
+  } else if (selData.kind === "json") {
+    body = `<div class="scroll"><pre>${esc(JSON.stringify(selData.json, null, 2))}</pre></div>`;
+  } else {
+    body = `<div class="scroll"><pre>${esc(selData.text || "")}</pre></div>`;
+  }
+  return `<div class="preview">${head}${body}</div>`;
+}
+
 function renderDetail(run) {
+  const known = artifacts[run.id];
   const rows = STAGES.filter(s => run.stages[s]).map(s => {
     const d = run.stages[s];
-    if (d.state !== "done") return `<tr><td class="k">${s}</td><td colspan="3">${d.state}</td></tr>`;
+    const files = renderFiles(run.id, s);
+    const fileRow = files ? `<tr><td colspan="4">${files}</td></tr>` : "";
+    if (d.state !== "done")
+      return `<tr><td class="k">${esc(s)}</td><td colspan="3">${esc(d.state)}</td></tr>${fileRow}`;
     const stats = Object.entries(d.stats).map(([k, v]) => `${k}=${v}`).join("  ");
-    return `<tr><td class="k">${s}</td><td>${fmtSecs(d.seconds)}</td>` +
-           `<td>${d.output} <span class="sub">${fmtBytes(d.bytes)}</span></td>` +
-           `<td>${stats || "—"}</td></tr>`;
+    return `<tr><td class="k">${esc(s)}</td><td>${fmtSecs(d.seconds)}</td>` +
+           `<td>${esc(d.output)} <span class="sub">${fmtBytes(d.bytes)}</span></td>` +
+           `<td>${esc(stats || "—")}</td></tr>${fileRow}`;
   }).join("");
+  const note = known ? "" : `<p class="empty">loading files…</p>`;
   return `<div class="detail"><table><tr><th>stage</th><th>time</th>` +
-         `<th>output</th><th>stats</th></tr>${rows}</table></div>`;
+         `<th>output</th><th>stats</th></tr>${rows}</table>${note}` +
+         renderPreview() + `</div>`;
+}
+
+async function loadArtifacts(runId) {
+  if (artifacts[runId] || pendingArtifacts[runId]) return;
+  pendingArtifacts[runId] = true;
+  try {
+    const d = await api("/api/artifacts?run=" + encodeURIComponent(runId));
+    artifacts[runId] = d.stages;
+    refresh();
+  } catch (e) { artifacts[runId] = {}; }
+  delete pendingArtifacts[runId];
+}
+
+async function selectFile(run, stage, file) {
+  if (sel && sel.run === run && sel.stage === stage && sel.file === file) {
+    sel = null; selData = null; refresh(); return;
+  }
+  sel = {run, stage, file}; selData = null; refresh();
+  try {
+    selData = await api(`/api/preview?run=${encodeURIComponent(run)}` +
+      `&stage=${encodeURIComponent(stage)}&file=${encodeURIComponent(file)}`);
+  } catch (e) { selData = {kind: "text", text: e.message, bytes: 0}; }
+  refresh();
 }
 
 function renderRuns(runs, jobs) {
@@ -198,8 +287,16 @@ function renderRuns(runs, jobs) {
     </div>`;
   }).join("");
   el.querySelectorAll(".run").forEach(n => n.onclick = () => {
-    openRun = openRun === n.dataset.id ? null : n.dataset.id; refresh();
+    openRun = openRun === n.dataset.id ? null : n.dataset.id;
+    if (!openRun) { sel = null; selData = null; }
+    refresh();
   });
+  el.querySelectorAll(".chip").forEach(n => n.onclick = ev => {
+    ev.stopPropagation();                       // do not collapse the run
+    if (n.classList.contains("binary")) return;
+    selectFile(n.dataset.run, n.dataset.stage, n.dataset.file);
+  });
+  if (openRun) loadArtifacts(openRun);
 }
 
 function renderJobs(jobs) {

@@ -72,6 +72,17 @@ LOG_TAIL = 64 * 1024
 MAX_LISTING = 500
 SEQ_SUFFIXES = (".gz", ".fa", ".fasta", ".fna", ".faa", ".fastq")
 
+# Artifact preview. The frontend knows only three shapes - text, table, json -
+# and never a stage's schema, so a stage may change its columns, or a new stage
+# may appear, without touching any JavaScript. A stage that wants a curated
+# summary just drops a .md or .tsv in its work directory and it shows up.
+TEXT_SUFFIXES = (".faa", ".fa", ".fasta", ".fna", ".fastq", ".txt", ".md",
+                 ".log", ".err", ".out", ".sam", ".gfa", ".bed")
+TABLE_SUFFIXES = (".tsv", ".csv", ".parquet")
+PREVIEW_LINES = 200
+PREVIEW_ROWS = 100
+PREVIEW_BYTES = 2 * 1024**2
+
 # Options forwarded to run.py. Anything not listed here is rejected, so the
 # request body can never introduce a new flag.
 OPTIONS: dict[str, type] = {
@@ -109,6 +120,82 @@ def defaults() -> dict:
 # --------------------------------------------------------------------------
 # reading pipeline state
 # --------------------------------------------------------------------------
+def _inner_suffix(p: Path) -> str:
+    """Suffix ignoring a trailing .gz, so foo.tsv.gz reads as a table."""
+    return (p.suffixes[-2] if p.suffix == ".gz" and len(p.suffixes) > 1
+            else p.suffix).lower()
+
+
+def artifact_kind(p: Path) -> str:
+    suf = _inner_suffix(p)
+    if suf == ".json":
+        return "json"
+    if suf in TABLE_SUFFIXES:
+        return "table"
+    if suf in TEXT_SUFFIXES:
+        return "text"
+    return "binary"
+
+
+def _open_text(p: Path):
+    import gzip
+    return gzip.open(p, "rt", errors="replace") if p.suffix == ".gz" \
+        else open(p, "r", errors="replace")
+
+
+def preview(p: Path, limit: int) -> dict:
+    """Normalise any artifact into text, table or json. Never stage-specific."""
+    kind = artifact_kind(p)
+    if kind == "json":
+        raw = p.read_bytes()[:PREVIEW_BYTES]
+        try:
+            return {"kind": "json", "json": json.loads(raw)}
+        except json.JSONDecodeError:
+            return {"kind": "text", "text": raw.decode(errors="replace")}
+
+    if kind == "table":
+        suf = _inner_suffix(p)
+        if suf == ".parquet":
+            # pyarrow is a pipeline dependency, not a web one. Import it only
+            # when a parquet is actually asked for, so the server still runs
+            # anywhere without it.
+            try:
+                import pyarrow.parquet as pq
+            except ImportError:
+                return {"kind": "text",
+                        "text": "pyarrow is not installed, so this parquet "
+                                "cannot be previewed here."}
+            f = pq.ParquetFile(p)
+            cols = [c.name for c in f.schema_arrow]
+            rows: list[list] = []
+            for batch in f.iter_batches(batch_size=min(limit, 1000)):
+                for row in batch.to_pylist():
+                    rows.append([row.get(c) for c in cols])
+                    if len(rows) >= limit:
+                        break
+                if len(rows) >= limit:
+                    break
+            return {"kind": "table", "columns": cols, "rows": rows,
+                    "total_rows": f.metadata.num_rows}
+        import csv
+        delim = "\t" if suf == ".tsv" else ","
+        with _open_text(p) as fh:
+            r = csv.reader(fh, delimiter=delim)
+            try:
+                cols = next(r)
+            except StopIteration:
+                return {"kind": "table", "columns": [], "rows": []}
+            rows = [row for _, row in zip(range(limit), r)]
+        return {"kind": "table", "columns": cols, "rows": rows}
+
+    if kind == "text":
+        with _open_text(p) as fh:
+            lines = [ln.rstrip("\n") for _, ln in zip(range(limit), fh)]
+        return {"kind": "text", "text": "\n".join(lines)}
+
+    return {"kind": "binary", "text": f"{p.name} is not a previewable format."}
+
+
 def _summarise(mf: Path) -> dict | None:
     try:
         d = json.loads(mf.read_text())
@@ -357,6 +444,16 @@ class Handler(BaseHTTPRequestHandler):
                                "log": data.decode(errors="replace")})
         if u.path == "/api/inputs":
             return self._json({"files": self._candidate_inputs()})
+        if u.path == "/api/artifacts":
+            return self._artifacts((q.get("run") or [""])[0])
+        if u.path == "/api/preview":
+            try:
+                limit = int((q.get("limit") or ["0"])[0]) or PREVIEW_ROWS
+            except ValueError:
+                limit = PREVIEW_ROWS
+            return self._preview((q.get("run") or [""])[0],
+                                 (q.get("stage") or [""])[0],
+                                 (q.get("file") or [""])[0], limit)
         return self._err(404, "not found")
 
     def do_POST(self):
@@ -388,6 +485,61 @@ class Handler(BaseHTTPRequestHandler):
                 seen.add(sp)
                 out.append({"path": sp, "name": p.name, "bytes": p.stat().st_size})
         return out
+
+    def _run_dir(self, run_id: str) -> Path:
+        """Resolve '<root index>:<sample>' to a sample directory, or raise."""
+        idx, _, sample = run_id.partition(":")
+        roots = self.cfg["roots"]
+        if not idx.isdigit() or not SAFE_NAME.match(sample):
+            raise ValueError("bad run id")
+        i = int(idx)
+        if i >= len(roots):
+            raise ValueError("bad run id")
+        d = (roots[i] / sample).resolve()
+        if roots[i] not in d.parents or not d.is_dir():
+            raise ValueError("no such run")
+        return d
+
+    def _artifacts(self, run_id: str):
+        try:
+            run_dir = self._run_dir(run_id)
+        except ValueError as exc:
+            return self._err(404, str(exc))
+        out: dict[str, list] = {}
+        for stage in STAGES:
+            sd = run_dir / stage
+            if not sd.is_dir():
+                continue
+            files = []
+            for f in sorted(sd.iterdir()):
+                if not f.is_file() or f.name.startswith("."):
+                    continue
+                files.append({"name": f.name, "bytes": f.stat().st_size,
+                              "kind": artifact_kind(f)})
+            if files:
+                out[stage] = files
+        return self._json({"run": run_id, "stages": out})
+
+    def _preview(self, run_id: str, stage: str, name: str, limit: int):
+        try:
+            run_dir = self._run_dir(run_id)
+        except ValueError as exc:
+            return self._err(404, str(exc))
+        if stage not in STAGES:
+            return self._err(400, "unknown stage")
+        if "/" in name or "\\" in name or not SAFE_NAME.match(name):
+            return self._err(400, "bad filename")
+        p = (run_dir / stage / name).resolve()
+        if run_dir not in p.parents or not p.is_file():
+            return self._err(404, "no such artifact")
+        limit = max(1, min(limit, 5000))
+        try:
+            body = preview(p, limit)
+        except Exception as exc:                 # a corrupt artifact is data,
+            return self._err(422, f"cannot preview: {exc}")   # not a crash
+        body.update({"name": name, "stage": stage,
+                     "bytes": p.stat().st_size, "limit": limit})
+        return self._json(body)
 
     def _upload(self, name: str):
         if not self._guard_writes():
