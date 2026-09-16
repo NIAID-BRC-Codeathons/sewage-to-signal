@@ -121,7 +121,8 @@ expected by chance — along a known → partial → dark gradient.
 ## Where runs execute
 
 The server does not run the pipeline. It **submits** it, and polls the
-scheduler — `sbatch` when it is on PATH, otherwise a local fork.
+scheduler. There is exactly one execution path: `sbatch`. Nothing is ever
+forked from the server.
 
 ```
 GET  /api/state      -> .launcher tells you which backend is in use
@@ -130,8 +131,15 @@ POST /api/cancel?id= -> scancel, or terminate for a local fork
 
 Forking was wrong on a cluster twice over: the run died with the server, and it
 was confined to the *UI's* allocation, so a dashboard sized for browsing could
-never start real work. Submitting removes both problems and the sizing
-question with them.
+never start real work. Submitting removes both problems and the sizing question
+with them.
+
+There was briefly a local fork as a fallback. It is gone — two execution paths
+meant the deployment changed shape depending on where it ran, and the default
+quietly chose the weaker one. **Without a scheduler the server still serves the
+dashboard** (reading manifests needs nothing) and refuses to launch with a
+message saying how to get one. That is a missing capability, not a second code
+path.
 
 **Run the server on the login node.** It only reads manifests and submits, so
 it needs no allocation — one long-lived lightweight process, with every

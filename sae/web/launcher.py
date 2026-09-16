@@ -5,15 +5,15 @@ wrong twice over: the run dies with the server, and it is confined to whatever
 allocation the *UI* was given, so a dashboard sized for browsing cannot start
 real work. Runs are submitted to a scheduler instead.
 
-Two backends behind one interface, chosen by whether ``sbatch`` is on PATH:
+There is exactly one way a run executes: ``sbatch``. There used to be a local
+fork as a fallback, which meant two execution paths to keep working and a
+default that quietly chose the weaker one — the deployment changed shape
+depending on where it ran, so what you tested was not what you deployed.
 
-* ``SlurmLauncher``  - submits with ``sbatch``, polls ``squeue`` then ``sacct``.
-* ``LocalLauncher``  - forks, for a machine with no scheduler at all.
-
-The point of keeping both is that the deployment should not change shape
-between a laptop and a cluster. Running SLURM locally (``container/slurm-local``)
-gets you the scheduler path everywhere, so what you test is what you deploy;
-the local fork remains for when even that is unavailable.
+Where there is no cluster, run one: ``container/slurm-local`` starts SLURM and
+Apptainer in Docker and puts ``sbatch`` on PATH. Without a scheduler the server
+still serves the dashboard — reading manifests needs nothing — and refuses to
+launch, which is a missing capability rather than a second code path.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ import signal
 import subprocess
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 STATE_RUNNING = "running"
@@ -51,48 +51,9 @@ class Job:
     ended: float | None = None
     _state: str = STATE_RUNNING
     _rc: int | None = None
-    proc: subprocess.Popen | None = field(default=None, repr=False)
 
     def elapsed(self) -> float:
         return round((self.ended or time.time()) - self.started, 1)
-
-
-class LocalLauncher:
-    """Fork the run as a child of the server. No queue, no wall clock."""
-
-    name = "local"
-
-    def __init__(self, log_dir: Path):
-        self.log_dir = log_dir
-
-    def submit(self, argv: list[str], sample: str, cwd: Path) -> Job:
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        jid = uuid.uuid4().hex[:12]
-        log = self.log_dir / f"{jid}.log"
-        fh = open(log, "w", buffering=1)
-        fh.write(f"$ {shlex.join(argv)}\n\n")
-        proc = subprocess.Popen(argv, cwd=str(cwd), stdout=fh,
-                                stderr=subprocess.STDOUT, text=True)
-        return Job(jid, sample, argv, log, time.time(), self.name, proc=proc)
-
-    def refresh(self, job: Job) -> None:
-        rc = job.proc.poll() if job.proc else None
-        if rc is None:
-            job._state = STATE_RUNNING
-            return
-        if job.ended is None:
-            job.ended = time.time()
-        job._rc = rc
-        job._state = STATE_FINISHED if rc == 0 else STATE_FAILED
-
-    def cancel(self, job: Job) -> bool:
-        if job.proc and job.proc.poll() is None:
-            job.proc.terminate()
-            return True
-        return False
-
-    def describe(self) -> dict:
-        return {"backend": self.name, "queue": None}
 
 
 class SlurmLauncher:
@@ -210,14 +171,21 @@ def failure_hint(job: Job) -> str | None:
     return f"killed by {name}"
 
 
-def make_launcher(log_dir: Path, prefer: str = "auto", **slurm_kw):
-    """slurm when sbatch is on PATH, else a local fork. 'prefer' forces one."""
-    if prefer not in ("auto", "slurm", "local"):
-        raise ValueError("launcher must be auto, slurm or local")
-    has_sbatch = shutil.which("sbatch") is not None
-    if prefer == "slurm" and not has_sbatch:
-        raise RuntimeError("--launcher slurm but sbatch is not on PATH; "
-                           "see container/slurm-local to run one locally")
-    if prefer == "local" or (prefer == "auto" and not has_sbatch):
-        return LocalLauncher(log_dir)
+NO_SCHEDULER = (
+    "no scheduler: sbatch is not on PATH, and runs are only ever submitted, "
+    "never forked from this server. Start one locally with "
+    "`container/slurm-local/up.sh` then "
+    "`eval \"$(container/slurm-local/up.sh env)\"`, or run this server on a "
+    "login node."
+)
+
+
+def make_launcher(log_dir: Path, **slurm_kw):
+    """A SlurmLauncher, or None when there is no sbatch to submit to.
+
+    None is deliberate: the dashboard still works without a scheduler, so the
+    server starts and only launching is unavailable.
+    """
+    if shutil.which("sbatch") is None:
+        return None
     return SlurmLauncher(log_dir, **slurm_kw)

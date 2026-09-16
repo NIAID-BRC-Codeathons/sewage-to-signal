@@ -212,7 +212,7 @@ def preview(p: Path, limit: int) -> dict:
 
 # One definition of "read s06 output" and "normalise it", shared with the
 # reference-map builder so a run is projected exactly as the corpus was fitted.
-from launcher import Job, failure_hint, make_launcher    # noqa: E402
+from launcher import NO_SCHEDULER, Job, failure_hint, make_launcher  # noqa: E402
 from reference_map import load as load_reference          # noqa: E402
 from reference_map import normalise, sparse_features      # noqa: E402
 
@@ -322,6 +322,8 @@ class Jobs:
         self._lock = threading.Lock()
 
     def submit(self, argv: list[str], sample: str, cwd: Path) -> Job:
+        if self.launcher is None:
+            raise RuntimeError(NO_SCHEDULER)
         job = self.launcher.submit(argv, sample, cwd)
         with self._lock:
             self._jobs[job.id] = job
@@ -340,6 +342,8 @@ class Jobs:
         }
 
     def all(self) -> list[dict]:
+        if self.launcher is None:
+            return []
         with self._lock:
             jobs = list(self._jobs.values())
         return sorted((self._as_dict(j) for j in jobs),
@@ -452,7 +456,9 @@ class Handler(BaseHTTPRequestHandler):
                 "uploads": str(self.cfg["uploads"]),
                 "container": "docker" if IN_DOCKER else
                              ("apptainer" if IN_APPTAINER else None),
-                "launcher": self.cfg["jobs"].launcher.describe(),
+                "launcher": (self.cfg["jobs"].launcher.describe()
+                             if self.cfg["jobs"].launcher
+                             else {"backend": None, "reason": NO_SCHEDULER}),
             })
         if u.path == "/api/log":
             job = self.cfg["jobs"].get((q.get("id") or [""])[0])
@@ -779,6 +785,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._err(400, str(exc))
         if runner == "python" and not Path(self.cfg["python"]).is_file():
             return self._err(500, f"interpreter not found: {self.cfg['python']}")
+        if self.cfg["jobs"].launcher is None:
+            return self._err(503, NO_SCHEDULER)
         try:
             job = self.cfg["jobs"].submit(
                 argv, sample, REPO if runner == "container" else PIPELINE)
@@ -805,11 +813,6 @@ def main():
     p.add_argument("--python", default=d["python"])
     p.add_argument("--host", default=d["host"])
     p.add_argument("--port", type=int, default=8765)
-    p.add_argument("--launcher", choices=["auto", "slurm", "local"],
-                   default="auto",
-                   help="auto uses sbatch when it is on PATH. A run submitted "
-                        "to SLURM outlives this server and gets its own "
-                        "allocation; a local one does neither")
     p.add_argument("--partition")
     p.add_argument("--account")
     p.add_argument("--job-cpus", type=int, default=4)
@@ -853,7 +856,7 @@ def main():
         # A run may only read from these; see checked_path.
         "allowed": [uploads, *data, *roots],
         "jobs": Jobs(make_launcher(
-            uploads / ".logs", prefer=a.launcher, partition=a.partition,
+            uploads / ".logs", partition=a.partition,
             account=a.account, cpus=a.job_cpus, mem=a.job_mem,
             time_limit=a.job_time, gres=a.job_gres)),
     }
@@ -865,14 +868,17 @@ def main():
     print(f"  data       : {', '.join(str(r) for r in data)}")
     print(f"  uploads    : {uploads}")
     print(f"  interpreter: {a.python}")
-    _l = Handler.cfg["jobs"].launcher.describe()
     print(f"  job runner : {runner}"
           + ("" if runner == "container" else
              "  — needs this interpreter visible on the compute node"))
-    print(f"  launcher   : {_l['backend']}"
-          + (f" ({_l.get('cpus')} cpus, {_l.get('mem')}, {_l.get('time')})"
-             if _l["backend"] == "slurm" else
-             "  — runs are children of this server and die with it"))
+    _lr = Handler.cfg["jobs"].launcher
+    if _lr is None:
+        print("  launcher   : none — browsing works, launching does not")
+        print(f"               {NO_SCHEDULER}")
+    else:
+        _l = _lr.describe()
+        print(f"  launcher   : slurm ({_l['cpus']} cpus, {_l['mem']}, "
+              f"{_l['time']})")
     if a.read_only:
         print("  mode       : read-only (upload and launch disabled)")
     # A non-loopback bind is only alarming when this process is what decides
