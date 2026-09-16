@@ -184,7 +184,7 @@ let artifacts = {}, pendingArtifacts = {}, sel = null, selData = null;
 let jobLog = {};                 // job id -> last fetched log text
 // Feature map: s06's top-K vectors reduced to 2D. Fetched only when asked,
 // because t-SNE over a thousand proteins takes seconds.
-let mapRun = null, mapMethod = "umap", mapData = null, mapErr = null, mapHover = null;
+let mapRun = null, mapMode = "reference", mapData = null, mapErr = null, mapHover = null;
 const GROUP_COLOR = {dark: "var(--accent)", partial: "var(--warn)",
                      known: "var(--dim)"};
 
@@ -277,37 +277,51 @@ function renderPreview() {
 function renderMap(run) {
   const open = mapRun === run.id;
   const bar = `<div class="map-bar">
-      <span class="seg">${["umap", "tsne", "svd"].map(m =>
-        `<button data-map="${esc(run.id)}" data-method="${m}"
-          class="${open && mapMethod === m ? "on" : ""}">${m}</button>`).join("")}</span>
+      <span class="seg">${[["reference", "shared map"], ["run", "this run only"]]
+        .map(([m, label]) =>
+        `<button data-map="${esc(run.id)}" data-mode="${m}"
+          class="${open && mapMode === m ? "on" : ""}">${label}</button>`).join("")}</span>
       ${open && mapData ? `<span>${mapData.n} proteins · ${mapData.shared_features}`
         + `/${mapData.distinct_features} features shared `
         + `(${Math.round(mapData.shared_frac * 100)}%)</span>` : ""}
+      ${open && mapData && mapData.reference
+        ? `<span class="key"><i style="background:var(--line)"></i>`
+          + `${mapData.reference.n} reference</span>` : ""}
+      ${open && mapData && mapData.mode === "run"
+        ? `<span class="msg err">fitted on this run alone — not comparable `
+          + `with other runs</span>` : ""}
+      ${open && mapData && mapData.reference && mapData.reference.version_drift
+        ? `<span class="msg err">reference built with different library `
+          + `versions</span>` : ""}
       ${open && mapData ? Object.keys(GROUP_COLOR)
         .filter(g => mapData.groups.includes(g))
         .map(g => `<span class="key"><i style="background:${GROUP_COLOR[g]}"></i>${g}</span>`)
         .join("") : ""}
       ${mapHover ? `<span class="name">${esc(mapHover)}</span>` : ""}
     </div>`;
-  if (!open) return `<div class="map">${bar}<p class="empty">Pick a method to
-    project this run's SAE features to 2D.</p></div>`;
+  if (!open) return `<div class="map">${bar}<p class="empty">Plot this run's
+    SAE features on the shared UMAP layout.</p></div>`;
   if (mapErr) return `<div class="map">${bar}<p class="msg err">${esc(mapErr)}</p></div>`;
   if (!mapData) return `<div class="map">${bar}<p class="empty">projecting…</p></div>`;
 
   const W = 760, H = 420, pad = 26;
-  const xs = mapData.points.map(p => p.x), ys = mapData.points.map(p => p.y);
+  const all = mapData.points.concat(mapData.context || []);
+  const xs = all.map(p => p.x), ys = all.map(p => p.y);
   const x0 = Math.min(...xs), x1 = Math.max(...xs);
   const y0 = Math.min(...ys), y1 = Math.max(...ys);
   const sx = v => pad + (x1 === x0 ? 0.5 : (v - x0) / (x1 - x0)) * (W - 2 * pad);
   // SVG y grows downward; flip so the plot reads the usual way up.
   const sy = v => H - pad - (y1 === y0 ? 0.5 : (v - y0) / (y1 - y0)) * (H - 2 * pad);
+  const ctx = (mapData.context || []).map(p =>
+    `<circle cx="${sx(p.x).toFixed(1)}" cy="${sy(p.y).toFixed(1)}" r="1.6"
+      fill="var(--line)" fill-opacity="0.55"/>`).join("");
   const dots = mapData.points.map(p =>
     `<circle cx="${sx(p.x).toFixed(1)}" cy="${sy(p.y).toFixed(1)}" r="2.6"
       fill="${GROUP_COLOR[p.group] || "var(--dim)"}" fill-opacity="0.75"
       data-dot="${esc(p.id)}${p.group ? " · " + esc(p.group) : ""}"><title>${esc(p.id)}${
       p.group ? " (" + esc(p.group) + ")" : ""}</title></circle>`).join("");
   return `<div class="map">${bar}<svg viewBox="0 0 ${W} ${H}"
-      role="img" aria-label="2D projection of SAE feature vectors">${dots}</svg></div>`;
+      role="img" aria-label="2D UMAP of SAE feature vectors">${ctx}${dots}</svg></div>`;
 }
 
 function renderDetail(run) {
@@ -341,12 +355,12 @@ async function loadArtifacts(runId) {
   delete pendingArtifacts[runId];
 }
 
-async function loadMap(runId, method) {
-  if (mapRun === runId && mapMethod === method && (mapData || mapErr)) return;
-  mapRun = runId; mapMethod = method; mapData = null; mapErr = null; refresh();
+async function loadMap(runId, mode) {
+  if (mapRun === runId && mapMode === mode && (mapData || mapErr)) return;
+  mapRun = runId; mapMode = mode; mapData = null; mapErr = null; refresh();
   try {
     mapData = await api(`/api/projection?run=${encodeURIComponent(runId)}` +
-                        `&method=${encodeURIComponent(method)}`);
+                        `&mode=${encodeURIComponent(mode)}`);
   } catch (e) { mapErr = e.message; }
   refresh();
 }
@@ -390,7 +404,7 @@ function renderRuns(runs, jobs) {
   });
   el.querySelectorAll("[data-map]").forEach(n => n.onclick = ev => {
     ev.stopPropagation();
-    loadMap(n.dataset.map, n.dataset.method);
+    loadMap(n.dataset.map, n.dataset.mode);
   });
   el.querySelectorAll("circle[data-dot]").forEach(n => {
     n.onmouseenter = () => { mapHover = n.dataset.dot; refresh(); };

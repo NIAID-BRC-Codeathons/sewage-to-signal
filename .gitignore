@@ -19,6 +19,11 @@ data/fastq_rnaseq/.both
 # Pfam-A — ~400 MB compressed, larger on disk; fetch with ./setup.sh pfam
 data/pfam/
 
+# Fitted reference layout. Derived, and a pickle whose validity depends on
+# library versions — build with sae/web/reference_map.py, share the file
+# deliberately rather than by committing one built from a laptop's scratch.
+data/reference_map.joblib
+
 # Pipeline outputs — all derived, regenerate with pipeline/run.py
 work/
 

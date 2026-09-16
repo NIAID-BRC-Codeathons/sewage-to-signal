@@ -58,34 +58,65 @@ where it is absent; you get a message in place of the table.
 
 `s06` writes long-format `(gene_id, feature_id, activation)` with top-K per
 gene, so a run is a sparse matrix over the 16,384-wide codebook. Expanding a
-run projects it to 2D and plots it, coloured by the `s05` class — the same kind
-of picture as the ESM Atlas map, at a scale that needs no tiling.
+run plots it in 2D, coloured by the `s05` class — the same kind of picture as
+the ESM Atlas map, at a scale that needs no tiling.
 
 ```
-GET /api/projection?run=<id>&method=umap|tsne|svd
+GET /api/projection?run=<id>&mode=reference|run
 ```
 
-**UMAP by default**, on cosine distance over the raw sparse vectors — which
-features fire is the signal, and reducing first would throw away the sparse
-structure UMAP handles natively. `tsne` goes through a 50-component SVD first,
-as is usual; `svd` is the instant, deterministic fallback. Rows are
-L2-normalised either way: without it a protein's activation *magnitude*
-dominates the leading components and everything else collapses toward the
-origin.
+**UMAP only.** It is the one method here with a `transform`, and that is what
+makes a fixed layout possible — t-SNE cannot place a new point in an existing
+layout without refitting, and a linear projection was not good enough.
 
-`umap-learn` is pinned in `requirements.txt` (it brings numba and llvmlite, and
-resolves against numpy 2.5.3 rather than pinning it back). If it is missing —
-an image built before the pin, say — the request falls back to t-SNE and the
-response says which method actually ran.
+### The shared layout
 
-The response also reports how many codebook features are *shared* between
-proteins. That is the honest health check: with top-16 over 16,384 features,
-two proteins may share none, and then the layout is noise rather than biology.
+Projecting each run on its own gives an arbitrary layout: two samples cannot be
+compared, and re-running moves every point. So UMAP is fitted **once** over a
+reference corpus and every run is `transform`ed into that space, exactly as the
+ESM Atlas serves precomputed `umap_1`/`umap_2` columns.
 
-Measured on 1142 wastewater proteins: 971 distinct features, 468 shared (48%),
-UMAP in ~10 s. The classes separate — 10-nearest-neighbour same-class rate
-0.610 against 0.461 expected by chance — along a known → partial → dark
-gradient, with dark the tightest cluster (spread 2.65 against 5.47 for known).
+```bash
+python sae/web/reference_map.py build \
+    --out data/reference_map.joblib \
+    "work/*/s06_embed/*.sae_features.parquet"
+
+python sae/web/reference_map.py info        # corpus, params, library versions
+```
+
+The run's proteins are drawn over the corpus, which appears as faint context.
+Without a map the server falls back to fitting each run alone and labels it
+plainly, because those coordinates mean something different.
+
+The corpus has to span what you expect to see: `transform` places a point
+relative to the fitted manifold and has nothing useful to say about a region
+the fit never covered. That is why it wants both ends — proteins you care about
+*and* enough empirical wastewater to cover the unannotated bulk.
+
+Two honest limits. `transform` is an approximation, so a protein in the corpus
+does not land exactly where the fit put it (median drift 0.73 on a span of 18.4
+in our build, ~4%). And the map is a pickle, so it is version-sensitive; the
+build records `umap`, `numpy`, `scipy` and `sklearn` versions and the response
+flags any drift rather than quietly returning a wrong layout.
+
+**Everyone sharing a map must share the file.** Two people who each fit their
+own have incomparable coordinates, which is the problem this exists to solve.
+It is gitignored on purpose: our corpus today is "whatever is in `work/`",
+which is not reproducible, so committing one would enshrine an arbitrary
+sample. A corpus worth sharing should be defined first.
+
+### Reading it
+
+Rows are L2-normalised before fitting: otherwise a protein's activation
+*magnitude* dominates the leading components and everything else collapses
+toward the origin. The response reports how many codebook features are *shared*
+between proteins, which is the health check — with top-16 over 16,384, two
+proteins may share none, and then the layout is noise rather than biology.
+
+Measured on 1142 CASPER proteins plus the SARS-CoV-2 reference: 1033 distinct
+features, 476 shared, fitted in 5.2 s, 0.2 MB on disk. The classes separate in
+the shared layout — 10-nearest-neighbour same-class rate 0.612 against 0.461
+expected by chance — along a known → partial → dark gradient.
 
 ## Host vs container
 
