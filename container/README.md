@@ -153,6 +153,37 @@ pipeline. Two sensible shapes:
 Submitting a SLURM job per pipeline run from the UI would be the better model
 and is not implemented; the server shells out with `subprocess` directly.
 
+### Batch scripts
+
+`slurm_example.sbatch` (a pipeline run) and `slurm_web.sbatch` (the UI) both run
+two ways from one file:
+
+```bash
+sbatch container/slurm_example.sbatch SRR38294894      # on a cluster
+bash   container/slurm_example.sbatch SRR38294894      # anywhere else
+DRY_RUN=1 bash container/slurm_example.sbatch SAMPLE   # print the command only
+```
+
+`slurm_common.sh` supplies everything SLURM would otherwise provide, so nothing
+is assumed: CPU count, job id, and paths that prefer `/scratch/$USER` and the
+shared image when they exist and fall back to the checkout when they do not.
+`REPO` is found from `SLURM_SUBMIT_DIR` under sbatch, because SLURM runs the
+job from a spool copy and the script's own directory is not the repo there.
+`DRY_RUN=1` prints the command instead of running it — worth doing before
+spending an allocation.
+
+Tested against a real scheduler (slurm-wlm 21.08.5 in a container), which
+caught three things no amount of shell linting would have:
+
+* **`--gres=gpu:1` was rejected at submission** — "Invalid generic resource
+  (gres) specification" — on any site that does not define that gres name. It
+  was the one site-specific line left active while partition and account were
+  commented out. Now commented too.
+* **`--output=logs/…` silently produced no output at all.** SLURM opens that
+  file before the job body runs, so the `mkdir -p logs` inside the script was
+  always too late. Output now goes to the submit directory.
+* `--hmm /data/Pfam-A.hmm` was the wrong path; Pfam lives at `/data/pfam/`.
+
 ### Runtimes
 
 `run.sh` uses **apptainer** or **singularity** when either is on PATH, and

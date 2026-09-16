@@ -9,7 +9,7 @@ tells you what is present; each row names the target that fetches it.
 | ESMC-300M + SAE | 1.7 GB | `model-small` | HF `biohub/ESMC-300M`, `…-sae-layer23-k64-codebook16384` |
 | ESMC-6B + SAE | 25 GB | `model-6b` | HF `biohub/ESMC-6B`, `…-sae-layer60-k64-codebook16384` |
 | SARS-CoV-2 amplicon FASTQ | 2.4 GB | `reads` | NCBI SRA via `data/fetch_fastq.sh` |
-| CASPER metagenome subsample | 100 MB | `rnaseq` | ENA stream via `data/subsample_rnaseq.sh` |
+| CASPER metagenome subsamples | 206 MB | `rnaseq` | ENA stream via `data/subsample_rnaseq.sh` |
 | Pfam-A HMMs | 399 MB gz | `pfam` | EBI `ftp.ebi.ac.uk/pub/databases/Pfam/current_release` |
 | ESM Atlas cluster tables | 28.6 GB | `atlas` | AWS S3 `esm-protein-atlas` (public, unauthenticated) |
 

@@ -1,6 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=sae-web
-#SBATCH --output=logs/sae-web-%j.out
+#SBATCH --output=sae-web-%j.out
+# Written to the submit directory on purpose. SLURM opens this file before
+# the job body runs, so a subdirectory that does not exist yet yields a job
+# that produces no output at all and gives no hint why.
 #SBATCH --time=08:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
@@ -26,17 +29,28 @@
 # --gres=gpu:1 for s06_embed. For heavy runs prefer submitting
 # slurm_example.sbatch per sample and using this UI read-only to watch them.
 set -euo pipefail
+# Works either way:
+#     sbatch container/slurm_web.sbatch      # on a cluster, then tunnel
+#     bash   container/slurm_web.sbatch      # anywhere else, just open it
 module load apptainer 2>/dev/null || module load singularity 2>/dev/null || true
 
-REPO=${REPO:-$HOME/sewage-to-signal}
-
-# Shared scratch, not $HOME: the model cache alone is ~27 GB and every job
-# reuses it.
-export SAE_HF=${SAE_HF:-/scratch/$USER/hf_cache}
-export SAE_WORK=${SAE_WORK:-/scratch/$USER/sae_work}
-export SAE_DATA=${SAE_DATA:-$REPO/data}
-export SAE_SIF=${SAE_SIF:-/shared/images/sae.sif}
-mkdir -p logs "$SAE_WORK" "$SAE_HF"
+# Find the prelude explicitly. A failed `source` aborts the shell under
+# `set -e` rather than falling through to `||`, and under sbatch the script
+# runs from a spool copy, so its own directory is not the repo.
+_sae_common=""
+for _c in "$(dirname "${BASH_SOURCE[0]:-$0}")" \
+          "${REPO:-}/container" \
+          "${SLURM_SUBMIT_DIR:-}/container" \
+          "$PWD/container" "$PWD"; do
+  [ -n "$_c" ] && [ -f "$_c/slurm_common.sh" ] && { _sae_common="$_c/slurm_common.sh"; break; }
+done
+[ -n "$_sae_common" ] || {
+  echo "error: slurm_common.sh not found; submit from a checkout or set REPO=" >&2
+  exit 2
+}
+# shellcheck source=slurm_common.sh
+. "$_sae_common"
+sae_env
 
 # A shared node may already have something on a fixed port, and several people
 # may run this at once, so take a free one rather than assuming 8765.
@@ -54,14 +68,12 @@ pick_port() {
 }
 export SAE_PORT=${SAE_PORT:-$(pick_port)}
 
-cat <<BANNER
+sae_banner
+if [ "$SAE_MODE" = slurm ]; then
+  cat <<BANNER
 
-  sae web UI
-    node : $(hostname)
-    port : $SAE_PORT
-    work : $SAE_WORK
-
-  From your laptop, open a tunnel that terminates on the compute node:
+  Compute nodes are not reachable from outside the cluster, so open a tunnel
+  that terminates on this node:
 
     ssh -N -L ${SAE_PORT}:127.0.0.1:${SAE_PORT} -J ${USER}@LOGIN_HOST ${USER}@$(hostname)
 
@@ -73,6 +85,9 @@ cat <<BANNER
     ssh -N -L ${SAE_PORT}:$(hostname):${SAE_PORT} ${USER}@LOGIN_HOST
 
 BANNER
+else
+  echo "  open   : http://127.0.0.1:${SAE_PORT}"
+fi
 
 # run.sh binds loopback for native Apptainer, which is what the tunnel expects.
-exec "$REPO"/container/run.sh web --work /work
+sae_run "$REPO"/container/run.sh web --work /work

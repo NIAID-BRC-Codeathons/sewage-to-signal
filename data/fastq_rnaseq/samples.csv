@@ -1,2 +1,3 @@
 run_accession,experiment,biosample,bioproject,collection_date,site_or_sample,strategy,platform,gbases
 SRR38294894,SRX33130932,SAMN57413783,PRJNA1247874,2026-02-01,"Influent wastewater from Chicago (CHI-A), IL",RNA-Seq,Illumina NovaSeq X,263.34
+SRR39695108,SRX34378580,SAMN61656759,PRJNA1247874,2026-06-29,"Wastewater (airport sewer manhole) from Chicago (CHI-C), IL",RNA-Seq,Illumina NovaSeq X,193.02

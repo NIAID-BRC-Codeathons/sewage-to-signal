@@ -118,15 +118,19 @@ failed library rather than a usable sample.
 S0120 appears under both PRJNA989260 and PRJNA1498729, so the two projects can be
 compared at one sewershed across the lab handover.
 
-**Metagenomic (RNA-Seq)** — `data/fastq_rnaseq/`, 103 MB.
+**Metagenomic (RNA-Seq)** — `data/fastq_rnaseq/`, 206 MB.
 
 | Run | Collected | Site | Pairs kept | Full run size |
 |---|---|---|---|---|
 | SRR38294894 | 2026-02-01 | CHI-A influent | 1,000,000 | 88.7 GB (44.4 + 44.3) |
+| SRR39695108 | 2026-06-29 | CHI-C airport manhole | 1,000,000 | 70.9 GB (35.5 + 35.4) |
 
-Split `_1`/`_2` mates, 151 bp, verified: 0 malformed records, mate names identical.
-Collected inside the Feb-Jun 2026 amplicon gap, so it covers a period nothing else
-here reaches.
+Split `_1`/`_2` mates, 151 bp, both verified: 0 malformed records, mate names
+identical. SRR38294894 sits inside the Feb-Jun 2026 amplicon gap, so it covers a
+period nothing else here reaches. SRR39695108 is the deliberate contrast — a
+different matrix (airport sewer manhole rather than municipal influent) four
+months later — and exists so pipeline behaviour can be checked against a second
+community rather than tuned to one.
 
 ## Subsampling large runs
 
