@@ -114,6 +114,45 @@ passes `--host 0.0.0.0` and publishes to the host's loopback only,
 `-p 127.0.0.1:8765:8765`; `SAE_PORT` changes the host port. Uploads land in
 `/work/uploads`, which is your `$SAE_WORK` bind.
 
+### The UI on an HPC node
+
+`container/slurm_web.sbatch` runs the dashboard on a compute node:
+
+```bash
+sbatch container/slurm_web.sbatch
+tail -f logs/sae-web-<jobid>.out      # prints the exact ssh command to use
+```
+
+Compute nodes are not reachable from outside the cluster, so the server binds
+loopback on the node and you tunnel to it, terminating the tunnel *on the
+node*:
+
+```bash
+ssh -N -L PORT:127.0.0.1:PORT -J you@login you@node
+```
+
+Binding loopback is not just convention. This server accepts uploads and
+launches subprocesses, so on a shared cluster a wider bind hands every other
+user on that network a way to run commands as you. If your site refuses ssh
+straight to compute nodes, the fallback is forwarding through the login node
+against the node's hostname — which does require a wider bind, so pair it with
+`--read-only`.
+
+The job picks a free high port rather than assuming 8765, since several people
+may do this on one node.
+
+**Sizing is the decision to make.** The server launches pipeline runs as child
+processes *inside its own allocation*, so a small allocation means a small
+pipeline. Two sensible shapes:
+
+* *Watching* — a modest allocation, `--read-only`, and real work submitted
+  separately with `slurm_example.sbatch`. Best for a shared dashboard.
+* *Working* — a real allocation (`--gres=gpu:1` for `s06_embed`) and launch
+  from the UI. Bounded by the job's wall time.
+
+Submitting a SLURM job per pipeline run from the UI would be the better model
+and is not implemented; the server shells out with `subprocess` directly.
+
 ### Runtimes
 
 `run.sh` uses **apptainer** or **singularity** when either is on PATH, and
