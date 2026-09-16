@@ -13,6 +13,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONNOUSERSITE=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     HF_HOME=/hf \
+    UV_PYTHON_INSTALL_DIR=/opt/uv-python \
     SAE_HOME=/opt/sae \
     MPLCONFIGDIR=/tmp
 
@@ -34,6 +35,7 @@ RUN mkdir -p /opt/conda \
 # uv provisions Python 3.12 itself rather than trusting the base image's python3.
 COPY requirements.txt /opt/build/requirements.txt
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh \
+    && uv python install 3.12 \
     && uv venv --python 3.12 /opt/venv \
     && uv pip install --python /opt/venv/bin/python -r /opt/build/requirements.txt \
     && rm -rf /root/.cache/uv
@@ -46,10 +48,13 @@ RUN { echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
       echo "python: $(/opt/venv/bin/python -V 2>&1)"; echo; \
 echo "micromamba: $(/usr/local/bin/micromamba --version 2>&1)"; \
             echo "--- bioconda ---"; \
-      /usr/local/bin/micromamba list -p /opt/conda | awk 'NR>2 && $1!="" {printf "%s==%s\n", $1, $2}'; \
+      /usr/local/bin/micromamba list -p /opt/conda | awk 'NF>=2 && $1!="Name" && $1 !~ /^[-\xe2]/ {printf "%s==%s\n", $1, $2}'; \
       echo; echo "--- python packages ---"; uv pip freeze --python /opt/venv/bin/python; \
     } > /opt/image-manifest.txt \
     && mkdir -p /work /data /hf && chmod 777 /work /data /hf
+
+# Documentation only; run.sh publishes this to the host's loopback.
+EXPOSE 8765
 
 WORKDIR /work
 ENTRYPOINT []

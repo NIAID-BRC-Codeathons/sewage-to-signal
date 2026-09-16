@@ -52,7 +52,13 @@ From: ubuntu:24.04
     # --- Python environment -------------------------------------------------
     # uv provisions Python 3.12 itself, so the image does not depend on
     # whatever python3 the base happens to ship.
+    #
+    # UV_PYTHON_INSTALL_DIR matters: uv's default is under $HOME, and Apptainer
+    # bind-mounts the host home over the container's, which would hide the
+    # interpreter /opt/venv/bin/python symlinks to and break every run.
+    export UV_PYTHON_INSTALL_DIR=/opt/uv-python
     curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+    uv python install 3.12
     uv venv --python 3.12 /opt/venv
     uv pip install --python /opt/venv/bin/python -r /opt/build/requirements.txt
     rm -rf /root/.cache/uv
@@ -67,7 +73,7 @@ From: ubuntu:24.04
       echo "micromamba: $(/usr/local/bin/micromamba --version 2>&1)"
       echo "--- bioconda ---"
       /usr/local/bin/micromamba list -p /opt/conda \
-        | awk 'NR>2 && $1!="" {printf "%s==%s\n", $1, $2}'
+        | awk 'NF>=2 && $1!="Name" && $1 !~ /^[-\xe2]/ {printf "%s==%s\n", $1, $2}'
       echo
       echo "--- python packages ---"
       uv pip freeze --python /opt/venv/bin/python
@@ -85,6 +91,7 @@ From: ubuntu:24.04
     # cache is ~27 GB. run.sh binds it.
     export HF_HOME=${HF_HOME:-/hf}
     export SAE_HOME=/opt/sae
+    export UV_PYTHON_INSTALL_DIR=/opt/uv-python
     export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
     export MPLCONFIGDIR=/tmp
 
@@ -97,11 +104,19 @@ From: ubuntu:24.04
 %apprun query
     exec /opt/venv/bin/python /opt/sae/sae/sae_testing_script.py "$@"
 
+%apprun web
+    # Apptainer shares the host network namespace, so the server's localhost
+    # default is already reachable from outside the container.
+    exec /opt/venv/bin/python /opt/sae/sae/web/server.py "$@"
+
 %apprun manifest
     exec cat /opt/image-manifest.txt
 
 %test
     set -e
+    echo "--- interpreter is inside the image (not under a home mount) ---"
+    test -x "$(readlink -f /opt/venv/bin/python)" || { echo "BROKEN: venv interpreter unreachable"; exit 1; }
+    readlink -f /opt/venv/bin/python
     echo "--- python deps ---"
     /opt/venv/bin/python -c "import torch, esm, pyarrow, pyrodigal, pyhmmer, pyfastx; \
 print('torch', torch.__version__); print('esm', esm.__version__); \
