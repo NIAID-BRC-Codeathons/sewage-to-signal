@@ -37,16 +37,17 @@ is in (`/.dockerenv`, `APPTAINER_CONTAINER`, `SINGULARITY_CONTAINER`).
 | data | `<repo>/data` | `/data` |
 | uploads | `<repo>/uploads` | `/work/uploads` |
 | interpreter | `sae/.venv/bin/python` | `/opt/venv/bin/python` |
-| bind | `127.0.0.1` | `0.0.0.0` under Docker, `127.0.0.1` under Apptainer |
+| bind | `127.0.0.1` | `127.0.0.1`; run.sh passes `0.0.0.0` when nested in Docker |
 
 The bind difference is the subtle one. Apptainer shares the host network
-namespace, so localhost inside is localhost outside. Docker isolates it, so the
-server binds `0.0.0.0` *within its own namespace* and `run.sh` publishes that
-to the host's loopback only (`-p 127.0.0.1:8765:8765`) — never `0.0.0.0` on the
-host. Override the host port with `SAE_PORT`.
+namespace, so localhost inside is localhost outside and the default is right.
+Nested in Docker it shares the *Docker container's* namespace instead, which
+`-p` cannot reach, so `run.sh` passes `--host 0.0.0.0` and publishes that to
+the host's loopback only — never `0.0.0.0` on the host. `SAE_PORT` sets the
+host port.
 
-It lives under `sae/` so the image's existing `COPY sae /opt/sae/sae` carries
-it in with no extra recipe step, and `SAE_CODE` shadowing covers it too.
+It lives under `sae/` so the image's existing `%files sae /opt/sae/sae` entry
+carries it in with no extra recipe step, and `SAE_CODE` shadowing covers it.
 
 ## Security
 

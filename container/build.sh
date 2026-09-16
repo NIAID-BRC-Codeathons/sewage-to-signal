@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
-# Build sae.sif. Three routes, because clusters differ in what they allow.
+# Build sae.sif from container/sae.def. Three routes, because hosts differ in
+# what they allow.
 #
 #   container/build.sh              # pick the best available route
 #   container/build.sh apptainer    # native, needs root or --fakeroot
-#   container/build.sh docker       # build with Docker, convert to SIF
+#   container/build.sh nested       # Apptainer inside Docker, for macOS
 #   container/build.sh remote       # Sylabs remote builder (needs `apptainer remote login`)
 #
-# Must run from a Linux host for the native route. Apptainer cannot build on
-# macOS; use the docker route there and convert on the cluster, or build on the
-# cluster directly.
+# sae.def is the only recipe. Apptainer cannot build on macOS, so the nested
+# route runs Apptainer in a Docker container and produces the same .sif the
+# cluster runs - rather than a second, Docker-shaped image that would have to
+# be kept in step and would never exercise Apptainer's own semantics.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 SIF="$HERE/sae.sif"
-TAG="wastewater-sae:latest"
+# Carries Apptainer only; it is not a second recipe for this project.
+AP_IMAGE="${SAE_APPTAINER_IMAGE:-quay.io/singularity/singularity:v4.1.0}"
 
 route="${1:-auto}"
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -40,7 +43,7 @@ stage_context() {
 
 if [ "$route" = auto ]; then
   if have apptainer || have singularity; then route=apptainer
-  elif have docker; then route=docker
+  elif have docker; then route=nested
   else
     echo "error: need apptainer, singularity or docker on PATH." >&2; exit 127
   fi
@@ -59,26 +62,15 @@ case "$route" in
       "$AP" build --fakeroot "$SIF" container/sae.def
     fi
     ;;
-  docker)
+  nested)
     have docker || { echo "error: docker not found" >&2; exit 127; }
     stage_context
-    cd "$STAGE"
-    echo "[build] docker build (linux/amd64)"
-    docker build --platform linux/amd64 --label "git.sha=$SHA" \
-      -t "$TAG" -f container/Dockerfile .
-    if have apptainer || have singularity; then
-      AP=apptainer; have apptainer || AP=singularity
-      echo "[build] converting to SIF"
-      docker save "$TAG" -o "$HERE/sae-docker.tar"
-      "$AP" build "$SIF" "docker-archive://$HERE/sae-docker.tar"
-      rm -f "$HERE/sae-docker.tar"
-    else
-      echo "[build] no apptainer here — image built as docker tag '$TAG'."
-      echo "        To finish on a host that has apptainer:"
-      echo "          docker save $TAG -o sae-docker.tar"
-      echo "          # copy sae-docker.tar to that host, then:"
-      echo "          apptainer build sae.sif docker-archive://sae-docker.tar"
-    fi
+    # Building a SIF creates user namespaces, which inside Docker requires
+    # --privileged. On Docker Desktop that is confined to the Linux VM.
+    echo "[build] apptainer inside docker ($AP_IMAGE)"
+    docker run --rm --privileged --platform "${SAE_PLATFORM:-linux/amd64}" \
+      -v "$STAGE:/w" -w /w "$AP_IMAGE" build /w/sae.sif container/sae.def
+    mv "$STAGE/sae.sif" "$SIF"
     ;;
   remote)
     AP=apptainer; have apptainer || AP=singularity
@@ -92,5 +84,11 @@ esac
 if [ -f "$SIF" ]; then
   echo "[build] wrote $SIF ($(du -h "$SIF" | cut -f1))"
   echo "[build] self-check:"
-  ${AP:-apptainer} test "$SIF" || echo "  (test reported problems — see above)"
+  if [ "$route" = nested ]; then
+    docker run --rm --privileged --platform "${SAE_PLATFORM:-linux/amd64}" \
+      -v "$HERE:/mnt/sif" "$AP_IMAGE" test "/mnt/sif/$(basename "$SIF")" \
+      || echo "  (test reported problems — see above)"
+  else
+    ${AP:-apptainer} test "$SIF" || echo "  (test reported problems — see above)"
+  fi
 fi

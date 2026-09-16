@@ -92,8 +92,9 @@ def defaults() -> dict:
             "uploads": Path("/work/uploads"),
             "data": [Path("/data")],
             "python": "/opt/venv/bin/python",
-            # Docker isolates the network namespace, so localhost inside is
-            # unreachable from the host; run.sh publishes to host loopback.
+            # Apptainer shares the host network namespace, so localhost is
+            # already right. Nested in Docker it is not, and run.sh passes an
+            # explicit --host 0.0.0.0 for that case.
             "host": "0.0.0.0" if IN_DOCKER else "127.0.0.1",
         }
     return {
@@ -471,6 +472,10 @@ def main():
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--read-only", action="store_true",
                    help="serve progress only; reject upload and launch")
+    p.add_argument("--published", action="store_true",
+                   help="something in front of this process controls exposure "
+                        "(run.sh passes it when publishing a container port), "
+                        "so a non-loopback bind is intentional")
     p.add_argument("--verbose", action="store_true")
     a = p.parse_args()
 
@@ -494,16 +499,19 @@ def main():
     print(f"  interpreter: {a.python}")
     if a.read_only:
         print("  mode       : read-only (upload and launch disabled)")
-    # Inside Docker 0.0.0.0 is the container's own namespace, not the host's.
-    if a.host not in ("127.0.0.1", "localhost", "::1") and not IN_DOCKER:
+    # A non-loopback bind is only alarming when this process is what decides
+    # reachability. Nested in a container whose port the runtime publishes to
+    # host loopback, 0.0.0.0 is the container's own namespace and is correct.
+    if a.host not in ("127.0.0.1", "localhost", "::1") and not a.published:
         print(f"\n  WARNING: bound to {a.host}, not localhost. This server "
               f"launches\n           subprocesses and accepts uploads. Do not "
               f"expose it.\n")
-    if IN_DOCKER:
-        # The published host port is run.sh's business, not ours; printing a
-        # localhost URL here would name the container-internal port.
-        print(f"\n  listening on {a.host}:{a.port} inside the container\n",
-              flush=True)
+    if a.host == "0.0.0.0":
+        # Bound to every interface, which means the reachable address belongs
+        # to whatever published the port (run.sh), not to us. Naming a URL here
+        # would name the wrong one.
+        via = " (published by the runtime)" if a.published else ""
+        print(f"\n  listening on {a.host}:{a.port}{via}\n", flush=True)
     else:
         print(f"\n  http://{a.host}:{a.port}\n", flush=True)
     try:

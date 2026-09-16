@@ -22,6 +22,10 @@ work/
 # Uploads staged by the web UI (sae/web/server.py --uploads)
 uploads/
 
+# Built container images — 3.2 GB, rebuild with container/build.sh
+*.sif
+container/sae-docker.tar
+
 # Model weights live in ~/.cache/huggingface, but catch a local override too
 **/hf_cache/
 *.safetensors
