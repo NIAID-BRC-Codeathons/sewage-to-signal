@@ -119,27 +119,59 @@ requirements file alone.
 baked-in environment instead. Data targets still work, so you can fetch inside
 or outside.
 
-## Verification status — read this before trusting the recipe
+## Verification status
 
-Verified on this machine (macOS/arm64, Docker only):
+Built and tested on macOS/arm64 via Docker, and — since Apptainer runs inside
+privileged Docker — a real SIF was built and tested here too.
 
-* bioconda resolves and installs the three tools on `linux/amd64`, and all
-  three binaries execute: `MEGAHIT v1.2.9`, `mmseqs 18.8cc5c`, `fastp 1.3.7`.
-  The pins in `sae.def` and `Dockerfile` are those verified versions.
-* `setup.sh` container detection works — it reports the baked-in environment
-  and stops asking for uv.
-* Shell syntax of every script here.
+Verified:
 
-**Not verified here**, because this machine has no Apptainer and no NVIDIA GPU:
+* **Docker image builds** (6.78 GB) and **SIF converts** (3.2 GB, squashfs).
+* **`apptainer test sae.sif` passes**: interpreter resolves, `torch
+  2.11.0+cu130`, `esm 3.4.1`, `pyrodigal 3.7.1`, all three binaries
+  (`MEGAHIT v1.2.9`, `mmseqs 18.8cc5c`, `fastp 1.3.7`), all seven stages import.
+* **Apptainer sections**: `%environment`, `%runscript`, `%test`, `%labels`,
+  `%help`, and the `%apprun` SCIF apps. `apptainer inspect` shows the
+  `git.sha` label, so an image traces back to a commit.
+* **Pipeline executes in-container**: gene calling on SARS-CoV-2 returns
+  Spike at 21563-25384 (1273 aa), matching the host runs exactly.
+* `torch` carries its own CUDA (`+cu130`), confirming the plain-Ubuntu base
+  plus `--nv` is sound.
 
-* `apptainer build` of `sae.def` end to end, and the `%test` section.
-* The Docker→SIF conversion.
-* GPU execution under `--nv`, and CUDA-enabled `torch` at all.
-* The SLURM script, whose partition/account lines are placeholders.
+Not verified, and unavoidable here:
 
-So treat the first build on the cluster as the real test. Run
-`apptainer test sae.sif` immediately after — the `%test` section checks the
-Python imports, the three binaries, and that all seven pipeline stages import.
+* **GPU execution under `--nv`** — no NVIDIA device on this machine.
+* **`apptainer build sae.def` as a single pass.** Every instruction in `%post`
+  is verified via the Docker build and every Apptainer section via a SIF built
+  from that image, but the two have not run as one command. The residual risk
+  is specific: `%files` path handling.
+* The SLURM script's partition/account lines are placeholders.
+
+### Bugs this testing caught
+
+Worth recording, because none were visible from inspection:
+
+1. `micro.mamba.pm` unreachable — switched to the GitHub releases static
+   binary, which also removes the tar step.
+2. `curl` without `-f` wrote an error page that `tar` reported as bzip2
+   corruption, hiding a network failure as a format error.
+3. `uv venv` installs no `pip`, so `python -m pip freeze` exited 1 and failed
+   the build; `2>/dev/null` hid the message but not the status.
+4. **`uv` installs its managed interpreter under `$HOME`.** Apptainer
+   bind-mounts the host home over the container's, hiding the target of
+   `/opt/venv/bin/python`. The `%test` block passed at build time but
+   `apptainer test` failed with `python: not found`, and every `run.sh` call on
+   a cluster would have failed the same way. Docker does not mount over the
+   home, so **only the Apptainer test could find this.** Fixed with
+   `UV_PYTHON_INSTALL_DIR=/opt/uv-python`; `%test` now resolves the symlink and
+   fails loudly if it regresses.
+
+### Two Pythons in the image
+
+`/opt/venv` holds ours (3.12.14). The bioconda environment brings its own
+(3.14.7) as a dependency of the three tools. `PATH` puts `/opt/venv/bin` first,
+so `python` resolves to 3.12.14 — verified. Both appear in the image manifest,
+which is expected rather than a packaging error.
 
 ## Worth adding on a GPU cluster
 
