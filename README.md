@@ -1,13 +1,79 @@
-# Wastewater SAE anomaly detection
+# Sewage-to-Signal: Early Warning for Immune-Escape Mutations
 
-Encode predicted proteins from wastewater metagenomes as sparse-autoencoder
-feature fingerprints, and match them against ESM Atlas clusters. Two entry
-points:
+**NIAID-BRCs AI Codeathon 2.0** · September 16–18, 2026 · Argonne National Laboratory
+
+An AI-assisted wastewater surveillance workflow that detects pathogens of
+concern, tracks their prevalence, and flags emerging immune-escape and
+therapeutic-resistance mutations.
+
+Project page: https://niaid-brc-codeathons.github.io/projects/sewage-to-signal/
+
+---
+
+> **The scope below is a draft pitch, not a plan.**
+>
+> The proposal is a one-slide pitch from the organizing team. It exists to
+> seed a team, not to constrain one. Scope, methods, target organism, and
+> success criteria are all still open — expect them to change substantially.
+> Turning this into a real plan is the team's first job, and it lands in the
+> project charter due August 28, 2026.
+
+## Proposed scope
+
+**Goal.** Detect pathogens of concern in wastewater, track their prevalence,
+identify emerging mutations, and assess potential immune-escape or therapeutic
+impact.
+
+**Three-day MVP.** From target-capture wastewater sequencing: classify reads
+and identify NIAID pathogens of concern; call protein mutations and track their
+geographic, temporal and lineage distribution against public repositories; use
+literature RAG plus curated databases to associate mutations with immune
+escape, therapeutic resistance or altered pathogenicity; emit a
+provenance-linked early-warning report.
+
+**Evaluation.** Taxonomic classification accuracy; concordance of mutation
+calls with standard pipelines; accuracy of geographic and temporal context;
+precision of literature-derived mutation–phenotype associations; and recovery
+of known escape or resistance mutations as high-priority signals.
+
+## What is built so far
+
+A different angle on the same problem, and deliberately narrower than the
+pitch: encode predicted proteins from wastewater metagenomes as
+sparse-autoencoder feature fingerprints and match them against ESM Atlas
+clusters, so a protein with no conventional annotation still gets a functional
+description.
 
 * **`sae/sae_testing_script.py`** — one query sequence (protein or nucleotide),
   end to end, with human-readable feature descriptions.
 * **`sae/pipeline/`** — seven modular stages from reads to candidate clusters,
   resumable, each writing a provenance manifest.
+* **`sae/web/`** — progress dashboard, artifact browser, and run launcher.
+* **`container/`** — Apptainer image for cluster use.
+
+Where it does **not** yet meet the pitch, and these are the open gaps:
+
+* **No taxonomic classification.** Nothing identifies pathogens of concern from
+  reads; there is no Kraken/Bracken step. `s07_match` surfaces an
+  `lca_taxonomy` for a matched cluster representative, which is a weak proxy.
+* **No mutation calling.** `s05_prefilter` now separates proteins that are
+  *fully* explained by a known family from those only partially explained, and
+  the partial ones carry their family label — the hook for comparing a protein
+  against its own family. The comparison itself is not implemented.
+* **No literature RAG** and no phenotype association.
+* **No host or rRNA depletion**, which untargeted wastewater RNA-seq needs.
+
+See `sae/pipeline/README.md` for the measured limits behind each of these.
+
+## Leads
+
+* Alexander Taepper
+* Andrew Warren
+
+Team members get access through the
+[NIAID-BRC-Codeathons](https://github.com/NIAID-BRC-Codeathons) organization.
+
+---
 
 ## Requirements
 
