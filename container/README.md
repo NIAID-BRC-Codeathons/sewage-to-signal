@@ -27,6 +27,9 @@ on a host that has Apptainer, or build on the cluster directly.
 
 ## Run
 
+One command runs all seven stages; `run.sh` sets the bind mounts and passes
+everything else through to `pipeline/run.py`.
+
 ```bash
 container/run.sh pipeline --fastq /data/fastq_rnaseq/SRR38294894_1.fastq.gz \
                           --fastq2 /data/fastq_rnaseq/SRR38294894_2.fastq.gz \
@@ -36,6 +39,33 @@ container/run.sh manifest     # exact package versions baked into this image
 container/run.sh test         # self-check
 container/run.sh shell        # interactive
 ```
+
+### Runtimes
+
+`run.sh` picks the first of **apptainer**, **singularity**, **docker** on PATH;
+`SAE_RUNTIME=docker` overrides. The subcommands are identical across runtimes.
+
+| | image | selected by |
+|---|---|---|
+| apptainer / singularity | `$SAE_SIF` (default `container/sae.sif`) | the cluster path |
+| docker | `$SAE_IMAGE` (default `wastewater-sae:latest`) | local, where Apptainer is unavailable |
+
+The docker branch mirrors the `%apprun` entrypoints in `sae.def` rather than
+relying on the Dockerfile's `CMD`, so `pipeline`, `query`, `manifest`, `test`
+and `shell` behave the same either way. It adds `--platform linux/amd64`
+(`$SAE_PLATFORM`), `--gpus all` when a driver is present, and on Linux
+`--user $(id -u):$(id -g)` so runs do not leave root-owned files in `/work`.
+Docker Desktop maps ownership itself, so that flag is skipped on macOS.
+
+**On Apple Silicon this runs under emulation.** The image is `linux/amd64`, so
+`s06` executes on emulated CPU with no MPS — much slower than the native venv.
+The container's value on a Mac is narrow but real: it is the only way past
+`s02_assemble` without a local `megahit`. Assembling in the container and
+returning to the native venv for `s06` is the sensible split.
+
+**The image is built from `git archive HEAD`**, so uncommitted work is not in
+it. Either commit first, or shadow the baked-in code with
+`SAE_CODE=$PWD/sae` — that works on both runtimes.
 
 ## What is in the image, and what is not
 

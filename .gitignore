@@ -17,7 +17,7 @@ data/fastq_rnaseq/.n2
 data/fastq_rnaseq/.both
 
 # Pipeline outputs — all derived, regenerate with pipeline/run.py
-sae/pipeline/work/
+work/
 
 # Model weights live in ~/.cache/huggingface, but catch a local override too
 **/hf_cache/
