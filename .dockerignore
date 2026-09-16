@@ -1,0 +1,14 @@
+# The build context must contain code only. Belt-and-braces for manual
+# `docker build`; container/build.sh stages a clean git export instead.
+**/.venv/
+**/__pycache__/
+**/*.pyc
+sae/representative_proteins.parquet
+sae/sae_clusters/
+sae/pipeline/work/
+data/fastq/*.fastq.gz
+data/fastq/*.part
+data/fastq_rnaseq/*.fastq*
+container/*.sif
+container/*.tar
+.git/

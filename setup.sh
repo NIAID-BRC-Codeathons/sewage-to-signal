@@ -22,9 +22,18 @@
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-VENV="$ROOT/sae/.venv"
-PY="$VENV/bin/python"
 PYVER="3.12"   # the interpreter this project is pinned to; uv provisions it
+
+# Inside the Apptainer image the environment is baked in at /opt/venv and the
+# filesystem is read-only, so venv creation is neither possible nor wanted.
+if [ -n "${APPTAINER_CONTAINER:-${SINGULARITY_CONTAINER:-}}" ] || [ -f /.dockerenv ]; then
+  IN_CONTAINER=1
+  VENV="/opt/venv"
+else
+  IN_CONTAINER=0
+  VENV="$ROOT/sae/.venv"
+fi
+PY="$VENV/bin/python"
 
 # --- formatting -------------------------------------------------------------
 if [ -t 1 ]; then B=$'\033[1m'; G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; D=$'\033[2m'; N=$'\033[0m'
@@ -75,6 +84,11 @@ EOT
 
 t_env() {
   head2 "Environment"
+  if [ "$IN_CONTAINER" = 1 ]; then
+    ok "container image — environment baked in at $VENV ($("$PY" -V 2>&1))"
+    say "        ${D}package versions: cat /opt/image-manifest.txt${N}"
+    return 0
+  fi
   require_uv
 
   if [ -x "$PY" ]; then
@@ -225,8 +239,12 @@ t_atlas() {
 t_preflight() {
   head2 "Required host commands"
   local fail=0
-  command -v uv   >/dev/null && ok "uv      $(uv --version 2>&1 | head -1)" \
-    || { bad "uv      REQUIRED — https://astral.sh/uv"; fail=1; }
+  if [ "$IN_CONTAINER" = 1 ]; then
+    ok "uv      not needed in-container (deps baked in)"
+  else
+    command -v uv >/dev/null && ok "uv      $(uv --version 2>&1 | head -1)" \
+      || { bad "uv      REQUIRED — https://astral.sh/uv"; fail=1; }
+  fi
   command -v curl >/dev/null && ok "curl    all data fetching" \
     || { bad "curl    REQUIRED"; fail=1; }
   command -v awk  >/dev/null && ok "awk     read validation and pairing" \
@@ -252,7 +270,13 @@ t_preflight() {
 t_status() {
   t_preflight || true
   head2 "Checkout status"
-  [ -x "$PY" ] && ok "venv                $("$PY" -V 2>&1)" || miss "venv                ./setup.sh env"
+  if [ "$IN_CONTAINER" = 1 ]; then
+    ok "environment         baked into image ($("$PY" -V 2>&1))"
+  elif [ -x "$PY" ]; then
+    ok "venv                $("$PY" -V 2>&1)"
+  else
+    miss "venv                ./setup.sh env"
+  fi
 
   if [ -x "$PY" ]; then
     hf_present biohub/ESMC-SAE-Features dataset \
@@ -282,8 +306,13 @@ t_status() {
     command -v "$t" >/dev/null && ok "$t" || miss "$t  — needed by $( [ "$t" = mmseqs ] && echo s04_derep || { [ "$t" = fastp ] && echo 's01_qc (optional, 30x faster)' || echo s02_assemble; })"
   done
   say ""
-  say "  ${D}conda install -c bioconda megahit mmseqs2 fastp${N}"
-  say "  ${D}(this machine needs an interactive 'conda tos accept' first)${N}"
+  if [ "$IN_CONTAINER" = 1 ]; then
+    say "  ${D}these ship in the image; anything missing is an image bug${N}"
+  else
+    say "  ${D}conda install -c bioconda megahit mmseqs2 fastp${N}"
+    say "  ${D}(this machine needs an interactive 'conda tos accept' first)${N}"
+    say "  ${D}or skip all of it: container/build.sh  (see container/README.md)${N}"
+  fi
   head2 "Next"
   say "  ./setup.sh quickstart     # ~2 GB, enough to run the pipeline end to end"
   say "  cat DATA.md               # provenance and sizes for every item"

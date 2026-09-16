@@ -1,0 +1,128 @@
+# Apptainer/Singularity image for the wastewater SAE pipeline.
+#
+# Build (needs Linux + fakeroot, or --remote):
+#     apptainer build sae.sif sae.def
+#     apptainer build --fakeroot sae.sif sae.def
+#
+# No GPU base image on purpose: PyTorch's Linux wheels bundle their own CUDA
+# runtime libraries (nvidia-*-cu12 dependencies), so the image only needs the
+# host driver, which `apptainer run --nv` provides. That avoids pinning a CUDA
+# base tag that has to match the cluster's driver.
+#
+# Nothing large is baked in. Model weights (~27 GB) and data (~29 GB) are bind
+# mounted at runtime — see run.sh.
+
+Bootstrap: docker
+From: ubuntu:24.04
+
+%files
+    requirements.txt /opt/build/requirements.txt
+    sae              /opt/sae/sae
+    setup.sh         /opt/sae/setup.sh
+    data/fetch_fastq.sh      /opt/sae/data/fetch_fastq.sh
+    data/subsample_rnaseq.sh /opt/sae/data/subsample_rnaseq.sh
+    data/atlas_manifest.tsv  /opt/sae/data/atlas_manifest.tsv
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl bzip2 xz-utils procps gzip \
+        coreutils gawk findutils grep sed tar
+    rm -rf /var/lib/apt/lists/*
+
+    # --- bioinformatics binaries (no pip equivalent) -----------------------
+    # micromamba rather than apt: mmseqs2 is not in the Ubuntu archive, and
+    # bioconda gives one resolver for all three tools.
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    mkdir -p /opt/conda
+    curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
+        | tar -xvj -C /usr/local bin/micromamba
+    /usr/local/bin/micromamba install -y -p /opt/conda \
+        -c conda-forge -c bioconda \
+        megahit=1.2.9 mmseqs2=18.8cc5c fastp=1.3.7
+    /usr/local/bin/micromamba clean -y --all
+
+    # --- Python environment -------------------------------------------------
+    # uv provisions Python 3.12 itself, so the image does not depend on
+    # whatever python3 the base happens to ship.
+    curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+    uv venv --python 3.12 /opt/venv
+    uv pip install --python /opt/venv/bin/python -r /opt/build/requirements.txt
+    rm -rf /root/.cache/uv
+
+    # --- record exactly what is in here ------------------------------------
+    # The image is the lockfile; this makes its contents auditable after the
+    # fact without rebuilding.
+    {
+      echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "python: $(/opt/venv/bin/python -V 2>&1)"
+      echo
+      echo "--- bioconda ---"
+      /usr/local/bin/micromamba list -p /opt/conda \
+        | awk 'NR>2 && $1!="" {printf "%s==%s\n", $1, $2}'
+      echo
+      echo "--- pip ---"
+      /opt/venv/bin/python -m pip freeze 2>/dev/null
+    } > /opt/image-manifest.txt
+
+    chmod -R a+rX /opt/sae /opt/venv /opt/conda
+    mkdir -p /work /data /hf
+    chmod 777 /work /data /hf
+
+%environment
+    export PATH=/opt/venv/bin:/opt/conda/bin:/usr/local/bin:$PATH
+    export PYTHONNOUSERSITE=1
+    export PYTHONDONTWRITEBYTECODE=1
+    # HF_HOME must land on a bind mount: the image is read-only and the model
+    # cache is ~27 GB. run.sh binds it.
+    export HF_HOME=${HF_HOME:-/hf}
+    export SAE_HOME=/opt/sae
+    export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
+    export MPLCONFIGDIR=/tmp
+
+%runscript
+    exec "$@"
+
+%apprun pipeline
+    exec /opt/venv/bin/python /opt/sae/sae/pipeline/run.py "$@"
+
+%apprun query
+    exec /opt/venv/bin/python /opt/sae/sae/sae_testing_script.py "$@"
+
+%apprun manifest
+    exec cat /opt/image-manifest.txt
+
+%test
+    set -e
+    echo "--- python deps ---"
+    /opt/venv/bin/python -c "import torch, esm, pyarrow, pyrodigal, pyhmmer, pyfastx; \
+print('torch', torch.__version__); print('esm', esm.__version__); \
+print('pyrodigal', pyrodigal.__version__)"
+    echo "--- external binaries ---"
+    for t in megahit mmseqs fastp; do command -v $t >/dev/null || { echo "MISSING $t"; exit 1; }; done
+    megahit --version; mmseqs version; fastp --version 2>&1 | head -1
+    echo "--- pipeline imports ---"
+    cd /opt/sae/sae/pipeline && /opt/venv/bin/python -c \
+      "import common, s01_qc, s02_assemble, s03_genes, s04_derep, s05_prefilter, s06_embed, s07_match, run; print('all stages import')"
+
+%labels
+    Name        wastewater-sae
+    Description SAE anomaly detection for wastewater metagenomes
+    Python      3.12
+
+%help
+    Wastewater SAE pipeline. Models and data live outside the image.
+
+      apptainer run --nv \
+        -B /path/to/hf_cache:/hf -B /path/to/data:/data -B $PWD/work:/work \
+        sae.sif pipeline --fastq /data/r1.fq.gz --fastq2 /data/r2.fq.gz \
+                         --sample S1 --work /work
+
+      apptainer run-help sae.sif          # this text
+      apptainer run --app manifest sae.sif # exact package versions in the image
+      apptainer test sae.sif               # self-check
+
+    Use container/run.sh for the bind mounts rather than typing them.
