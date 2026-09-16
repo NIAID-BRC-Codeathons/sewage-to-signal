@@ -124,6 +124,14 @@ so `--hmm` is the only working prefilter backend on this machine. When pyswrd
 does run, it yields coverage only if its result type carries query bounds;
 without them coverage stays `None` and the protein is never discarded.
 
+**ESMC-6B will be OOM-killed on a small machine.** Weights alone are ~12 GB in
+bfloat16, so in a 16 GB Docker VM `s06` dies to SIGKILL during model load,
+before printing anything — the log simply stops after `s05`. Pass
+`--model 300m` there; it runs on CPU (measured 0.33 seq/s emulated) at the cost
+of feature *descriptions*, since only the 6B layer-60 SAE has a published
+description table. `--model` keeps backbone, SAE repo and layer consistent;
+`--backbone`/`--sae-repo`/`--layer` override individually.
+
 **Retrieval and interpretation need different models.** Matching a query to
 clusters only requires both sides use the *same* SAE — ESMC-300M is fine and
 20× cheaper. Only human-readable feature descriptions require the 6B layer-60

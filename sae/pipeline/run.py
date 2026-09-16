@@ -20,6 +20,18 @@ from common import MissingTool, workdir
 ORDER = ["s01_qc", "s02_assemble", "s03_genes", "s04_derep",
          "s05_prefilter", "s06_embed", "s07_match"]
 
+# Backbone, SAE repo and layer have to agree; picking them separately is an
+# easy way to get a silently wrong answer, so offer them as one choice.
+# ESMC-6B needs ~12 GB for weights alone — on anything smaller, or on CPU,
+# use 300m. Only the 6B layer-60 SAE has a published feature description
+# table, so 300m gives retrieval but no human-readable summaries in s07.
+MODELS = {
+    "6b": ("biohub/ESMC-6B",
+           "biohub/ESMC-6B-sae-layer60-k64-codebook16384", 60),
+    "300m": ("biohub/ESMC-300M",
+             "biohub/ESMC-300M-sae-layer23-k64-codebook16384", 23),
+}
+
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
@@ -41,6 +53,13 @@ def main():
     p.add_argument("--confident-evalue", type=float, default=1e-20)
     p.add_argument("--min-coverage", type=float, default=0.80)
     p.add_argument("--bit-cutoffs", choices=["gathering", "noise", "trusted"])
+    p.add_argument("--model", choices=sorted(MODELS), default="6b",
+                   help="6b needs ~12 GB and a GPU to be practical; 300m runs "
+                        "on CPU but has no feature description table (default: 6b)")
+    p.add_argument("--backbone", help="override the --model backbone")
+    p.add_argument("--sae-repo", help="override the --model SAE repo")
+    p.add_argument("--layer", type=int, help="override the --model SAE layer")
+    p.add_argument("--max-len", type=int, default=1022)
     p.add_argument("--top-k", type=int, default=16)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--limit", type=int, help="cap proteins sent to the GPU stage")
@@ -49,6 +68,11 @@ def main():
                    default=Path(__file__).resolve().parent.parent / "representative_proteins.parquet")
     p.add_argument("--force", action="store_true")
     a = p.parse_args()
+
+    backbone, sae_repo, layer = MODELS[a.model]
+    backbone = a.backbone or backbone
+    sae_repo = a.sae_repo or sae_repo
+    layer = layer if a.layer is None else a.layer
 
     if a.fastq:
         start = a.start or "s01_qc"
@@ -89,6 +113,8 @@ def main():
                                       bit_cutoffs=a.bit_cutoffs, force=a.force)
             elif stage == "s06_embed":
                 r = s06_embed.run(current, wd(stage), a.sample, top_k=a.top_k,
+                                  backbone=backbone, sae_repo=sae_repo,
+                                  layer=layer, max_len=a.max_len,
                                   batch_size=a.batch_size, limit=a.limit,
                                   device=a.device, force=a.force)
             else:

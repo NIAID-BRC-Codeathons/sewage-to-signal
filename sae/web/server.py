@@ -90,9 +90,11 @@ OPTIONS: dict[str, type] = {
     "hmm": str, "ref": str, "evalue": float, "confident_evalue": float,
     "min_coverage": float, "bit_cutoffs": str, "top_k": int,
     "batch_size": int, "limit": int, "device": str, "force": bool,
+    "model": str, "max_len": int,
 }
 CHOICES = {"from": STAGES, "to": STAGES,
-           "bit_cutoffs": ["gathering", "noise", "trusted"]}
+           "bit_cutoffs": ["gathering", "noise", "trusted"],
+           "model": ["6b", "300m"]}
 
 
 def defaults() -> dict:
@@ -279,6 +281,22 @@ class Job:
             self.ended = time.time()
         return "finished" if rc == 0 else "failed"
 
+    def failure_hint(self) -> str | None:
+        """A signalled death writes nothing to the log, so name it here."""
+        rc = self.proc.poll()
+        if rc is None or rc >= 0:
+            return None
+        import signal
+        try:
+            name = signal.Signals(-rc).name
+        except ValueError:
+            return f"killed by signal {-rc}"
+        if -rc in (signal.SIGKILL, signal.SIGABRT):
+            return (f"killed by {name} — usually the out-of-memory killer. "
+                    "ESMC-6B needs ~12 GB for weights alone; try model=300m "
+                    "or give the container more memory.")
+        return f"killed by {name}"
+
     def as_dict(self) -> dict:
         state = self.state()
         return {
@@ -286,6 +304,7 @@ class Job:
             "returncode": self.proc.poll(), "started": self.started,
             "elapsed": round((self.ended or time.time()) - self.started, 1),
             "argv": self.argv, "stage": self._stage_from_log(),
+            "hint": self.failure_hint(),
         }
 
     def _stage_from_log(self) -> str | None:

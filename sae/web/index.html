@@ -140,6 +140,11 @@
           <input id="confident_evalue" placeholder="1e-20"></div>
         <div><label for="limit">--limit (cap GPU stage)</label>
           <input id="limit" placeholder="e.g. 50"></div>
+        <div><label for="model">model (s06)</label>
+          <select id="model">
+            <option value="">6b — needs ~12 GB + GPU</option>
+            <option value="300m">300m — runs on CPU, no descriptions</option>
+          </select></div>
       </div>
     </details>
     <div style="margin-top:12px"><button id="go">Start run</button></div>
@@ -336,6 +341,7 @@ function renderJobs(jobs) {
       <div class="run-head"><span class="name">${j.sample}</span>
         <span class="badge ${j.state}">${j.state}</span>
         <span class="sub">${j.stage || "starting"} · ${fmtSecs(j.elapsed)}</span></div>
+      ${j.hint ? `<div class="msg err">${esc(j.hint)}</div>` : ""}
       ${openJob === j.id
           ? `<pre data-key="log|${j.id}">${esc(jobLog[j.id] ?? "loading…")}</pre>`
           : ""}
@@ -394,7 +400,7 @@ $("file").onchange = async e => {
 $("go").onclick = async () => {
   const options = {};
   for (const k of ["from", "to", "hmm", "bit_cutoffs", "min_coverage",
-                   "confident_evalue", "limit"]) {
+                   "confident_evalue", "limit", "model"]) {
     const v = $(k).value.trim(); if (v) options[k] = v;
   }
   const body = {
