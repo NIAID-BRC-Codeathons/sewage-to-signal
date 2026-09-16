@@ -69,8 +69,8 @@ From: ubuntu:24.04
       /usr/local/bin/micromamba list -p /opt/conda \
         | awk 'NR>2 && $1!="" {printf "%s==%s\n", $1, $2}'
       echo
-      echo "--- pip ---"
-      /opt/venv/bin/python -m pip freeze 2>/dev/null
+      echo "--- python packages ---"
+      uv pip freeze --python /opt/venv/bin/python
     } > /opt/image-manifest.txt
 
     chmod -R a+rX /opt/sae /opt/venv /opt/conda

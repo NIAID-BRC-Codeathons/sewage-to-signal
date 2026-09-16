@@ -47,7 +47,7 @@ RUN { echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
 echo "micromamba: $(/usr/local/bin/micromamba --version 2>&1)"; \
             echo "--- bioconda ---"; \
       /usr/local/bin/micromamba list -p /opt/conda | awk 'NR>2 && $1!="" {printf "%s==%s\n", $1, $2}'; \
-      echo; echo "--- pip ---"; /opt/venv/bin/python -m pip freeze 2>/dev/null; \
+      echo; echo "--- python packages ---"; uv pip freeze --python /opt/venv/bin/python; \
     } > /opt/image-manifest.txt \
     && mkdir -p /work /data /hf && chmod 777 /work /data /hf
 
