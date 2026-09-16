@@ -23,3 +23,7 @@ pyfastx==2.3.1       # FASTQ streaming
 pyrodigal==3.7.1     # metagenomic gene calling
 pyhmmer==0.12.3      # HMM search (Pfam prefilter)
 pyswrd==0.3.1        # heuristic protein search (prefilter alternative)
+
+# Feature-map projection for the web UI. umap-learn pulls numba + llvmlite;
+# verified to resolve against numpy 2.5.3 rather than pinning it back.
+umap-learn==0.5.12

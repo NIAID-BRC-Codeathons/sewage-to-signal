@@ -89,6 +89,19 @@
                         max-width:340px;overflow:hidden;text-overflow:ellipsis}
   .scroll th{position:sticky;top:0;background:var(--panel)}
   .scroll pre{border:0;margin:0;max-height:none}
+  .map{margin-top:10px;border-top:1px dashed var(--line);padding-top:10px}
+  .map-bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+           font:11px var(--mono);color:var(--dim);margin-bottom:6px}
+  .map svg{width:100%;height:auto;display:block;border:1px solid var(--line);
+           border-radius:5px;background:var(--bg)}
+  .map circle{cursor:pointer}
+  .key{display:inline-flex;gap:4px;align-items:center}
+  .key i{width:9px;height:9px;border-radius:50%;display:inline-block}
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:5px;
+       overflow:hidden}
+  .seg button{border:0;border-radius:0;padding:3px 9px;font:11px var(--mono);
+              font-weight:400;background:var(--bg);color:var(--dim);width:auto}
+  .seg button.on{background:var(--ink);color:var(--bg)}
 </style>
 </head>
 <body>
@@ -169,6 +182,11 @@ let STAGES = [], openRun = null, openJob = null, readOnly = false;
 // a new stage appear, with no change to this file.
 let artifacts = {}, pendingArtifacts = {}, sel = null, selData = null;
 let jobLog = {};                 // job id -> last fetched log text
+// Feature map: s06's top-K vectors reduced to 2D. Fetched only when asked,
+// because t-SNE over a thousand proteins takes seconds.
+let mapRun = null, mapMethod = "umap", mapData = null, mapErr = null, mapHover = null;
+const GROUP_COLOR = {dark: "var(--accent)", partial: "var(--warn)",
+                     known: "var(--dim)"};
 
 const esc = v => String(v == null ? "" : v)
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -256,6 +274,42 @@ function renderPreview() {
   return `<div class="preview">${head}${body}</div>`;
 }
 
+function renderMap(run) {
+  const open = mapRun === run.id;
+  const bar = `<div class="map-bar">
+      <span class="seg">${["umap", "tsne", "svd"].map(m =>
+        `<button data-map="${esc(run.id)}" data-method="${m}"
+          class="${open && mapMethod === m ? "on" : ""}">${m}</button>`).join("")}</span>
+      ${open && mapData ? `<span>${mapData.n} proteins · ${mapData.shared_features}`
+        + `/${mapData.distinct_features} features shared `
+        + `(${Math.round(mapData.shared_frac * 100)}%)</span>` : ""}
+      ${open && mapData ? Object.keys(GROUP_COLOR)
+        .filter(g => mapData.groups.includes(g))
+        .map(g => `<span class="key"><i style="background:${GROUP_COLOR[g]}"></i>${g}</span>`)
+        .join("") : ""}
+      ${mapHover ? `<span class="name">${esc(mapHover)}</span>` : ""}
+    </div>`;
+  if (!open) return `<div class="map">${bar}<p class="empty">Pick a method to
+    project this run's SAE features to 2D.</p></div>`;
+  if (mapErr) return `<div class="map">${bar}<p class="msg err">${esc(mapErr)}</p></div>`;
+  if (!mapData) return `<div class="map">${bar}<p class="empty">projecting…</p></div>`;
+
+  const W = 760, H = 420, pad = 26;
+  const xs = mapData.points.map(p => p.x), ys = mapData.points.map(p => p.y);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs);
+  const y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const sx = v => pad + (x1 === x0 ? 0.5 : (v - x0) / (x1 - x0)) * (W - 2 * pad);
+  // SVG y grows downward; flip so the plot reads the usual way up.
+  const sy = v => H - pad - (y1 === y0 ? 0.5 : (v - y0) / (y1 - y0)) * (H - 2 * pad);
+  const dots = mapData.points.map(p =>
+    `<circle cx="${sx(p.x).toFixed(1)}" cy="${sy(p.y).toFixed(1)}" r="2.6"
+      fill="${GROUP_COLOR[p.group] || "var(--dim)"}" fill-opacity="0.75"
+      data-dot="${esc(p.id)}${p.group ? " · " + esc(p.group) : ""}"><title>${esc(p.id)}${
+      p.group ? " (" + esc(p.group) + ")" : ""}</title></circle>`).join("");
+  return `<div class="map">${bar}<svg viewBox="0 0 ${W} ${H}"
+      role="img" aria-label="2D projection of SAE feature vectors">${dots}</svg></div>`;
+}
+
 function renderDetail(run) {
   const known = artifacts[run.id];
   const rows = STAGES.filter(s => run.stages[s]).map(s => {
@@ -270,9 +324,10 @@ function renderDetail(run) {
            `<td>${esc(stats || "—")}</td></tr>${fileRow}`;
   }).join("");
   const note = known ? "" : `<p class="empty">loading files…</p>`;
+  const map = run.stages["s06_embed"] ? renderMap(run) : "";
   return `<div class="detail"><table><tr><th>stage</th><th>time</th>` +
          `<th>output</th><th>stats</th></tr>${rows}</table>${note}` +
-         renderPreview() + `</div>`;
+         map + renderPreview() + `</div>`;
 }
 
 async function loadArtifacts(runId) {
@@ -284,6 +339,16 @@ async function loadArtifacts(runId) {
     refresh();
   } catch (e) { artifacts[runId] = {}; }
   delete pendingArtifacts[runId];
+}
+
+async function loadMap(runId, method) {
+  if (mapRun === runId && mapMethod === method && (mapData || mapErr)) return;
+  mapRun = runId; mapMethod = method; mapData = null; mapErr = null; refresh();
+  try {
+    mapData = await api(`/api/projection?run=${encodeURIComponent(runId)}` +
+                        `&method=${encodeURIComponent(method)}`);
+  } catch (e) { mapErr = e.message; }
+  refresh();
 }
 
 async function selectFile(run, stage, file) {
@@ -320,8 +385,16 @@ function renderRuns(runs, jobs) {
   if (!paint(el, html)) { if (openRun) loadArtifacts(openRun); return; }
   el.querySelectorAll(".run").forEach(n => n.onclick = () => {
     openRun = openRun === n.dataset.id ? null : n.dataset.id;
-    if (!openRun) { sel = null; selData = null; }
+    if (!openRun) { sel = null; selData = null; mapRun = null; mapData = null; }
     refresh();
+  });
+  el.querySelectorAll("[data-map]").forEach(n => n.onclick = ev => {
+    ev.stopPropagation();
+    loadMap(n.dataset.map, n.dataset.method);
+  });
+  el.querySelectorAll("circle[data-dot]").forEach(n => {
+    n.onmouseenter = () => { mapHover = n.dataset.dot; refresh(); };
+    n.onclick = ev => ev.stopPropagation();
   });
   el.querySelectorAll(".chip").forEach(n => n.onclick = ev => {
     ev.stopPropagation();                       // do not collapse the run

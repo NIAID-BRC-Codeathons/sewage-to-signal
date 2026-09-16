@@ -54,6 +54,39 @@ Parquet needs `pyarrow`, which is a *pipeline* dependency, not a web one. It is
 imported only when a parquet is actually requested, so the server still runs
 where it is absent; you get a message in place of the table.
 
+## The feature map
+
+`s06` writes long-format `(gene_id, feature_id, activation)` with top-K per
+gene, so a run is a sparse matrix over the 16,384-wide codebook. Expanding a
+run projects it to 2D and plots it, coloured by the `s05` class — the same kind
+of picture as the ESM Atlas map, at a scale that needs no tiling.
+
+```
+GET /api/projection?run=<id>&method=umap|tsne|svd
+```
+
+**UMAP by default**, on cosine distance over the raw sparse vectors — which
+features fire is the signal, and reducing first would throw away the sparse
+structure UMAP handles natively. `tsne` goes through a 50-component SVD first,
+as is usual; `svd` is the instant, deterministic fallback. Rows are
+L2-normalised either way: without it a protein's activation *magnitude*
+dominates the leading components and everything else collapses toward the
+origin.
+
+`umap-learn` is pinned in `requirements.txt` (it brings numba and llvmlite, and
+resolves against numpy 2.5.3 rather than pinning it back). If it is missing —
+an image built before the pin, say — the request falls back to t-SNE and the
+response says which method actually ran.
+
+The response also reports how many codebook features are *shared* between
+proteins. That is the honest health check: with top-16 over 16,384 features,
+two proteins may share none, and then the layout is noise rather than biology.
+
+Measured on 1142 wastewater proteins: 971 distinct features, 468 shared (48%),
+UMAP in ~10 s. The classes separate — 10-nearest-neighbour same-class rate
+0.610 against 0.461 expected by chance — along a known → partial → dark
+gradient, with dark the tightest cluster (spread 2.65 against 5.47 for known).
+
 ## Host vs container
 
 Paths, interpreter and bind address all differ, and the server detects which it

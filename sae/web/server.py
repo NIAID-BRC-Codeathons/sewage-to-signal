@@ -83,6 +83,14 @@ PREVIEW_LINES = 200
 PREVIEW_ROWS = 100
 PREVIEW_BYTES = 2 * 1024**2
 
+# Feature map. s06 writes long-format (gene_id, feature_id, activation) with
+# top-K per gene, so a run is a sparse matrix over the 16,384-wide codebook.
+# Reduced to 2D it gives the same kind of picture as the ESM Atlas map, at a
+# scale that needs no tiling: a sample is thousands of points, not millions.
+PROJECTION_METHODS = ("umap", "tsne", "svd")
+DEFAULT_PROJECTION = "umap"
+MAX_PROJECTION_POINTS = 20000
+
 # Options forwarded to run.py. Anything not listed here is rejected, so the
 # request body can never introduce a new flag.
 OPTIONS: dict[str, type] = {
@@ -196,6 +204,79 @@ def preview(p: Path, limit: int) -> dict:
         return {"kind": "text", "text": "\n".join(lines)}
 
     return {"kind": "binary", "text": f"{p.name} is not a previewable format."}
+
+
+def _sparse_features(path: Path):
+    """Long-format parquet -> (gene_ids, CSR matrix over the codebook)."""
+    import numpy as np
+    import pyarrow.parquet as pq
+    from scipy.sparse import csr_matrix
+
+    t = pq.read_table(path, columns=["gene_id", "feature_id", "activation"])
+    genes = t.column("gene_id").to_pylist()
+    feats = np.asarray(t.column("feature_id").to_pylist(), dtype=np.int32)
+    vals = np.asarray(t.column("activation").to_pylist(), dtype=np.float32)
+
+    order: dict[str, int] = {}
+    rows = np.empty(len(genes), dtype=np.int32)
+    for i, g in enumerate(genes):
+        rows[i] = order.setdefault(g, len(order))
+    ids = [g for g, _ in sorted(order.items(), key=lambda kv: kv[1])]
+    m = csr_matrix((vals, (rows, feats)), shape=(len(ids), 16384))
+    return ids, m
+
+
+def _reduce_2d(m, method: str, seed: int = 0):
+    """Project to 2D. SVD is the default: sparse-native, instant, stable.
+
+    Rows are L2-normalised first. Without it a protein's *magnitude* dominates
+    the top components and everything else collapses toward the origin, which
+    is wrong here — what matters is which features fire, not how hard.
+    """
+    from sklearn.decomposition import TruncatedSVD
+    from sklearn.preprocessing import normalize
+
+    m = normalize(m, norm="l2", copy=True)
+    n = m.shape[0]
+    if method == "umap" and n >= 4:
+        try:
+            import umap                     # pinned, but degrade rather than 500
+        except ImportError:
+            method = "tsne"
+        else:
+            # Cosine on the raw sparse vectors: which features fire is the
+            # signal, and SVD first would discard the sparse structure UMAP
+            # handles natively. n_neighbors must stay under the sample size.
+            return umap.UMAP(
+                n_components=2, metric="cosine", random_state=seed,
+                n_neighbors=max(2, min(15, n - 1)),
+                min_dist=0.1,
+            ).fit_transform(m), "umap"
+    if method == "tsne" and n >= 5:
+        from sklearn.manifold import TSNE
+        # t-SNE on raw 16k-wide sparse is slow and noisy; SVD first is standard.
+        pre = TruncatedSVD(n_components=min(50, n - 1),
+                           random_state=seed).fit_transform(m)
+        per = max(5.0, min(30.0, (n - 1) / 3))
+        return TSNE(n_components=2, perplexity=per, init="pca",
+                    metric="cosine", random_state=seed).fit_transform(pre), "tsne"
+    return TruncatedSVD(n_components=2, random_state=seed).fit_transform(m), "svd"
+
+
+def _groups_from_classification(tsv: Path) -> dict[str, str]:
+    """gene_id -> s05 category, when the run has one. Optional by design."""
+    out: dict[str, str] = {}
+    try:
+        with open(tsv) as fh:
+            header = fh.readline().rstrip("\n").split("\t")
+            gi, ci = header.index("gene_id"), header.index("category")
+            for line in fh:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) > max(gi, ci):
+                    out[parts[gi]] = parts[ci]
+    except (OSError, ValueError):
+        pass
+    return out
 
 
 def _summarise(mf: Path) -> dict | None:
@@ -471,6 +552,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"files": self._candidate_inputs()})
         if u.path == "/api/artifacts":
             return self._artifacts((q.get("run") or [""])[0])
+        if u.path == "/api/projection":
+            return self._projection((q.get("run") or [""])[0],
+                                    (q.get("method") or [DEFAULT_PROJECTION])[0])
         if u.path == "/api/preview":
             try:
                 limit = int((q.get("limit") or ["0"])[0]) or PREVIEW_ROWS
@@ -544,6 +628,56 @@ class Handler(BaseHTTPRequestHandler):
             if files:
                 out[stage] = files
         return self._json({"run": run_id, "stages": out})
+
+    def _projection(self, run_id: str, method: str):
+        try:
+            run_dir = self._run_dir(run_id)
+        except ValueError as exc:
+            return self._err(404, str(exc))
+        if method not in PROJECTION_METHODS:
+            return self._err(400, f"method must be one of {', '.join(PROJECTION_METHODS)}")
+
+        found = sorted((run_dir / "s06_embed").glob("*.sae_features.parquet"))
+        if not found:
+            return self._err(404, "this run has no s06_embed output")
+        try:
+            ids, m = _sparse_features(found[0])
+        except ImportError as exc:
+            return self._err(501, f"projection needs scipy and scikit-learn: {exc}")
+        except Exception as exc:
+            return self._err(422, f"cannot read features: {exc}")
+        if len(ids) < 2:
+            return self._err(422, f"need at least 2 proteins to project, got {len(ids)}")
+        if len(ids) > MAX_PROJECTION_POINTS:
+            return self._err(413, f"{len(ids)} proteins exceeds the "
+                                  f"{MAX_PROJECTION_POINTS} point cap")
+
+        try:
+            xy, used = _reduce_2d(m, method)
+        except Exception as exc:
+            return self._err(422, f"projection failed: {exc}")
+
+        groups = _groups_from_classification(
+            next(iter(sorted((run_dir / "s05_prefilter").glob("*.classification.tsv"))),
+                 run_dir / "missing"))
+        points = [{"id": g, "x": round(float(xy[i][0]), 4),
+                   "y": round(float(xy[i][1]), 4),
+                   "group": groups.get(g)}
+                  for i, g in enumerate(ids)]
+        # A map is only meaningful if proteins share features. With top-K over
+        # a 16,384-wide codebook they may not, and then the layout is noise.
+        import numpy as np
+        counts = np.bincount(m.tocoo().col, minlength=16384)
+        distinct = int((counts > 0).sum())
+        shared = int((counts > 1).sum())
+        return self._json({
+            "run": run_id, "method": used, "requested": method,
+            "n": len(points), "points": points,
+            "groups": sorted({p["group"] for p in points if p["group"]}),
+            "nnz_per_protein": round(m.nnz / len(ids), 1),
+            "distinct_features": distinct, "shared_features": shared,
+            "shared_frac": round(shared / distinct, 3) if distinct else 0.0,
+        })
 
     def _preview(self, run_id: str, stage: str, name: str, limit: int):
         try:
