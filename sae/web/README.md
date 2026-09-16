@@ -118,6 +118,57 @@ features, 476 shared, fitted in 5.2 s, 0.2 MB on disk. The classes separate in
 the shared layout — 10-nearest-neighbour same-class rate 0.612 against 0.461
 expected by chance — along a known → partial → dark gradient.
 
+## Where runs execute
+
+The server does not run the pipeline. It **submits** it, and polls the
+scheduler — `sbatch` when it is on PATH, otherwise a local fork.
+
+```
+GET  /api/state      -> .launcher tells you which backend is in use
+POST /api/cancel?id= -> scancel, or terminate for a local fork
+```
+
+Forking was wrong on a cluster twice over: the run died with the server, and it
+was confined to the *UI's* allocation, so a dashboard sized for browsing could
+never start real work. Submitting removes both problems and the sizing
+question with them.
+
+**Run the server on the login node.** It only reads manifests and submits, so
+it needs no allocation — one long-lived lightweight process, with every
+expensive thing in its own job.
+
+A submitted job lands on a compute node that has the image but not this
+server's interpreter, so by default it runs `container/run.sh` and any path in
+its arguments is rewritten to the path the image sees — `/data`, `/work`,
+`/atlas`, mirroring run.sh's bind table. `--job-runner python` submits the
+interpreter instead, which only works where that path is visible on the node.
+
+`--job-cpus`, `--job-mem`, `--job-time`, `--partition`, `--account` and
+`--job-gres` size the jobs. Site-specific options are only sent when set: an
+undefined gres or a missing partition is rejected at submission, not later.
+
+### Running SLURM locally
+
+So the deployment does not change shape between a laptop and a cluster:
+
+```bash
+container/slurm-local/up.sh                 # SLURM + Apptainer in Docker
+eval "$(container/slurm-local/up.sh env)"   # put the shims on PATH
+./sae/.venv/bin/python sae/web/server.py    # now submits instead of forking
+container/slurm-local/up.sh down
+```
+
+The node carries Apptainer as well as SLURM, so a job there executes the same
+`sae.sif` a cluster node would — otherwise the local setup would test
+scheduling and never execution. The repo is mounted at its own absolute path,
+so a path that resolves on the host resolves identically inside a job.
+
+Verified end to end: the server submits, SLURM schedules, the job runs
+Apptainer against `sae.sif`, and `s05` writes its output back to the host's
+`work/`. One caveat — the toy cluster has no accounting storage, so `sacct`
+returns nothing and a finished job reports `returncode: null` rather than 0.
+Real clusters have it.
+
 ## Host vs container
 
 Paths, interpreter and bind address all differ, and the server detects which it

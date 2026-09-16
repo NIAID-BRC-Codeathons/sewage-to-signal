@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Proxy squeue into the local SLURM container so callers need no special case.
+# -i keeps stdin usable (sbatch reads a script from it when given none).
+exec docker exec -i "${SAE_SLURM_NAME:-sae-slurm}" squeue "$@"

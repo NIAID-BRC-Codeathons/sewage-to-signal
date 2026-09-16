@@ -13,6 +13,18 @@
 #
 # Run the progress UI on a compute node and reach it from your laptop.
 #
+# PREFER THE LOGIN NODE. The server only reads manifests and submits jobs, so
+# it needs no allocation: run it on the login node and let it sbatch the
+# compute. That is one long-lived lightweight process instead of an allocation
+# that expires and takes the UI with it, and it removes the sizing problem
+# entirely — a UI sized for browsing could never have started real work when
+# runs were its own children.
+#
+#     ./sae/.venv/bin/python sae/web/server.py      # on the login node
+#
+# This script remains for sites that forbid long-running processes on login
+# nodes. There the UI lives inside an allocation and you tunnel to it.
+#
 #     sbatch container/slurm_web.sbatch
 #     tail -f logs/sae-web-<jobid>.out      # prints the ssh command to use
 #

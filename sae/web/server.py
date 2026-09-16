@@ -212,6 +212,7 @@ def preview(p: Path, limit: int) -> dict:
 
 # One definition of "read s06 output" and "normalise it", shared with the
 # reference-map builder so a run is projected exactly as the corpus was fitted.
+from launcher import Job, failure_hint, make_launcher    # noqa: E402
 from reference_map import load as load_reference          # noqa: E402
 from reference_map import normalise, sparse_features      # noqa: E402
 
@@ -295,101 +296,62 @@ def scan(roots: list[Path]) -> list[dict]:
 # --------------------------------------------------------------------------
 # launching runs
 # --------------------------------------------------------------------------
-@dataclass
-class Job:
-    id: str
-    sample: str
-    argv: list[str]
-    log: Path
-    started: float
-    proc: subprocess.Popen = field(repr=False)
-    ended: float | None = None
-
-    def state(self) -> str:
-        rc = self.proc.poll()
-        if rc is None:
-            return "running"
-        # Freeze the clock the first time we see it exit, so a finished job
-        # stops changing and clients need not redraw it forever.
-        if self.ended is None:
-            self.ended = time.time()
-        return "finished" if rc == 0 else "failed"
-
-    def failure_hint(self) -> str | None:
-        """A signalled death writes nothing to the log, so name it here."""
-        rc = self.proc.poll()
-        if rc is None or rc >= 0:
-            return None
-        import signal
-        try:
-            name = signal.Signals(-rc).name
-        except ValueError:
-            return f"killed by signal {-rc}"
-        if -rc in (signal.SIGKILL, signal.SIGABRT):
-            return (f"killed by {name} — usually the out-of-memory killer. "
-                    "ESMC-6B needs ~12 GB for weights alone; try model=300m "
-                    "or give the container more memory.")
-        return f"killed by {name}"
-
-    def as_dict(self) -> dict:
-        state = self.state()
-        return {
-            "id": self.id, "sample": self.sample, "state": state,
-            "returncode": self.proc.poll(), "started": self.started,
-            "elapsed": round((self.ended or time.time()) - self.started, 1),
-            "argv": self.argv, "stage": self._stage_from_log(),
-            "hint": self.failure_hint(),
-        }
-
-    def _stage_from_log(self) -> str | None:
-        """run.py prints '[stage] ...' as each stage completes."""
-        try:
-            text = self.log.read_text(errors="replace")
-        except OSError:
-            return None
-        seen = re.findall(r"^\[(\w+)\]", text, re.MULTILINE)
-        if not seen:
-            return None
-        last = seen[-1]
-        if last not in STAGES:
-            return last
-        # The line is printed on completion, so the next stage is in flight.
-        i = STAGES.index(last)
-        return STAGES[i + 1] if (self.state() == "running"
-                                 and i + 1 < len(STAGES)) else last
+def stage_from_log(log: Path, live: bool) -> str | None:
+    """run.py prints '[stage] ...' as each stage completes."""
+    try:
+        text = log.read_text(errors="replace")
+    except OSError:
+        return None
+    seen = re.findall(r"^\[(\w+)\]", text, re.MULTILINE)
+    if not seen:
+        return None
+    last = seen[-1]
+    if last not in STAGES:
+        return last
+    # The line is printed on completion, so the next stage is in flight.
+    i = STAGES.index(last)
+    return STAGES[i + 1] if (live and i + 1 < len(STAGES)) else last
 
 
 class Jobs:
-    def __init__(self, log_dir: Path):
-        self.log_dir = log_dir
+    """Registry over a launcher. Submission and polling are the launcher's."""
+
+    def __init__(self, launcher):
+        self.launcher = launcher
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
 
-    def launch(self, python: str, work: Path, sample: str,
-               argv_tail: list[str]) -> Job:
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        jid = uuid.uuid4().hex[:12]
-        log = self.log_dir / f"{jid}.log"
-        argv = [python, str(PIPELINE / "run.py"),
-                "--work", str(work), "--sample", sample, *argv_tail]
-        fh = open(log, "w", buffering=1)
-        fh.write(f"$ {' '.join(argv)}\n\n")
-        proc = subprocess.Popen(argv, cwd=str(PIPELINE), stdout=fh,
-                                stderr=subprocess.STDOUT, text=True)
-        job = Job(jid, sample, argv, log, time.time(), proc)
+    def submit(self, argv: list[str], sample: str, cwd: Path) -> Job:
+        job = self.launcher.submit(argv, sample, cwd)
         with self._lock:
-            self._jobs[jid] = job
+            self._jobs[job.id] = job
         return job
+
+    def _as_dict(self, job: Job) -> dict:
+        self.launcher.refresh(job)
+        live = job._state in ("running", "pending")
+        return {
+            "id": job.id, "backend": job.backend,
+            "backend_id": job.backend_id, "sample": job.sample,
+            "state": job._state, "returncode": job._rc,
+            "started": job.started, "elapsed": job.elapsed(),
+            "argv": job.argv, "stage": stage_from_log(job.log, live),
+            "hint": failure_hint(job),
+        }
 
     def all(self) -> list[dict]:
         with self._lock:
             jobs = list(self._jobs.values())
-        return sorted((j.as_dict() for j in jobs),
+        return sorted((self._as_dict(j) for j in jobs),
                       key=lambda d: d["started"], reverse=True)
 
     def get(self, jid: str) -> Job | None:
         with self._lock:
             return self._jobs.get(jid)
+
+    def cancel(self, jid: str) -> bool:
+        job = self.get(jid)
+        return bool(job) and self.launcher.cancel(job)
 
 
 def build_argv(body: dict, allowed: list[Path]) -> list[str]:
@@ -490,16 +452,18 @@ class Handler(BaseHTTPRequestHandler):
                 "uploads": str(self.cfg["uploads"]),
                 "container": "docker" if IN_DOCKER else
                              ("apptainer" if IN_APPTAINER else None),
+                "launcher": self.cfg["jobs"].launcher.describe(),
             })
         if u.path == "/api/log":
             job = self.cfg["jobs"].get((q.get("id") or [""])[0])
             if job is None:
                 return self._err(404, "no such job")
+            self.cfg["jobs"].launcher.refresh(job)
             try:
                 data = job.log.read_bytes()[-LOG_TAIL:]
             except OSError:
                 data = b""
-            return self._json({"id": job.id, "state": job.state(),
+            return self._json({"id": job.id, "state": job._state,
                                "log": data.decode(errors="replace")})
         if u.path == "/api/inputs":
             return self._json({"files": self._candidate_inputs()})
@@ -525,6 +489,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._upload((q.get("name") or [""])[0])
         if u.path == "/api/run":
             return self._launch()
+        if u.path == "/api/cancel":
+            if not self._guard_writes():
+                return
+            jid = (q.get("id") or [""])[0]
+            if self.cfg["jobs"].get(jid) is None:
+                return self._err(404, "no such job")
+            return self._json({"id": jid,
+                               "cancelled": self.cfg["jobs"].cancel(jid)})
         return self._err(404, "not found")
 
     # -- handlers
@@ -731,6 +703,59 @@ class Handler(BaseHTTPRequestHandler):
             return self._err(500, f"write failed: {exc}")
         self._json({"path": str(dest), "name": name, "bytes": length})
 
+    def _container_path(self, host: str) -> str | None:
+        """Host path -> the path run.sh binds it to inside the image."""
+        p = Path(host).resolve()
+        for root, inside in self.cfg["binds"]:
+            try:
+                rel = p.relative_to(Path(root).resolve())
+            except ValueError:
+                continue
+            return str(Path(inside) / rel) if str(rel) != "." else inside
+        return None
+
+    def _job_argv(self, sample: str, argv_tail: list[str]) -> tuple[list[str], str]:
+        """What the scheduler should actually run.
+
+        A submitted job lands on a compute node, which has the image but not
+        this server's interpreter — so it runs container/run.sh, and any path
+        in the arguments is rewritten to the path the image sees.
+        """
+        if self.cfg["runner"] == "python":
+            return ([self.cfg["python"], str(PIPELINE / "run.py"),
+                     "--work", str(self.cfg["roots"][0]),
+                     "--sample", sample, *argv_tail], "python")
+
+        out: list[str] = []
+        skip = False
+        for i, tok in enumerate(argv_tail):
+            if skip:
+                skip = False
+                continue
+            if tok in ("--fastq", "--fastq2", "--contigs", "--proteins",
+                       "--hmm", "--ref"):
+                inside = self._container_path(argv_tail[i + 1])
+                if inside is None:
+                    raise ValueError(
+                        f"{argv_tail[i + 1]} is not under a directory the "
+                        f"container can see ({', '.join(b for _, b in self.cfg['binds'])})")
+                out += [tok, inside]
+                skip = True
+            else:
+                out.append(tok)
+        # Pin run.sh's binds to what this server is actually showing.
+        # Its defaults are relative to $PWD, so a job would otherwise write
+        # into whatever directory it happened to start in rather than the work
+        # root the UI lists.
+        env = [f"{var}={path}" for var, path in (
+            ("SAE_WORK", self.cfg["roots"][0]),
+            ("SAE_DATA", self.cfg["data"][0]),
+            ("SAE_ATLAS", REPO / "sae"),
+        )]
+        # run.sh's pipeline app supplies --work /work itself.
+        return (["env", *env, str(REPO / "container" / "run.sh"), "pipeline",
+                 "--sample", sample, *out], "container")
+
     def _launch(self):
         if not self._guard_writes():
             return
@@ -748,15 +773,18 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             return self._err(400, str(exc))
 
-        python = self.cfg["python"]
-        if not Path(python).is_file():
-            return self._err(500, f"interpreter not found: {python}")
         try:
-            job = self.cfg["jobs"].launch(python, self.cfg["roots"][0],
-                                          sample, argv_tail)
-        except OSError as exc:
-            return self._err(500, f"launch failed: {exc}")
-        self._json(job.as_dict(), 201)
+            argv, runner = self._job_argv(sample, argv_tail)
+        except ValueError as exc:
+            return self._err(400, str(exc))
+        if runner == "python" and not Path(self.cfg["python"]).is_file():
+            return self._err(500, f"interpreter not found: {self.cfg['python']}")
+        try:
+            job = self.cfg["jobs"].submit(
+                argv, sample, REPO if runner == "container" else PIPELINE)
+        except (OSError, RuntimeError) as exc:
+            return self._err(500, f"submission failed: {exc}")
+        self._json(self.cfg["jobs"]._as_dict(job), 201)
 
 
 def main():
@@ -777,6 +805,26 @@ def main():
     p.add_argument("--python", default=d["python"])
     p.add_argument("--host", default=d["host"])
     p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--launcher", choices=["auto", "slurm", "local"],
+                   default="auto",
+                   help="auto uses sbatch when it is on PATH. A run submitted "
+                        "to SLURM outlives this server and gets its own "
+                        "allocation; a local one does neither")
+    p.add_argument("--partition")
+    p.add_argument("--account")
+    p.add_argument("--job-cpus", type=int, default=4)
+    p.add_argument("--job-mem", default="16G")
+    p.add_argument("--job-time", default="08:00:00")
+    p.add_argument("--job-runner", choices=["auto", "python", "container"],
+                   default="auto",
+                   help="what a job runs. 'container' submits container/run.sh "
+                        "so the job needs only the image, which is what a "
+                        "compute node has; 'python' runs this server's "
+                        "interpreter, which only works where it is visible. "
+                        "auto picks container when a .sif is present")
+    p.add_argument("--job-gres",
+                   help="e.g. gpu:1 — only sent when set, since an undefined "
+                        "gres is rejected at submission")
     p.add_argument("--read-only", action="store_true",
                    help="serve progress only; reject upload and launch")
     p.add_argument("--published", action="store_true",
@@ -786,16 +834,28 @@ def main():
     p.add_argument("--verbose", action="store_true")
     a = p.parse_args()
 
+    sif = Path(os.environ.get("SAE_SIF", REPO / "container" / "sae.sif"))
+    runner = a.job_runner
+    if runner == "auto":
+        runner = "container" if sif.is_file() else "python"
+
     roots = [r.resolve() for r in (a.work or d["work"])]
     data = [r.resolve() for r in (a.data or d["data"])]
     uploads = a.uploads.resolve()
     Handler.cfg = {
         "roots": roots, "data": data, "uploads": uploads, "python": a.python,
         "reference_path": a.reference,
+        "runner": runner,
+        # Mirrors run.sh's bind table, so a host path can be rewritten to the
+        # path a job sees inside the image.
+        "binds": [(roots[0], "/work"), (data[0], "/data"), (REPO / "sae", "/atlas")],
         "read_only": a.read_only, "verbose": a.verbose,
         # A run may only read from these; see checked_path.
         "allowed": [uploads, *data, *roots],
-        "jobs": Jobs(uploads / ".logs"),
+        "jobs": Jobs(make_launcher(
+            uploads / ".logs", prefer=a.launcher, partition=a.partition,
+            account=a.account, cpus=a.job_cpus, mem=a.job_mem,
+            time_limit=a.job_time, gres=a.job_gres)),
     }
 
     where = f"{'docker' if IN_DOCKER else 'apptainer'} container" \
@@ -805,6 +865,14 @@ def main():
     print(f"  data       : {', '.join(str(r) for r in data)}")
     print(f"  uploads    : {uploads}")
     print(f"  interpreter: {a.python}")
+    _l = Handler.cfg["jobs"].launcher.describe()
+    print(f"  job runner : {runner}"
+          + ("" if runner == "container" else
+             "  — needs this interpreter visible on the compute node"))
+    print(f"  launcher   : {_l['backend']}"
+          + (f" ({_l.get('cpus')} cpus, {_l.get('mem')}, {_l.get('time')})"
+             if _l["backend"] == "slurm" else
+             "  — runs are children of this server and die with it"))
     if a.read_only:
         print("  mode       : read-only (upload and launch disabled)")
     # A non-loopback bind is only alarming when this process is what decides
