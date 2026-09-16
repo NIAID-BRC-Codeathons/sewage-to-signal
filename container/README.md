@@ -34,11 +34,21 @@ everything else through to `pipeline/run.py`.
 container/run.sh pipeline --fastq /data/fastq_rnaseq/SRR38294894_1.fastq.gz \
                           --fastq2 /data/fastq_rnaseq/SRR38294894_2.fastq.gz \
                           --sample CHI-A
+container/run.sh web          # progress UI, published to host loopback
 container/run.sh query --fasta /data/contig.fna --top-k 8
 container/run.sh manifest     # exact package versions baked into this image
 container/run.sh test         # self-check
 container/run.sh shell        # interactive
 ```
+
+### The web UI
+
+`container/run.sh web` serves the dashboard from inside the image
+(`sae/web/`, carried in by the existing `COPY sae`). Under Docker the server
+binds `0.0.0.0` in its own network namespace and run.sh publishes it to the
+host's loopback only, `-p 127.0.0.1:8765:8765`; `SAE_PORT` changes the host
+port. Under Apptainer the network namespace is shared, so it simply binds
+localhost. Uploads land in `/work/uploads`, which is your `$SAE_WORK` bind.
 
 ### Runtimes
 
