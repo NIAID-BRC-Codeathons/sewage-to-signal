@@ -1,0 +1,18 @@
+# path	bytes	s3_key
+sae/representative_proteins.parquet	684434747	v1/clusters/data/representative_proteins.parquet
+sae/sae_clusters/cluster_members_0.parquet	1733658928	v1/clusters/indexes/secondary/cluster_members/cluster_members_0.parquet
+sae/sae_clusters/cluster_members_1.parquet	1758433220	v1/clusters/indexes/secondary/cluster_members/cluster_members_1.parquet
+sae/sae_clusters/cluster_members_2.parquet	1750858145	v1/clusters/indexes/secondary/cluster_members/cluster_members_2.parquet
+sae/sae_clusters/cluster_members_3.parquet	1748688297	v1/clusters/indexes/secondary/cluster_members/cluster_members_3.parquet
+sae/sae_clusters/cluster_members_4.parquet	1753934779	v1/clusters/indexes/secondary/cluster_members/cluster_members_4.parquet
+sae/sae_clusters/cluster_members_5.parquet	1740361161	v1/clusters/indexes/secondary/cluster_members/cluster_members_5.parquet
+sae/sae_clusters/cluster_members_6.parquet	1747603214	v1/clusters/indexes/secondary/cluster_members/cluster_members_6.parquet
+sae/sae_clusters/cluster_members_7.parquet	1738515393	v1/clusters/indexes/secondary/cluster_members/cluster_members_7.parquet
+sae/sae_clusters/cluster_members_8.parquet	1744818991	v1/clusters/indexes/secondary/cluster_members/cluster_members_8.parquet
+sae/sae_clusters/cluster_members_9.parquet	1750750923	v1/clusters/indexes/secondary/cluster_members/cluster_members_9.parquet
+sae/sae_clusters/cluster_members_a.parquet	1747346130	v1/clusters/indexes/secondary/cluster_members/cluster_members_a.parquet
+sae/sae_clusters/cluster_members_b.parquet	1755533274	v1/clusters/indexes/secondary/cluster_members/cluster_members_b.parquet
+sae/sae_clusters/cluster_members_c.parquet	1746657521	v1/clusters/indexes/secondary/cluster_members/cluster_members_c.parquet
+sae/sae_clusters/cluster_members_d.parquet	1749406085	v1/clusters/indexes/secondary/cluster_members/cluster_members_d.parquet
+sae/sae_clusters/cluster_members_e.parquet	1747287368	v1/clusters/indexes/secondary/cluster_members/cluster_members_e.parquet
+sae/sae_clusters/cluster_members_f.parquet	1743297091	v1/clusters/indexes/secondary/cluster_members/cluster_members_f.parquet

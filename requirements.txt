@@ -1,0 +1,25 @@
+# Pinned to the versions this pipeline was developed and validated against.
+#
+# Python 3.12 — provisioned by `uv venv --python 3.12`, which ./setup.sh env
+# does for you. uv is required; there is no pip fallback, because it would
+# build against the host interpreter instead of this pinned one.
+#
+#   ./setup.sh env        # preferred
+#   uv pip install -r requirements.txt --python sae/.venv/bin/python
+
+# Protein language model + SAE
+esm==3.4.1
+torch==2.11.0
+transformers==4.57.6
+huggingface-hub==0.36.2
+
+# Tables
+pyarrow==25.0.1
+pandas==3.0.5
+numpy==2.5.3
+
+# Bioinformatics — all pure wheels, no external binaries
+pyfastx==2.3.1       # FASTQ streaming
+pyrodigal==3.7.1     # metagenomic gene calling
+pyhmmer==0.12.3      # HMM search (Pfam prefilter)
+pyswrd==0.3.1        # heuristic protein search (prefilter alternative)

@@ -1,0 +1,41 @@
+# ---------------------------------------------------------------------------
+# Data. Everything here is fetched by ./setup.sh, never committed (~30 GB).
+# See DATA.md for the source of each item.
+# ---------------------------------------------------------------------------
+
+# ESM Atlas cluster tables (~27 GB)
+sae/representative_proteins.parquet
+sae/sae_clusters/
+
+# Sequencing reads (~2.5 GB)
+data/fastq/*.fastq.gz
+data/fastq/*.part
+data/fastq_rnaseq/*.fastq.gz
+data/fastq_rnaseq/*.fastq
+data/fastq_rnaseq/.n1
+data/fastq_rnaseq/.n2
+data/fastq_rnaseq/.both
+
+# Pipeline outputs — all derived, regenerate with pipeline/run.py
+sae/pipeline/work/
+
+# Model weights live in ~/.cache/huggingface, but catch a local override too
+**/hf_cache/
+*.safetensors
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# ---------------------------------------------------------------------------
+# OS / editor
+# ---------------------------------------------------------------------------
+.DS_Store
+*.swp
+.idea/
+.vscode/

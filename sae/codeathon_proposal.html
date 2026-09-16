@@ -1,0 +1,547 @@
+<title>Wastewater Anomaly Benchmark</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Serif:ital,wght@0,400;0,600;1,400&display=swap">
+<style>
+  :root{
+    --ground:#F6F9F9;
+    --surface:#FFFFFF;
+    --surface-sunk:#EDF2F2;
+    --ink:#101E1D;
+    --ink-soft:#425654;
+    --ink-faint:#6C817F;
+    --rule:#D3DEDD;
+    --rule-firm:#B4C4C2;
+    --accent:#0C6462;
+    --accent-soft:#E0EDEC;
+    --signal:#9E5A08;
+    --signal-soft:#F8EEDE;
+    --good:#1F6B43;
+    --good-soft:#E2EFE7;
+    --shadow:0 1px 2px rgba(16,30,29,.06);
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --ground:#0D1514;
+      --surface:#141F1E;
+      --surface-sunk:#101A19;
+      --ink:#E5EEEC;
+      --ink-soft:#A6B8B6;
+      --ink-faint:#7D908E;
+      --rule:#253533;
+      --rule-firm:#365049;
+      --accent:#4FB5AE;
+      --accent-soft:#162A29;
+      --signal:#D9A052;
+      --signal-soft:#2A2118;
+      --good:#6BBF8E;
+      --good-soft:#15251C;
+      --shadow:0 1px 2px rgba(0,0,0,.4);
+    }
+  }
+  :root[data-theme="dark"]{
+    --ground:#0D1514;
+    --surface:#141F1E;
+    --surface-sunk:#101A19;
+    --ink:#E5EEEC;
+    --ink-soft:#A6B8B6;
+    --ink-faint:#7D908E;
+    --rule:#253533;
+    --rule-firm:#365049;
+    --accent:#4FB5AE;
+    --accent-soft:#162A29;
+    --signal:#D9A052;
+    --signal-soft:#2A2118;
+    --good:#6BBF8E;
+    --good-soft:#15251C;
+    --shadow:0 1px 2px rgba(0,0,0,.4);
+  }
+
+  *{box-sizing:border-box}
+  body{
+    background:var(--ground);
+    color:var(--ink);
+    font-family:"IBM Plex Serif",Georgia,serif;
+    font-size:16px;
+    line-height:1.62;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:820px;margin:0 auto;padding-inline:20px;padding-block:44px 72px}
+
+  h1,h2,h3,h4{font-family:"IBM Plex Sans",system-ui,sans-serif;text-wrap:balance;margin:0}
+  h1{font-size:2.15rem;font-weight:700;line-height:1.14;letter-spacing:-.022em}
+  h2{font-size:1.28rem;font-weight:600;letter-spacing:-.01em}
+  h3{font-size:1.02rem;font-weight:600}
+  p{margin:0}
+  a{color:var(--accent)}
+
+  .eyebrow{
+    font-family:"IBM Plex Mono",ui-monospace,monospace;
+    font-size:.7rem;font-weight:500;text-transform:uppercase;
+    letter-spacing:.13em;color:var(--ink-faint);
+  }
+  .mono{font-family:"IBM Plex Mono",ui-monospace,monospace;font-variant-numeric:tabular-nums}
+
+  header.head{border-bottom:2px solid var(--ink);padding-bottom:22px}
+  .head .eyebrow{display:block;margin-bottom:11px}
+  .deck{
+    font-size:1.075rem;color:var(--ink-soft);margin-top:14px;max-width:64ch;
+  }
+  .headmeta{
+    display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:20px;
+    font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.735rem;color:var(--ink-faint);
+  }
+
+  section{margin-top:46px}
+  .sechead{
+    display:flex;align-items:baseline;gap:12px;
+    border-bottom:1px solid var(--rule-firm);padding-bottom:8px;margin-bottom:20px;
+  }
+  .sechead .num{
+    font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.78rem;
+    color:var(--accent);font-weight:600;
+  }
+  .stack{display:flex;flex-direction:column;gap:16px}
+  .stack-tight{display:flex;flex-direction:column;gap:9px}
+
+  /* status taxonomy — encodes what exists vs what is proposed */
+  .chip{
+    display:inline-flex;align-items:center;gap:5px;
+    font-family:"IBM Plex Mono",ui-monospace,monospace;
+    font-size:.66rem;font-weight:600;text-transform:uppercase;letter-spacing:.07em;
+    padding:2px 7px;border-radius:3px;white-space:nowrap;vertical-align:.08em;
+  }
+  .chip-built{background:var(--good-soft);color:var(--good);border:1px solid var(--good)}
+  .chip-meas{background:var(--accent-soft);color:var(--accent);border:1px solid var(--accent)}
+  .chip-prop{background:var(--surface-sunk);color:var(--ink-faint);border:1px solid var(--rule-firm)}
+
+  .legend{
+    display:flex;flex-wrap:wrap;gap:10px 20px;
+    background:var(--surface-sunk);border:1px solid var(--rule);
+    border-radius:4px;padding:13px 15px;margin-top:22px;
+  }
+  .legend div{font-size:.82rem;color:var(--ink-soft)}
+
+  ul.bul{margin:0;padding-left:20px;display:flex;flex-direction:column;gap:9px}
+  ul.bul li::marker{color:var(--rule-firm)}
+
+  /* goals */
+  .goal{
+    background:var(--surface);border:1px solid var(--rule);border-left:3px solid var(--accent);
+    border-radius:0 4px 4px 0;padding:16px 18px;box-shadow:var(--shadow);
+  }
+  .goal.opt{border-left-color:var(--rule-firm)}
+  .goal h3{margin-bottom:6px;display:flex;flex-wrap:wrap;gap:8px;align-items:baseline}
+  .goal p{font-size:.94rem;color:var(--ink-soft)}
+  .metric{
+    margin-top:10px;padding-top:10px;border-top:1px dotted var(--rule-firm);
+    font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.775rem;color:var(--ink);
+  }
+  .metric b{color:var(--accent);font-weight:600}
+
+  /* funnel chart */
+  .funnel{
+    background:var(--surface);border:1px solid var(--rule);border-radius:4px;
+    padding:18px;margin-top:4px;
+  }
+  .frow{display:grid;grid-template-columns:150px 1fr;gap:10px;align-items:center;padding:5px 0}
+  .flabel{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.735rem;color:var(--ink-soft)}
+  .fbarwrap{display:flex;align-items:center;gap:9px;min-width:0}
+  .fbar{height:13px;background:var(--accent);border-radius:2px;flex:none}
+  .fbar.sig{background:var(--signal)}
+  .fval{
+    font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.735rem;
+    color:var(--ink);font-variant-numeric:tabular-nums;white-space:nowrap;
+  }
+  .fnote{font-size:.79rem;color:var(--ink-faint);margin-top:12px;padding-top:11px;border-top:1px solid var(--rule)}
+
+  /* workflow */
+  ol.flow{margin:0;padding:0;list-style:none;counter-reset:st;display:flex;flex-direction:column;gap:0}
+  ol.flow li{
+    counter-increment:st;display:grid;grid-template-columns:auto 1fr;gap:14px;
+    padding:12px 0;border-bottom:1px solid var(--rule);
+  }
+  ol.flow li:last-child{border-bottom:none}
+  ol.flow li::before{
+    content:"s0" counter(st);
+    font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.72rem;font-weight:600;
+    color:var(--accent);background:var(--accent-soft);border-radius:3px;
+    padding:3px 7px;height:fit-content;
+  }
+  .fl-t{font-family:"IBM Plex Sans",system-ui,sans-serif;font-weight:600;font-size:.95rem;display:flex;flex-wrap:wrap;gap:8px;align-items:baseline}
+  .fl-d{font-size:.895rem;color:var(--ink-soft);margin-top:3px}
+
+  /* tables */
+  .tscroll{overflow-x:auto;border:1px solid var(--rule);border-radius:4px;background:var(--surface)}
+  table{border-collapse:collapse;width:100%;font-size:.855rem;min-width:520px}
+  caption{
+    caption-side:top;text-align:left;padding:11px 14px;background:var(--surface-sunk);
+    border-bottom:1px solid var(--rule);
+    font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.7rem;
+    text-transform:uppercase;letter-spacing:.1em;color:var(--ink-faint);
+  }
+  th,td{padding:9px 14px;text-align:left;vertical-align:top;border-bottom:1px solid var(--rule)}
+  th{
+    font-family:"IBM Plex Sans",system-ui,sans-serif;font-weight:600;font-size:.775rem;
+    color:var(--ink);background:var(--surface-sunk);
+  }
+  tbody tr:last-child td{border-bottom:none}
+  td.num{font-family:"IBM Plex Mono",ui-monospace,monospace;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .src{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.775rem;color:var(--ink-soft);word-break:break-word}
+
+  /* callout */
+  .callout{
+    background:var(--signal-soft);border:1px solid var(--signal);border-radius:4px;
+    padding:16px 18px;
+  }
+  .callout .eyebrow{color:var(--signal);display:block;margin-bottom:7px}
+  .callout p{font-size:.93rem}
+
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media (max-width:620px){
+    .two{grid-template-columns:1fr}
+    .frow{grid-template-columns:1fr;gap:3px}
+    h1{font-size:1.78rem}
+  }
+  footer{
+    margin-top:52px;padding-top:18px;border-top:1px solid var(--rule);
+    font-size:.8rem;color:var(--ink-faint);
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="head">
+    <span class="eyebrow">Codeathon project proposal</span>
+    <h1>Benchmarking anomaly detection in wastewater with synthetic spike-ins</h1>
+    <p class="deck">Build in&nbsp;silico wastewater samples carrying a known, hidden signal — then use them to measure
+      whether a sparse-autoencoder protein encoding detects that signal where homology search cannot.</p>
+    <div class="headmeta">
+      <span>Domain · metagenomic biosurveillance</span>
+      <span>Encoder · ESMC-6B SAE, 16,384 features</span>
+      <span>Site · Chicago influent wastewater</span>
+    </div>
+  </header>
+
+  <div class="legend">
+    <div><span class="chip chip-built">built</span> working prototype, validated this week</div>
+    <div><span class="chip chip-meas">measured</span> figure determined empirically, not estimated</div>
+    <div><span class="chip chip-prop">proposed</span> Codeathon work</div>
+  </div>
+
+  <!-- 1 -->
+  <section>
+    <div class="sechead"><span class="num">01</span><h2>Project summary</h2></div>
+    <div class="stack">
+      <ul class="bul">
+        <li>Create <b>in silico wastewater samples</b> that model specific environmental noise and pathogen
+          fragmentation, calibrated against real Chicago influent metagenomes. Insert a known signal — pathogen
+          genomes fragmented and mutated to a controlled divergence — at controlled abundance, so detection of
+          that signal can be benchmarked against ground truth.</li>
+        <li>Create an <b>encoding-based anomaly detection pipeline</b> in which each predicted protein is encoded
+          as a sparse fingerprint of interpretable features from an ESMC-6B sparse autoencoder, and an anomaly is
+          a protein whose fingerprint has no near neighbour in a reference index of the ESM Atlas.</li>
+        <li>Release both halves together: the generator and its labelled datasets as a reusable benchmark, and the
+          detector as a modular seven-stage pipeline, so that any future method can be scored on the same footing.</li>
+      </ul>
+
+      <div class="callout">
+        <span class="eyebrow">Why a synthetic benchmark is the necessary starting point</span>
+        <p>We sequenced the problem directly. A k-mer spectrum over a real CASPER wastewater metagenome subsample
+          (302&nbsp;Mbp, k=21) found <b>81.5% of distinct k-mers are singletons</b> — the community's novel long tail
+          sits near 1× coverage, precisely the fraction an anomaly detector is meant to surface. Real data therefore
+          cannot tell you whether a miss was the detector's fault or the sequencing depth's. Only a sample with
+          inserted, labelled signal separates those two failure modes.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 2 -->
+  <section>
+    <div class="sechead"><span class="num">02</span><h2>Goals and objectives</h2></div>
+    <div class="stack">
+
+      <div class="goal">
+        <h3>Goal 1 · Calibrated synthetic sample generator <span class="chip chip-prop">proposed</span></h3>
+        <p>Generate labelled in&nbsp;silico wastewater datasets over a grid of fragmentation regimes, error models
+          and spike-in abundances, with per-ORF ground truth. Noise must be realistic, not arbitrary: the generator
+          is calibrated against the measured k-mer spectrum of real CASPER data.</p>
+        <div class="metric">Success: <b>≥12 datasets</b> (3 fragment-length regimes × 2 error models × ≥3 spike
+          abundances); generated k-mer multiplicity profile within <b>±5 percentage points</b> of the measured real
+          profile (81.5% singleton / mean multiplicity 6.54).</div>
+      </div>
+
+      <div class="goal">
+        <h3>Goal 2 · Establish a detection limit <span class="chip chip-prop">proposed</span></h3>
+        <p>Quantify spike-in recovery as a function of relative abundance and fragment length, producing a
+          detection-limit curve rather than a single accuracy number. This is the output a public health lab
+          actually needs when designing sampling depth.</p>
+        <div class="metric">Success: precision/recall and <b>ROC-AUC</b> reported per grid cell; the minimum
+          relative abundance achieving <b>recall ≥ 0.80</b> is stated with a confidence interval.</div>
+      </div>
+
+      <div class="goal">
+        <h3>Goal 3 · Beat the homology baseline where it matters <span class="chip chip-prop">proposed</span></h3>
+        <p>Score the SAE encoding against an MMseqs2 / HMMER homology baseline on identical inputs. The claim under
+          test is narrow and falsifiable: the encoding should help specifically on <i>divergent</i> signal, where
+          sequence identity has decayed past homology search's reach.</p>
+        <div class="metric">Success: <b>≥15 percentage point recall gain</b> over the baseline on the divergent
+          subset (spike-ins mutated to 30–50% identity to any reference), at matched false-positive rate.</div>
+      </div>
+
+      <div class="goal opt">
+        <h3>Goal 4 · Reference index <span class="chip chip-prop">optional</span></h3>
+        <p>Encode the ESM Atlas cluster representatives to build a true feature&nbsp;→&nbsp;cluster index, replacing
+          the UniRef-accession bridge the prototype currently depends on.</p>
+        <div class="metric">Current bridge covers <b>2.3%</b> of feature-table accessions (35,569 / 1,553,786).
+          Target: <b>≥95%</b> of query features resolve to ≥1 cluster.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 3 -->
+  <section>
+    <div class="sechead"><span class="num">03</span><h2>Approach</h2></div>
+    <div class="stack">
+      <h3>Methods</h3>
+      <ul class="bul">
+        <li><b>Encoder — ESMC-6B with a sparse autoencoder</b> on layer 60 (k=64, codebook 16,384). We use an SAE
+          rather than raw embeddings for one reason: each of the 16,384 features carries a published biological
+          description, so every anomaly call comes with a human-readable rationale instead of a distance.</li>
+        <li><b>Anomaly score</b> — IDF-weighted similarity between a query's top-K feature fingerprint and its
+          nearest reference cluster. Features are weighted by inverse document frequency in UniRef90, which
+          suppresses features that fire on nearly every protein.</li>
+        <li><b>Gene calling</b> — pyrodigal in metagenomic mode, handling partial genes at contig edges.</li>
+        <li><b>Baseline</b> — MMseqs2 and pyhmmer/Pfam, run as a pipeline stage so the comparison is like-for-like.</li>
+        <li><b>Signal insertion</b> — BV-BRC pathogen genomes fragmented under empirical length and error models,
+          mutated to target identity, then mixed into real wastewater background at set abundance.</li>
+      </ul>
+
+      <h3 style="margin-top:6px">Pipeline workflow</h3>
+      <ol class="flow">
+        <li><div>
+          <div class="fl-t">Read QC <span class="chip chip-built">built</span></div>
+          <div class="fl-d">Paired sliding-window trim, mates kept synchronised. Verified: 1,000,000 pairs in,
+            998,003 kept (99.8%).</div>
+        </div></li>
+        <li><div>
+          <div class="fl-t">Assembly</div>
+          <div class="fl-d">MEGAHIT / metaSPAdes. Required — 151 bp reads translate to 50 aa, too short to contain a
+            domain, and one indel garbles the frame.</div>
+        </div></li>
+        <li><div>
+          <div class="fl-t">Gene calling <span class="chip chip-built">built</span></div>
+          <div class="fl-d">pyrodigal. Validated against SARS-CoV-2 NC_045512.2: recovers Spike at 21563–25384
+            (1273 aa), matching the canonical annotation exactly.</div>
+        </div></li>
+        <li><div>
+          <div class="fl-t">Dereplication <span class="chip chip-built">built</span></div>
+          <div class="fl-d">Hash dedup plus MMseqs2 linclust. Surveillance resequences one sewershed repeatedly, so
+            redundancy here is the cheapest large saving in the pipeline.</div>
+        </div></li>
+        <li><div>
+          <div class="fl-t">Homology prefilter <span class="chip chip-built">built</span></div>
+          <div class="fl-d">pyhmmer or pyswrd. The main cost lever: proteins with a confident family hit are already
+            annotated and never reach the GPU.</div>
+        </div></li>
+        <li><div>
+          <div class="fl-t">SAE encoding <span class="chip chip-built">built</span></div>
+          <div class="fl-d">Length-bucketed batching; top-K taken directly off the sparse tensor, so memory is flat
+            in sequence length. Emits long-format parquet.</div>
+        </div></li>
+        <li><div>
+          <div class="fl-t">Match &amp; annotate <span class="chip chip-built">built</span></div>
+          <div class="fl-d">Feature descriptions joined, candidate clusters ranked by fingerprint voting.</div>
+        </div></li>
+      </ol>
+
+      <h3 style="margin-top:6px">Why the funnel shape, in numbers</h3>
+      <div class="funnel">
+        <div class="frow">
+          <span class="flabel">Raw CASPER reads</span>
+          <span class="fbarwrap"><span class="fbar" style="width:100%"></span><span class="fval">4.0 × 10¹¹</span></span>
+        </div>
+        <div class="frow">
+          <span class="flabel">Assembled ORFs</span>
+          <span class="fbarwrap"><span class="fbar" style="width:62%"></span><span class="fval">~10⁹</span></span>
+        </div>
+        <div class="frow">
+          <span class="flabel">After dereplication</span>
+          <span class="fbarwrap"><span class="fbar" style="width:47%"></span><span class="fval">~10⁷–10⁸</span></span>
+        </div>
+        <div class="frow">
+          <span class="flabel">After prefilter → GPU</span>
+          <span class="fbarwrap"><span class="fbar sig" style="width:33%"></span><span class="fval">~10⁶–10⁷</span></span>
+        </div>
+        <p class="fnote">Bars are log-scaled; values as labelled. Embedding reads directly is not a slow option but
+          an impossible one — at the measured best rate of 0.107 M sequences/day, 4.0 × 10¹¹ reads would take on the
+          order of <span class="mono">10,000 years</span>. The prefilter, not the GPU, is what makes the problem
+          tractable.</p>
+      </div>
+
+      <h3 style="margin-top:6px">Milestones</h3>
+      <div class="tscroll">
+        <table>
+          <caption>Five-day plan</caption>
+          <thead><tr><th style="width:15%">Day</th><th>Milestone</th><th style="width:26%">Exit criterion</th></tr></thead>
+          <tbody>
+            <tr><td class="num">1</td><td>Fit noise and fragmentation models to real CASPER data; retrieve BV-BRC spike-in genomes</td><td>Measured spectrum reproduced</td></tr>
+            <tr><td class="num">2</td><td>Generator emits the full labelled dataset grid</td><td>12 datasets + ground truth</td></tr>
+            <tr><td class="num">3</td><td>Run detector and homology baseline across the grid</td><td>Both complete on all cells</td></tr>
+            <tr><td class="num">4</td><td>Score: ROC, detection-limit curves, divergence sweep</td><td>Curves reproducible from script</td></tr>
+            <tr><td class="num">5</td><td>Package benchmark, write up, BV-BRC integration sketch</td><td>Public repo + report</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4 -->
+  <section>
+    <div class="sechead"><span class="num">04</span><h2>Data and resources required</h2></div>
+    <div class="stack">
+      <div class="tscroll">
+        <table>
+          <caption>Data</caption>
+          <thead><tr><th style="width:27%">Resource</th><th style="width:26%">Source</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td>CASPER Chicago influent metagenomes</td><td class="src">SRA PRJNA1247874</td><td>Real environmental background and noise calibration. 206 runs, ~60.7 Tbp; one 263 Gbp run subsampled to 302 Mbp already in hand.</td></tr>
+            <tr><td>NWSS Chicago SARS-CoV-2 amplicon</td><td class="src">SRA PRJNA989260, PRJNA1498729</td><td>Known-answer positive control with a fully annotated target.</td></tr>
+            <tr><td>Pathogen reference genomes</td><td class="src">BV-BRC genome collections</td><td>Source material for spike-in signal, including divergent variants.</td></tr>
+            <tr><td>ESM Atlas cluster tables</td><td class="src">representative_proteins · cluster_members</td><td>Reference index. 7,723,579 representatives; ~811 M membership rows.</td></tr>
+            <tr><td>SAE feature descriptions</td><td class="src">biohub/ESMC-SAE-Features</td><td>Interpretation layer: 16,384 features with summaries, categories and IDF statistics.</td></tr>
+            <tr><td>UniRef90 · Pfam-A</td><td class="src">UniProt · InterPro</td><td>Homology baseline and prefilter reference.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="tscroll">
+        <table>
+          <caption>Tools and services</caption>
+          <thead><tr><th style="width:27%">Resource</th><th style="width:26%">Source</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td>Seven-stage pipeline</td><td class="src">this project</td><td>Modular, idempotent stages with provenance manifests; each independently runnable.</td></tr>
+            <tr><td>pyrodigal · pyfastx · pyhmmer · pyswrd</td><td class="src">PyPI wheels</td><td>Gene calling, FASTQ I/O, HMM and Smith-Waterman search. No external binaries.</td></tr>
+            <tr><td>MEGAHIT / metaSPAdes · MMseqs2 · fastp</td><td class="src">bioconda</td><td>Assembly, clustering, fast QC. The one hard external dependency.</td></tr>
+            <tr><td>BV-BRC CLI and analysis services</td><td class="src">BV-BRC</td><td>Genome retrieval, and comparison of our calls against curated annotation.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="tscroll">
+        <table>
+          <caption>Models</caption>
+          <thead><tr><th style="width:27%">Resource</th><th style="width:26%">Source</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td>ESMC-6B + SAE layer 60</td><td class="src">biohub</td><td>Primary encoder. The only variant with published feature descriptions, so the only one that supports interpretation.</td></tr>
+            <tr><td>ESMC-300M + SAE</td><td class="src">biohub</td><td>Retrieval-only encoder, 20× cheaper. Matching needs both sides on the same SAE, not a meaningful one.</td></tr>
+            <tr><td>BV-BRC Copilot / Claude</td><td class="src">BV-BRC</td><td>Summarising feature evidence into analyst-facing triage narratives; assisting pipeline development.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="tscroll">
+        <table>
+          <caption>Compute and storage — sized from measured throughput</caption>
+          <thead><tr><th style="width:27%">Need</th><th style="width:26%">Basis</th><th>Justification</th></tr></thead>
+          <tbody>
+            <tr><td>1 × A100/H100 80 GB</td><td class="src">measured on Apple M-series</td><td>ESMC-6B reaches 1.03 seq/s at batch 1 and only 1.24 at batch 8 — it is memory-bandwidth-bound, so batching cannot rescue it. 0.107 M seq/day makes the index build ~72 days locally.</td></tr>
+            <tr><td>Argonne HPC / BRC nodes for CPU stages</td><td class="src">measured</td><td>QC runs ~8 k pairs/s in pure Python; a full CASPER run is ~10 h in QC alone. Assembly of deep metagenomes is memory-bound.</td></tr>
+            <tr><td>~500 GB storage</td><td class="src">inventory</td><td>25 GB model weights, ~55 GB atlas tables, plus assemblies, ORF sets and benchmark datasets.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 5 -->
+  <section>
+    <div class="sechead"><span class="num">05</span><h2>Expected outcomes and deliverables</h2></div>
+    <div class="two">
+      <div class="stack-tight">
+        <h3>Benchmark suite <span class="chip chip-prop">proposed</span></h3>
+        <p style="font-size:.92rem;color:var(--ink-soft)">Labelled in&nbsp;silico wastewater datasets with per-ORF
+          ground truth, plus the generator that made them, so results are reproducible and the grid extensible.</p>
+      </div>
+      <div class="stack-tight">
+        <h3>Detection-limit report <span class="chip chip-prop">proposed</span></h3>
+        <p style="font-size:.92rem;color:var(--ink-soft)">ROC curves and recall-versus-abundance curves for the SAE
+          encoding and the homology baseline, with the divergence sweep that separates them.</p>
+      </div>
+      <div class="stack-tight">
+        <h3>Working pipeline <span class="chip chip-built">built</span></h3>
+        <p style="font-size:.92rem;color:var(--ink-soft)">Seven modular stages, resumable, each writing a provenance
+          manifest. Entry at reads, contigs or proteins. Already validated end to end.</p>
+      </div>
+      <div class="stack-tight">
+        <h3>Interpretable call sheets <span class="chip chip-prop">proposed</span></h3>
+        <p style="font-size:.92rem;color:var(--ink-soft)">Every flagged protein accompanied by the named features
+          that fired and the clusters they nominate — evidence an analyst can audit.</p>
+      </div>
+      <div class="stack-tight">
+        <h3>Reference index <span class="chip chip-prop">optional</span></h3>
+        <p style="font-size:.92rem;color:var(--ink-soft)">Feature&nbsp;→&nbsp;cluster index over the atlas
+          representatives, reusable by any downstream project and not specific to this one.</p>
+      </div>
+      <div class="stack-tight">
+        <h3>BV-BRC integration concept <span class="chip chip-prop">proposed</span></h3>
+        <p style="font-size:.92rem;color:var(--ink-soft)">A sketch for exposing SAE fingerprints as a BV-BRC protein
+          annotation track, and the benchmark as a shared evaluation target.</p>
+      </div>
+    </div>
+
+    <div class="callout" style="margin-top:20px">
+      <span class="eyebrow">Proof the interpretation layer works</span>
+      <p>Given only the 29,903 nt SARS-CoV-2 genome — no annotation, and no indication it was a coronavirus — the
+        pipeline called genes itself and returned, for the Spike gene, features described as
+        <span class="mono">entry/fusion envelope ectodomains</span>,
+        <span class="mono">viral envelope/spike/fusion proteins</span>,
+        <span class="mono">viral envelope/fusion glycoproteins</span> and
+        <span class="mono">fusion peptides, membrane-proximal/TM anchors</span>. Five independent features, each
+        correct for a protein with a signal peptide, an ectodomain, a fusion peptide and a TM anchor.</p>
+    </div>
+  </section>
+
+  <!-- 6 -->
+  <section>
+    <div class="sechead"><span class="num">06</span><h2>Potential impact and next steps</h2></div>
+    <div class="stack">
+      <div>
+        <h3>Infectious disease research</h3>
+        <p style="font-size:.95rem;color:var(--ink-soft);margin-top:4px">Wastewater surveillance currently sees what
+          it already has references for. A protein-encoding detector targets the opposite case — agents divergent
+          enough that homology search returns nothing — and the benchmark states honestly how divergent a thing can
+          be before detection fails. That boundary is the useful deliverable, whichever side of it the method lands on.</p>
+      </div>
+      <div>
+        <h3>AI/ML automation and interpretability</h3>
+        <p style="font-size:.95rem;color:var(--ink-soft);margin-top:4px">Anomaly detection on embeddings usually
+          returns a distance and no reason. Sparse autoencoder features return named biological concepts, which makes
+          a flag auditable by a domain expert rather than merely trusted. The benchmark also supplies something the
+          interpretability field is short of: a task with ground truth, where a feature-based explanation can be
+          scored rather than admired.</p>
+      </div>
+      <div>
+        <h3>Public health preparedness and education</h3>
+        <p style="font-size:.95rem;color:var(--ink-soft);margin-top:4px">Detection-limit curves convert directly into
+          sampling guidance — how deep a run must be to catch an agent at a given abundance. The synthetic datasets
+          double as teaching material, since the answer is known and students can see a detector succeed and fail
+          under controlled conditions.</p>
+      </div>
+      <div>
+        <h3>Follow-up after the Codeathon</h3>
+        <ul class="bul" style="margin-top:6px">
+          <li>Scale from the 302 Mbp subsample to full CASPER runs, where the rare fraction is actually assemblable.</li>
+          <li>Add an rRNA depletion stage — untargeted wastewater RNA-seq is rRNA-dominated and would otherwise spend GPU time on spurious ORFs.</li>
+          <li>Run prospectively across the Chicago site time series, including the S0120 sewershed that spans the 2026 lab handover.</li>
+          <li>Publish the benchmark as a standing evaluation target and the index as a community resource.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    Figures marked <span class="chip chip-meas">measured</span> were determined empirically during prototyping on
+    Apple M-series hardware and real Chicago wastewater data; they are reported as measured, not projected.
+    GPU throughput figures are extrapolations and are labelled as such.
+  </footer>
+
+</div>
