@@ -27,12 +27,20 @@ PYVER="3.12"   # the interpreter this project is pinned to; uv provisions it
 
 # Inside the Apptainer image the environment is baked in at /opt/venv and the
 # filesystem is read-only, so venv creation is neither possible nor wanted.
+# Inside the image /opt/sae is read-only, so data cannot live beside the code
+# the way it does in a checkout — it lives on the bind mounts run.sh sets up.
+# Pointing at $ROOT/data there would both misreport status and fail every fetch
+# with "Read-only file system".
 if [ -n "${APPTAINER_CONTAINER:-${SINGULARITY_CONTAINER:-}}" ] || [ -f /.dockerenv ]; then
   IN_CONTAINER=1
   VENV="/opt/venv"
+  DATA="${SAE_DATA_DIR:-/data}"
+  ATLAS="${SAE_ATLAS_DIR:-/atlas}"
 else
   IN_CONTAINER=0
   VENV="$ROOT/sae/.venv"
+  DATA="$ROOT/data"
+  ATLAS="$ROOT/sae"
 fi
 PY="$VENV/bin/python"
 
@@ -162,16 +170,16 @@ t_model_6b() {
 # --- sequencing reads -------------------------------------------------------
 t_reads() {
   head2 "SARS-CoV-2 amplicon FASTQ (~2.4 GB)"
-  bash "$ROOT/data/fetch_fastq.sh"
+  bash "$DATA/fetch_fastq.sh"
 }
 
 t_rnaseq() {
   head2 "CASPER metagenome subsample (~100 MB)"
-  if big_enough "$ROOT/data/fastq_rnaseq/SRR38294894_1.fastq.gz" 10000000 \
-  && big_enough "$ROOT/data/fastq_rnaseq/SRR38294894_2.fastq.gz" 10000000; then
+  if big_enough "$DATA/fastq_rnaseq/SRR38294894_1.fastq.gz" 10000000 \
+  && big_enough "$DATA/fastq_rnaseq/SRR38294894_2.fastq.gz" 10000000; then
     ok "SRR38294894 present"
   else
-    bash "$ROOT/data/subsample_rnaseq.sh" SRR38294894 1000000
+    bash "$DATA/subsample_rnaseq.sh" SRR38294894 1000000
   fi
 }
 
@@ -181,7 +189,7 @@ t_rnaseq() {
 # right default because s05 asks "is this already explained", so breadth beats
 # specificity — a viral-only set would leave every bacterial protein dark.
 PFAM_URL="https://ftp.ebi.ac.uk/pub/databases/Pfam/current_release"
-PFAM_DIR="$ROOT/data/pfam"
+PFAM_DIR="$DATA/pfam"
 
 t_pfam() {
   head2 "Pfam-A HMMs (~400 MB compressed)"
@@ -213,13 +221,23 @@ t_pfam() {
 # heuristic and a truncated transfer can never be mistaken for a finished one.
 S3_HOST="https://esm-protein-atlas.s3.amazonaws.com"
 S3_BUCKET="s3://esm-protein-atlas"
-MANIFEST="$ROOT/data/atlas_manifest.tsv"
+MANIFEST="$DATA/atlas_manifest.tsv"
+
+# Manifest paths are repo-relative ("sae/sae_clusters/x.parquet"). In a
+# checkout that resolves under $ROOT; in the image the same tree is the /atlas
+# bind, so the leading "sae/" is replaced rather than appended.
+atlas_path() {
+  case "$1" in
+    sae/*) printf '%s/%s\n' "$ATLAS" "${1#sae/}" ;;
+    *)     printf '%s/%s\n' "$ROOT" "$1" ;;
+  esac
+}
 
 # Print "path<TAB>bytes<TAB>key" for entries whose local size != manifest size.
 atlas_pending() {
   awk -F'\t' 'NR>1 && $1!=""' "$MANIFEST" | while IFS=$'\t' read -r path bytes key; do
     local actual=""
-    [ -f "$ROOT/$path" ] && actual="$(wc -c <"$ROOT/$path" | tr -d ' ')"
+    [ -f "$(atlas_path "$path")" ] && actual="$(wc -c <"$(atlas_path "$path")" | tr -d ' ')"
     [ "$actual" = "$bytes" ] || printf '%s\t%s\t%s\n' "$path" "$bytes" "$key"
   done
 }
@@ -242,7 +260,7 @@ t_atlas() {
   say "  ${D}$((total - n))/$total already complete; fetching $n via $transport${N}"
 
   printf '%s\n' "$pending" | while IFS=$'\t' read -r path bytes key; do
-    local dest="$ROOT/$path"
+    local dest; dest="$(atlas_path "$path")"
     mkdir -p "$(dirname "$dest")"
     say "  get  $path  ($(human "$bytes"))"
     if [ "$transport" = "aws s3 cp" ]; then
@@ -320,13 +338,13 @@ t_status() {
       && ok "ESMC-6B             cached" || miss "ESMC-6B             ./setup.sh model-6b"
   fi
 
-  local n; n=$(ls "$ROOT"/data/fastq/*.fastq.gz 2>/dev/null | wc -l | tr -d ' ')
+  local n; n=$(ls "$DATA"/fastq/*.fastq.gz 2>/dev/null | wc -l | tr -d ' ')
   [ "$n" -gt 0 ] && ok "amplicon FASTQ      $n run(s)" || miss "amplicon FASTQ      ./setup.sh reads"
 
-  big_enough "$ROOT/data/fastq_rnaseq/SRR38294894_1.fastq.gz" 10000000 \
+  big_enough "$DATA/fastq_rnaseq/SRR38294894_1.fastq.gz" 10000000 \
     && ok "CASPER subsample    present" || miss "CASPER subsample    ./setup.sh rnaseq"
 
-  big_enough "$ROOT/data/pfam/Pfam-A.hmm" 100000000 \
+  big_enough "$DATA/pfam/Pfam-A.hmm" 100000000 \
     && ok "Pfam-A HMMs         present" || miss "Pfam-A HMMs         ./setup.sh pfam  (else s05 is a pass-through)"
 
   if [ -f "$MANIFEST" ]; then

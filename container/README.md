@@ -213,10 +213,34 @@ not cross-platform — `torch==2.11.0` resolves to a CUDA build on Linux and a
 CPU/MPS build on macOS. The image is what makes a run reproducible, not the
 requirements file alone.
 
+## Provisioning a fresh node
+
+The image carries the environment, not the data. Model weights (~27 GB), the
+feature table, Pfam and the atlas tables are all bind mounts, so a node that has
+only pulled the image can serve the UI but cannot run anything that needs a
+model. Nothing self-provisions on first run.
+
+```bash
+git clone https://github.com/NIAID-BRC-Codeathons/sewage-to-signal.git
+cd sewage-to-signal
+container/build.sh pull
+
+container/run.sh setup status          # what this node is missing
+container/run.sh setup features        # 50 MB  — feature descriptions
+container/run.sh setup model-small     # 1.7 GB — ESMC-300M
+container/run.sh setup pfam            # 400 MB — else s05 is a pass-through
+container/run.sh web
+```
+
 `setup.sh` detects the container (via `APPTAINER_CONTAINER`,
 `SINGULARITY_CONTAINER` or `/.dockerenv`) and skips venv creation, reporting the
-baked-in environment instead. Data targets still work, so you can fetch inside
-or outside.
+baked-in environment instead. It also resolves data to the binds rather than to
+`/opt/sae/data`, which is read-only inside the image — pointing at the latter
+made every fetch fail with "Read-only file system" and made `status` report
+mounted data as missing.
+
+Put `SAE_HF` on shared scratch before doing any of this: it is ~27 GB and every
+job on the node reuses it.
 
 ## Verification status
 

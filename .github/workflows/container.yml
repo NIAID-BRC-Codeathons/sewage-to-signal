@@ -16,11 +16,13 @@ on:
     branches: [main]
     paths:
       - requirements.txt
+      - setup.sh
       - container/sae.def
       - .github/workflows/container.yml
   pull_request:
     paths:
       - requirements.txt
+      - setup.sh
       - container/sae.def
       - .github/workflows/container.yml
   workflow_dispatch:

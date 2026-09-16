@@ -3,6 +3,8 @@
 #
 #   container/run.sh pipeline --fastq /data/fastq_rnaseq/x_1.fastq.gz \
 #                             --fastq2 /data/fastq_rnaseq/x_2.fastq.gz --sample S1
+#   container/run.sh setup status        # what data is present on this node
+#   container/run.sh setup model-small   # fetch into the /hf and /data binds
 #   container/run.sh web                 # progress UI on http://127.0.0.1:8765
 #   container/run.sh query --fasta /data/contig.fna --top-k 8
 #   container/run.sh manifest            # package versions baked into the image
@@ -35,6 +37,10 @@ ATLAS="${SAE_ATLAS:-$REPO/sae}"
 PORT="${SAE_PORT:-8765}"
 # Carries Apptainer only; it is not a second recipe for this project.
 AP_IMAGE="${SAE_APPTAINER_IMAGE:-quay.io/singularity/singularity:v4.1.0}"
+# Provisioning runs inside the image but writes to the binds: the image is
+# read-only, so models land in /hf and data in /data. Not a %apprun, because
+# it takes setup.sh's own subcommands.
+APP_SETUP="/opt/sae/setup.sh"
 
 RUNNER="${SAE_RUNTIME:-}"
 if [ -z "$RUNNER" ]; then
@@ -104,11 +110,13 @@ if [ "$RUNNER" = nested ]; then
       echo "  http://127.0.0.1:$PORT" >&2
       exec docker run "${D[@]}" -p "127.0.0.1:$PORT:8765" "$AP_IMAGE" \
         run "${B[@]}" --app web "$IMG" --host 0.0.0.0 --port 8765 --published "$@" ;;
+    setup)    exec docker run "${D[@]}" "$AP_IMAGE" \
+                exec "${B[@]}" "$IMG" "$APP_SETUP" "$@" ;;
     manifest) exec docker run "${D[@]}" "$AP_IMAGE" run "${B[@]}" --app manifest "$IMG" ;;
     test)     exec docker run "${D[@]}" "$AP_IMAGE" test "$IMG" ;;
     shell)    exec docker run "${D[@]}" "$AP_IMAGE" shell $NV "${B[@]}" "$IMG" ;;
     help|*)
-      sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
       echo "runtime: apptainer nested in docker ($AP_IMAGE)" ;;
   esac
   exit $?
@@ -119,6 +127,7 @@ case "$cmd" in
   pipeline) exec $RUNNER run $NV "${BINDS[@]}" --app pipeline "$SIF" --work /work "$@" ;;
   query)    exec $RUNNER run $NV "${BINDS[@]}" --app query    "$SIF" "$@" ;;
   web)      exec $RUNNER run     "${BINDS[@]}" --app web      "$SIF" --port "$PORT" "$@" ;;
+  setup)    exec $RUNNER exec    "${BINDS[@]}" "$SIF" "$APP_SETUP" "$@" ;;
   manifest) exec $RUNNER run     "${BINDS[@]}" --app manifest "$SIF" ;;
   test)     exec $RUNNER test    "$SIF" ;;
   shell)    exec $RUNNER shell   $NV "${BINDS[@]}" "$SIF" ;;
