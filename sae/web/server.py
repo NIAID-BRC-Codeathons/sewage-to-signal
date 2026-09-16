@@ -267,18 +267,24 @@ class Job:
     log: Path
     started: float
     proc: subprocess.Popen = field(repr=False)
+    ended: float | None = None
 
     def state(self) -> str:
         rc = self.proc.poll()
         if rc is None:
             return "running"
+        # Freeze the clock the first time we see it exit, so a finished job
+        # stops changing and clients need not redraw it forever.
+        if self.ended is None:
+            self.ended = time.time()
         return "finished" if rc == 0 else "failed"
 
     def as_dict(self) -> dict:
+        state = self.state()
         return {
-            "id": self.id, "sample": self.sample, "state": self.state(),
+            "id": self.id, "sample": self.sample, "state": state,
             "returncode": self.proc.poll(), "started": self.started,
-            "elapsed": round(time.time() - self.started, 1),
+            "elapsed": round((self.ended or time.time()) - self.started, 1),
             "argv": self.argv, "stage": self._stage_from_log(),
         }
 

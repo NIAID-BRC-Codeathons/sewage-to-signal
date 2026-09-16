@@ -163,6 +163,7 @@ let STAGES = [], openRun = null, openJob = null, readOnly = false;
 // so nothing here knows a stage's schema — a stage can change its columns, or
 // a new stage appear, with no change to this file.
 let artifacts = {}, pendingArtifacts = {}, sel = null, selData = null;
+let jobLog = {};                 // job id -> last fetched log text
 
 const esc = v => String(v == null ? "" : v)
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -173,6 +174,26 @@ const fmtBytes = n => n == null ? "—" :
   n < 1073741824 ? (n/1048576).toFixed(1) + " MB" : (n/1073741824).toFixed(2) + " GB";
 const fmtSecs = s => s == null ? "—" :
   s < 60 ? s.toFixed(1) + "s" : (s/60).toFixed(1) + "m";
+
+// The 2s poll used to rewrite innerHTML unconditionally, which destroys and
+// recreates every scrollable element and so resets scrollTop — scrolling a
+// preview or a log would snap back to the top. Only touch the DOM when the
+// markup actually changed, and carry scroll offsets across the writes that do
+// happen. Elements that can scroll carry a stable data-key to be matched by.
+function paint(el, html) {
+  if (el._html === html) return false;
+  const saved = [...el.querySelectorAll("[data-key]")]
+    .map(n => [n.dataset.key, n.scrollTop, n.scrollLeft]);
+  const y = window.scrollY, x = window.scrollX;
+  el.innerHTML = html;
+  el._html = html;
+  for (const [key, top, left] of saved) {
+    const n = el.querySelector(`[data-key="${CSS.escape(key)}"]`);
+    if (n) { n.scrollTop = top; n.scrollLeft = left; }
+  }
+  window.scrollTo(x, y);        // a height change must not move the page
+  return true;
+}
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
@@ -214,16 +235,18 @@ function renderPreview() {
         : "") + `</span>` : `<span class="sub">loading…</span>`) + `</div>`;
   if (!selData) return `<div class="preview">${head}</div>`;
   let body;
+  const key = esc(`prev|${sel.run}|${sel.stage}|${sel.file}`);
   if (selData.kind === "table") {
-    body = `<div class="scroll"><table><tr>` +
+    body = `<div class="scroll" data-key="${key}"><table><tr>` +
       selData.columns.map(c => `<th>${esc(c)}</th>`).join("") + `</tr>` +
       selData.rows.map(r => `<tr>` +
         r.map(v => `<td title="${esc(v)}">${esc(v)}</td>`).join("") + `</tr>`).join("") +
       `</table></div>`;
   } else if (selData.kind === "json") {
-    body = `<div class="scroll"><pre>${esc(JSON.stringify(selData.json, null, 2))}</pre></div>`;
+    body = `<div class="scroll" data-key="${key}"><pre>` +
+           `${esc(JSON.stringify(selData.json, null, 2))}</pre></div>`;
   } else {
-    body = `<div class="scroll"><pre>${esc(selData.text || "")}</pre></div>`;
+    body = `<div class="scroll" data-key="${key}"><pre>${esc(selData.text || "")}</pre></div>`;
   }
   return `<div class="preview">${head}${body}</div>`;
 }
@@ -272,10 +295,13 @@ async function selectFile(run, stage, file) {
 
 function renderRuns(runs, jobs) {
   const el = $("runs");
-  if (!runs.length) { el.innerHTML = '<p class="empty">No runs found in the work roots.</p>'; return; }
+  if (!runs.length) {
+    paint(el, '<p class="empty">No runs found in the work roots.</p>');
+    return;
+  }
   const activeBySample = {};
   jobs.filter(j => j.state === "running").forEach(j => activeBySample[j.sample] = j.stage);
-  el.innerHTML = runs.map(r => {
+  const html = runs.map(r => {
     const active = activeBySample[r.sample];
     return `<div class="run" data-id="${r.id}">
       <div class="run-head"><span class="name">${r.sample}</span>
@@ -286,6 +312,7 @@ function renderRuns(runs, jobs) {
       ${openRun === r.id ? renderDetail(r) : ""}
     </div>`;
   }).join("");
+  if (!paint(el, html)) { if (openRun) loadArtifacts(openRun); return; }
   el.querySelectorAll(".run").forEach(n => n.onclick = () => {
     openRun = openRun === n.dataset.id ? null : n.dataset.id;
     if (!openRun) { sel = null; selData = null; }
@@ -301,18 +328,27 @@ function renderRuns(runs, jobs) {
 
 function renderJobs(jobs) {
   const el = $("jobs");
-  if (!jobs.length) { el.innerHTML = '<p class="empty">No runs started from here yet.</p>'; return; }
-  el.innerHTML = jobs.map(j => `<div class="run" data-job="${j.id}">
+  if (!jobs.length) {
+    paint(el, '<p class="empty">No runs started from here yet.</p>');
+    return;
+  }
+  const html = jobs.map(j => `<div class="run" data-job="${j.id}">
       <div class="run-head"><span class="name">${j.sample}</span>
         <span class="badge ${j.state}">${j.state}</span>
         <span class="sub">${j.stage || "starting"} · ${fmtSecs(j.elapsed)}</span></div>
-      ${openJob === j.id ? `<pre id="log-${j.id}">loading…</pre>` : ""}
+      ${openJob === j.id
+          ? `<pre data-key="log|${j.id}">${esc(jobLog[j.id] ?? "loading…")}</pre>`
+          : ""}
     </div>`).join("");
+  paint(el, html);
   el.querySelectorAll(".run").forEach(n => n.onclick = () => {
     openJob = openJob === n.dataset.job ? null : n.dataset.job; refresh();
   });
+  // Stash the text and let the next poll render it. Patching the node after
+  // paint would be undone by the following repaint; calling refresh() from
+  // here would recurse.
   if (openJob) api("/api/log?id=" + encodeURIComponent(openJob))
-    .then(d => { const p = $("log-" + openJob); if (p) p.textContent = d.log || "(no output yet)"; })
+    .then(d => { jobLog[openJob] = d.log || "(no output yet)"; })
     .catch(() => {});
 }
 
