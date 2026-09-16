@@ -108,6 +108,8 @@ if [ "$RUNNER" = nested ]; then
       # localhost there would be unreachable through -p. Bind all interfaces
       # inside and publish to the host's loopback only.
       echo "  http://127.0.0.1:$PORT" >&2
+      echo "  note: browse-only — no sbatch in the image, so this UI cannot" >&2
+      echo "        launch. Run the server on the host to submit jobs." >&2
       exec docker run "${D[@]}" -p "127.0.0.1:$PORT:8765" "$AP_IMAGE" \
         run "${B[@]}" --app web "$IMG" --host 0.0.0.0 --port 8765 --published "$@" ;;
     setup)    exec docker run "${D[@]}" "$AP_IMAGE" \
@@ -126,7 +128,11 @@ fi
 case "$cmd" in
   pipeline) exec $RUNNER run $NV "${BINDS[@]}" --app pipeline "$SIF" --work /work "$@" ;;
   query)    exec $RUNNER run $NV "${BINDS[@]}" --app query    "$SIF" "$@" ;;
-  web)      exec $RUNNER run     "${BINDS[@]}" --app web      "$SIF" --port "$PORT" "$@" ;;
+  web)
+    echo "  note: the UI inside the image can browse but not launch — there is" >&2
+    echo "        no sbatch in it. For launching, run the server on the login" >&2
+    echo "        node: ./sae/.venv/bin/python sae/web/server.py" >&2
+    exec $RUNNER run     "${BINDS[@]}" --app web      "$SIF" --port "$PORT" "$@" ;;
   setup)    exec $RUNNER exec    "${BINDS[@]}" "$SIF" "$APP_SETUP" "$@" ;;
   manifest) exec $RUNNER run     "${BINDS[@]}" --app manifest "$SIF" ;;
   test)     exec $RUNNER test    "$SIF" ;;

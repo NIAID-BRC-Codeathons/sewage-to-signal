@@ -454,6 +454,7 @@ class Handler(BaseHTTPRequestHandler):
                 "roots": [str(r) for r in self.cfg["roots"]],
                 "read_only": self.cfg["read_only"],
                 "uploads": str(self.cfg["uploads"]),
+                "hmms": self._candidate_hmms(),
                 "container": "docker" if IN_DOCKER else
                              ("apptainer" if IN_APPTAINER else None),
                 "launcher": (self.cfg["jobs"].launcher.describe()
@@ -506,6 +507,20 @@ class Handler(BaseHTTPRequestHandler):
         return self._err(404, "not found")
 
     # -- handlers
+    def _candidate_hmms(self) -> list[dict]:
+        """Profile databases for s05. Without one the stage is a pass-through
+        and every protein goes to the GPU, so the UI should not make finding
+        it a matter of knowing a path."""
+        out = []
+        for root in self.cfg["data"]:
+            if not root.is_dir():
+                continue
+            for p in sorted(root.rglob("*.hmm")):
+                if p.is_file() and not p.name.startswith("."):
+                    out.append({"path": str(p), "name": p.name,
+                                "bytes": p.stat().st_size})
+        return out
+
     def _candidate_inputs(self) -> list[dict]:
         """Files that can start a run: uploads plus anything under data/."""
         seen, out = set(), []

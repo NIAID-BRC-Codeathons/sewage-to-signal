@@ -222,6 +222,7 @@ bound to localhost, and should not be exposed. Beyond that:
 |---|---|
 | `GET /api/state` | runs, jobs, stage list, roots, environment |
 | `GET /api/inputs` | files eligible to start a run |
+| `GET /api/state` | also lists `hmms` — profile databases found under the data dirs |
 | `GET /api/artifacts?run=` | files in each stage directory, with shape and size |
 | `GET /api/preview?run=&stage=&file=&limit=` | one artifact as text, table or json |
 | `GET /api/log?id=` | tail of a job's log |

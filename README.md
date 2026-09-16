@@ -174,10 +174,22 @@ container/run.sh pipeline \
 **From a browser.** Progress for every run, an artifact browser, and
 upload-and-launch.
 
+The server runs *outside* the container, on the login node — it only reads
+manifests and submits jobs, so it needs no allocation. Every run it starts goes
+to the scheduler; nothing is forked from the server.
+
 ```bash
-./sae/.venv/bin/python sae/web/server.py      # http://127.0.0.1:8765
-container/run.sh web                          # the same UI from the container
+# on a cluster login node
+./sae/.venv/bin/python sae/web/server.py                  # http://127.0.0.1:8765
+
+# on a laptop: bring a scheduler, then the same command
+container/slurm-local/up.sh                               # SLURM + Apptainer in Docker
+eval "$(container/slurm-local/up.sh env)"
+./sae/.venv/bin/python sae/web/server.py
 ```
+
+`container/run.sh web` serves the same UI from inside the image, but it can
+only browse — there is no `sbatch` in there, so it cannot launch.
 
 It reads the manifests each stage already writes, so runs started from the CLI
 show up too. See **[sae/web/README.md](sae/web/README.md)**.

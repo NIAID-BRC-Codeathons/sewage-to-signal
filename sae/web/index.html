@@ -139,8 +139,8 @@
       <div class="row">
         <div><label for="from">from</label><select id="from"></select></div>
         <div><label for="to">to</label><select id="to"></select></div>
-        <div><label for="hmm">--hmm (Pfam-A.hmm)</label>
-          <input id="hmm" placeholder="path inside the repo"></div>
+        <div><label for="hmm">--hmm (profile database)</label>
+          <select id="hmm"></select></div>
       </div>
       <div class="row">
         <div><label for="bit_cutoffs">--bit-cutoffs</label>
@@ -452,6 +452,17 @@ async function refresh() {
     $("env").textContent =
       `${s.container ? s.container + " container" : "host"} · work: ${s.roots.join("  ")}` +
       (readOnly ? " · read-only" : "");
+    // Default to a provisioned HMM set when there is one: without it s05 is a
+    // pass-through and every protein reaches the GPU stage.
+    if (!$("hmm").options.length || $("hmm").dataset.n !== String((s.hmms || []).length)) {
+      const hs = s.hmms || [];
+      $("hmm").dataset.n = String(hs.length);
+      $("hmm").innerHTML =
+        `<option value="">none — s05 becomes a pass-through</option>` +
+        hs.map(h => `<option value="${esc(h.path)}">${esc(h.name)} ` +
+                    `(${fmtBytes(h.bytes)})</option>`).join("");
+      if (hs.length) $("hmm").value = hs[0].path;
+    }
     if (!$("from").options.length) {
       for (const sel of ["from", "to"]) {
         $(sel).innerHTML = '<option value="">—</option>' +
