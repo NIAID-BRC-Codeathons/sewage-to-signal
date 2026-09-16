@@ -93,7 +93,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh    # or: brew install uv
 | `awk` | FASTQ record validation and mate pairing | required |
 | `gzip` + `gzcat` (or `zcat`) | subsample compression / reading | required |
 | `md5` (or `md5sum`) | verifying mate order after subsampling | required |
-| `megahit` or `spades.py` | pipeline `s02_assemble` | no pip equivalent |
+| `megahit` or `spades.py` | `s02_assemble` — **only** way in from raw reads | no pip equivalent |
 | `mmseqs` | `s04_derep` clustering below 100% identity | optional |
 | `fastp` | `s01_qc`, ~30× faster than the Python path | optional |
 | `aws` | faster, resumable atlas download (else `curl`) | optional |
@@ -102,18 +102,24 @@ curl -LsSf https://astral.sh/uv/install.sh | sh    # or: brew install uv
 those plus data and the optional binaries. Python packages are pinned in
 `requirements.txt`.
 
-The bioinformatics binaries come from bioconda:
+The three bioinformatics binaries have no pip equivalent. The container carries
+them pinned, which is the least painful route:
 
 ```bash
-conda install -c bioconda megahit mmseqs2 fastp
+container/build.sh pull          # prebuilt image from GHCR
 ```
+
+Otherwise `conda install -c bioconda megahit mmseqs2 fastp`. Everything except
+assembly runs without them.
 
 ## Fresh checkout
 
 ```bash
-git clone <url> && cd codeathon
+git clone https://github.com/NIAID-BRC-Codeathons/sewage-to-signal.git
+cd sewage-to-signal
 ./setup.sh                 # status: what is present, what to run next
-./setup.sh quickstart      # ~2 GB — enough to run the pipeline end to end
+./setup.sh quickstart      # ~2 GB — venv, deps, feature table, ESMC-300M, reads
+./setup.sh pfam            # 400 MB — without it s05 is a pass-through
 ```
 
 `./setup.sh` on its own only reports; it never downloads. Every target is
@@ -126,31 +132,67 @@ See **[DATA.md](DATA.md)** for the size and source of every data item.
 ./setup.sh atlas           # ESM Atlas tables, 28.6 GB from the public S3 bucket
 ```
 
-Without an assembler, pipeline stage `s02` blocks with instructions and the
-rest still runs from contigs or proteins.
-
 ## Run it
 
-```bash
-cd sae
-.venv/bin/python sae_testing_script.py --sequence MKTAYIAKQRQ...
-.venv/bin/python sae_testing_script.py --fasta contig.fna --orfs all
+Everything below runs from the repo root and uses the venv interpreter
+explicitly — a bare `python` will not have the dependencies.
 
-cd pipeline
-python run.py --fastq ../../data/fastq_rnaseq/SRR38294894_1.fastq.gz \
-              --fastq2 ../../data/fastq_rnaseq/SRR38294894_2.fastq.gz --sample CHI-A
-python run.py --contigs contigs.fa --sample S1 --from s03_genes
+**One sequence, end to end.** Prints the top SAE features with descriptions.
+
+```bash
+./sae/.venv/bin/python sae/sae_testing_script.py \
+    --sequence MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQ
 ```
 
-Or drive it from a browser — progress for every run, plus upload-and-launch:
+**From a genome or contigs.** Works on a bare checkout — no assembler needed,
+because you are supplying the contigs.
 
 ```bash
-python sae/web/server.py      # http://127.0.0.1:8765
-container/run.sh web          # the same UI from inside the container
+curl -s "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id=NC_045512.2&rettype=fasta&retmode=text" > sars2.fa
+
+./sae/.venv/bin/python sae/pipeline/run.py \
+    --contigs sars2.fa --sample SARS2 \
+    --hmm data/pfam/Pfam-A.hmm --bit-cutoffs gathering --model 300m
+```
+
+That is the validation case, so you can check the answer: s03 calls 9 genes,
+and s05 discards 8 of them as fully explained by Pfam, leaving ORF1a — a
+polyprotein that matches 17 Pfam domains and is still a quarter unaccounted
+for. Results land in `work/SARS2/`.
+
+**From raw reads.** Needs an assembler, so use the container; `/data` and
+`/work` are bind mounts onto `data/` and `./work`.
+
+```bash
+container/run.sh pipeline \
+    --fastq  /data/fastq_rnaseq/SRR38294894_1.fastq.gz \
+    --fastq2 /data/fastq_rnaseq/SRR38294894_2.fastq.gz \
+    --sample CHI-A \
+    --hmm /data/pfam/Pfam-A.hmm --bit-cutoffs gathering --model 300m
+```
+
+**From a browser.** Progress for every run, an artifact browser, and
+upload-and-launch.
+
+```bash
+./sae/.venv/bin/python sae/web/server.py      # http://127.0.0.1:8765
+container/run.sh web                          # the same UI from the container
 ```
 
 It reads the manifests each stage already writes, so runs started from the CLI
 show up too. See **[sae/web/README.md](sae/web/README.md)**.
+
+### Which model, and where to run
+
+`--model 300m` is the right default for a laptop. ESMC-6B is ~12 GB of weights
+and will be OOM-killed in a 16 GB container; it also needs a GPU to be
+practical. 300m gives you retrieval but no feature *descriptions*, since only
+the 6B layer-60 SAE has a published description table.
+
+On Apple Silicon, run `s06_embed` **natively** rather than in the container:
+the container is `linux/amd64` under emulation with no MPS, so it falls back to
+CPU. Measured on the same protein: 1.24 seq/s native on MPS against 0.33 seq/s
+emulated. Assemble in the container, embed outside it.
 
 ## Layout
 
