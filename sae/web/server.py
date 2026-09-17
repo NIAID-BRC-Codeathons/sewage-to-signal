@@ -56,13 +56,41 @@ IN_APPTAINER = bool(os.environ.get("APPTAINER_CONTAINER")
                     or os.environ.get("SINGULARITY_CONTAINER"))
 IN_CONTAINER = IN_DOCKER or IN_APPTAINER
 
-# Single source of truth for the stage list; fall back if run.py cannot import.
+# The pipeline describes itself. Stages, their parameters, the entity levels
+# and which stage fills which role all come from the registry, so this server
+# has no list of stages to keep in step and no schema to mirror - a pipeline it
+# has never seen renders the same way. REGISTRY is None when the pipeline
+# cannot be imported at all; every reader below degrades to what the work
+# directory says rather than failing.
+sys.path.insert(0, str(PIPELINE))
 try:
-    sys.path.insert(0, str(PIPELINE))
-    from run import ORDER as STAGES          # type: ignore
-except Exception:                            # pragma: no cover - defensive
-    STAGES = ["s01_qc", "s02_assemble", "s03_genes", "s04_derep",
-              "s05_prefilter", "s06_embed", "s07_match"]
+    import entities                          # type: ignore
+    from stage import registry               # type: ignore
+
+    REGISTRY = registry()
+except Exception as exc:                     # pragma: no cover - defensive
+    print(f"  warning: cannot load the pipeline registry: {exc}", file=sys.stderr)
+    entities, REGISTRY = None, None
+
+
+def stage_names() -> list[str]:
+    return REGISTRY.names if REGISTRY else []
+
+
+def stage_dirs(run_dir: Path) -> list[str]:
+    """Stage directories actually present, registry order first.
+
+    Reading the directory rather than the registry is what lets the UI display
+    a run produced by a different pipeline, or by a version of this one with
+    stages that have since been removed.
+    """
+    try:
+        found = [p.name for p in sorted(run_dir.iterdir())
+                 if p.is_dir() and not p.name.startswith(".")]
+    except OSError:
+        return []
+    known = [n for n in stage_names() if n in found]
+    return known + [n for n in found if n not in known]
 
 # Sample names and uploaded filenames become path components, so they are
 # restricted rather than escaped - no separators, no leading dot, no traversal.
@@ -93,18 +121,10 @@ PREVIEW_BYTES = 2 * 1024**2
 MAX_CONTEXT_POINTS = 8000
 MAX_PROJECTION_POINTS = 20000
 
-# Options forwarded to run.py. Anything not listed here is rejected, so the
-# request body can never introduce a new flag.
-OPTIONS: dict[str, type] = {
-    "from": str, "to": str, "max_reads": int, "min_aa": int,
-    "hmm": str, "ref": str, "evalue": float, "confident_evalue": float,
-    "min_coverage": float, "bit_cutoffs": str, "top_k": int,
-    "batch_size": int, "limit": int, "device": str, "force": bool,
-    "model": str, "max_len": int,
-}
-CHOICES = {"from": STAGES, "to": STAGES,
-           "bit_cutoffs": ["gathering", "noise", "trusted"],
-           "model": ["6b", "300m"]}
+# What a launch request may contain is derived from the registry rather than
+# listed here: a parameter exists if some stage declares it, and it is valid if
+# that stage's own Param accepts it. The hand-kept mirror of run.py's argparse
+# that used to live here could only ever drift.
 
 
 def defaults() -> dict:
@@ -216,22 +236,7 @@ from launcher import (Job, failure_hint,  # noqa: E402
                       load_jobs, make_launcher, save_job, script_text)
 from reference_map import load as load_reference          # noqa: E402
 from reference_map import normalise, sparse_features      # noqa: E402
-
-
-def _groups_from_classification(tsv: Path) -> dict[str, str]:
-    """gene_id -> s05 category, when the run has one. Optional by design."""
-    out: dict[str, str] = {}
-    try:
-        with open(tsv) as fh:
-            header = fh.readline().rstrip("\n").split("\t")
-            gi, ci = header.index("gene_id"), header.index("category")
-            for line in fh:
-                parts = line.rstrip("\n").split("\t")
-                if len(parts) > max(gi, ci):
-                    out[parts[gi]] = parts[ci]
-    except (OSError, ValueError):
-        pass
-    return out
+import metadata                                           # noqa: E402
 
 
 def _fit_layout(m):
@@ -255,11 +260,29 @@ def _cap(ids, m, limit):
     return ids[::step], m[::step], True
 
 
-def _points(ids, xy, groups: dict, side: str | None) -> list[dict]:
-    return [{"id": g, "x": round(float(xy[i][0]), 3),
-             "y": round(float(xy[i][1]), 3), "group": groups.get(g),
-             **({"side": side} if side else {})}
-            for i, g in enumerate(ids)]
+def _points(ids, xy, rows: dict, column: str | None, domain: dict | None,
+            keep: set | None, side: str | None) -> list[dict]:
+    """Drawable points, carrying the value the plot is coloured by.
+
+    `keep` is the filter: None means no filter was applied, which is not the
+    same as a filter that matched nothing. The slot is resolved here rather
+    than in the browser so that binning a numeric column - and deciding what
+    counts as the folded tail - happens in exactly one place.
+    """
+    out = []
+    for i, g in enumerate(ids):
+        if keep is not None and g not in keep:
+            continue
+        p = {"id": g, "x": round(float(xy[i][0]), 3),
+             "y": round(float(xy[i][1]), 3)}
+        if column:
+            v = (rows.get(g) or {}).get(column)
+            p["v"] = v
+            p["s"] = metadata.slot_of(v, domain) if domain else None
+        if side:
+            p["side"] = side
+        out.append(p)
+    return out
 
 
 def _summarise(mf: Path) -> dict | None:
@@ -277,6 +300,13 @@ def _summarise(mf: Path) -> dict | None:
         "seconds": d.get("seconds"),
         "written": d.get("written"),
         "inputs": [Path(i.get("path", "")).name for i in (d.get("inputs") or [])],
+        # Columns this stage contributed, and to which level. The frontend
+        # renders these without knowing what any of them mean.
+        "tables": [{"level": t.get("level"), "role": t.get("role"),
+                    "where": t.get("where"),
+                    "columns": [c.get("name") for c in (t.get("columns") or [])
+                                if c.get("name") not in (t.get("key") or [])]}
+                   for t in (d.get("tables") or [])],
     }
 
 
@@ -294,10 +324,8 @@ def scan(roots: list[Path]) -> list[dict]:
             if sample_dir.name.startswith("."):
                 continue
             stages, latest = {}, None
-            for stage in STAGES:
+            for stage in stage_dirs(sample_dir):
                 sd = sample_dir / stage
-                if not sd.is_dir():
-                    continue
                 mfs = sorted(sd.glob("*.manifest.json"))
                 if not mfs:
                     stages[stage] = {"state": "started"}   # dir but no manifest
@@ -315,6 +343,11 @@ def scan(roots: list[Path]) -> list[dict]:
                     "sample": sample_dir.name,
                     "root": str(root),
                     "stages": stages,
+                    # The order these ran in, as this run actually has them -
+                    # not the registry's, so a run from another pipeline still
+                    # draws a sensible strip.
+                    "order": list(stages),
+                    "levels": entities.levels_present(sample_dir) if entities else [],
                     "updated": latest,
                     "done": sum(1 for v in stages.values() if v["state"] == "done"),
                 })
@@ -335,11 +368,18 @@ def stage_from_log(log: Path, live: bool) -> str | None:
     if not seen:
         return None
     last = seen[-1]
-    if last not in STAGES:
+    if not live:
         return last
-    # The line is printed on completion, so the next stage is in flight.
-    i = STAGES.index(last)
-    return STAGES[i + 1] if (live and i + 1 < len(STAGES)) else last
+    # The line is printed on completion, so the next stage is in flight. Which
+    # one that is comes from the plan run.py printed, not from a fixed order -
+    # a run with --only or --skip has a different sequence, and a run from
+    # another pipeline has different stages entirely.
+    planned = re.findall(r"^\s{2}(\w+)\s+\S+ -> ", text, re.MULTILINE) \
+        or stage_names()
+    if last in planned:
+        i = planned.index(last)
+        return planned[i + 1] if i + 1 < len(planned) else last
+    return last
 
 
 class Jobs:
@@ -396,35 +436,79 @@ class Jobs:
 
 
 def build_argv(body: dict, allowed: list[Path]) -> list[str]:
-    """Translate a request body into run.py flags, rejecting anything unlisted."""
-    kind = body.get("input_kind")
-    if kind not in ("fastq", "contigs", "proteins"):
-        raise ValueError("input_kind must be fastq, contigs or proteins")
-    argv = [f"--{kind}", checked_path(body.get("input_path"), allowed)]
-    if kind == "fastq" and body.get("input_path2"):
-        argv += ["--fastq2", checked_path(body["input_path2"], allowed)]
+    """Translate a request body into run.py flags.
 
-    for key, value in (body.get("options") or {}).items():
-        if key not in OPTIONS:
-            raise ValueError(f"unknown option: {key}")
-        if value in (None, ""):
+    Validation is the registry's: a parameter is accepted because some stage
+    declares it and that stage's own ``Param`` coerces the value, so this
+    function has nothing to keep in step with the pipeline. Predicates go
+    through ``guard_predicate`` for the same reason the pipeline does - the
+    server writes files, and a WHERE clause can reach a COPY.
+
+        {"sample": "CHI-A", "input_kind": "contigs", "input_path": "...",
+         "target": "feature",
+         "params": {"s05_prefilter": {"hmm": "/data/pfam/Pfam-A.hmm"}},
+         "where":  {"s06_embed": "category = 'dark' AND aa_len > 200"}}
+    """
+    if REGISTRY is None:
+        raise ValueError("the pipeline registry is unavailable on this server")
+
+    argv: list[str] = []
+    kind = body.get("input_kind")
+    if kind:
+        if entities and kind not in entities.FILE_KINDS:
+            raise ValueError(f"input_kind must be one of "
+                             f"{', '.join(entities.FILE_KINDS)}")
+        flag = {"reads": "fastq"}.get(kind, kind)
+        argv += [f"--{flag}", checked_path(body.get("input_path"), allowed)]
+        if body.get("input_path2"):
+            argv += ["--fastq2", checked_path(body["input_path2"], allowed)]
+    elif body.get("start"):
+        argv += ["--from", str(body["start"])]
+    else:
+        raise ValueError("give input_kind with input_path, or a start port")
+
+    if body.get("target"):
+        argv += ["--to", str(body["target"])]
+    if body.get("force"):
+        argv.append("--force")
+    for name in body.get("only") or []:
+        if name not in REGISTRY:
+            raise ValueError(f"no stage named {name!r}")
+        argv += ["--only", name]
+    for name in body.get("skip") or []:
+        if name not in REGISTRY:
+            raise ValueError(f"no stage named {name!r}")
+        argv += ["--skip", name]
+
+    for stage_name, values in (body.get("params") or {}).items():
+        if stage_name not in REGISTRY:
+            raise ValueError(f"no stage named {stage_name!r}")
+        st = REGISTRY[stage_name]
+        for key, value in (values or {}).items():
+            param = st.param(key)
+            if param is None:
+                raise ValueError(
+                    f"{stage_name} has no parameter {key!r}; have "
+                    + ", ".join(p.name for p in st.params))
+            if value in (None, ""):
+                continue
+            if param.path:
+                # A path parameter is still a path, whoever declared it.
+                argv += ["--set", f"{stage_name}.{key}={checked_path(value, allowed)}"]
+                continue
+            coerced = param.coerce(value)          # raises ValueError on a bad one
+            if param.type is bool and not coerced:
+                continue
+            argv += ["--set", f"{stage_name}.{key}={coerced}"]
+
+    for stage_name, expr in (body.get("where") or {}).items():
+        if stage_name not in REGISTRY:
+            raise ValueError(f"no stage named {stage_name!r}")
+        if not REGISTRY[stage_name].selectable:
+            raise ValueError(f"{stage_name} does not take a selection")
+        if not expr or not str(expr).strip():
             continue
-        typ = OPTIONS[key]
-        flag = "--" + key.replace("_", "-")
-        if typ is bool:
-            if value:
-                argv.append(flag)
-            continue
-        if key in ("hmm", "ref"):          # these are paths too
-            argv += [flag, checked_path(value, allowed)]
-            continue
-        try:
-            coerced = typ(value)
-        except (TypeError, ValueError):
-            raise ValueError(f"{key} must be {typ.__name__}")
-        if key in CHOICES and str(coerced) not in CHOICES[key]:
-            raise ValueError(f"{key} must be one of {', '.join(CHOICES[key])}")
-        argv += [flag, str(coerced)]
+        argv += ["--where", f"{stage_name}={entities.guard_predicate(str(expr))}"]
     return argv
 
 
@@ -487,11 +571,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({
                 "runs": scan(self.cfg["roots"]),
                 "jobs": self.cfg["jobs"].all(),
-                "stages": STAGES,
+                "stages": stage_names(),
                 "roots": [str(r) for r in self.cfg["roots"]],
                 "read_only": self.cfg["read_only"],
                 "uploads": str(self.cfg["uploads"]),
-                "hmms": self._candidate_hmms(),
+                "data_files": self._candidate_data(),
                 "container": "docker" if IN_DOCKER else
                              ("apptainer" if IN_APPTAINER else None),
                 "launcher": self.cfg["jobs"].launcher.describe(),
@@ -519,6 +603,19 @@ class Handler(BaseHTTPRequestHandler):
                 "path": str(job.script) if job.script else None,
                 "script": script_text(job),
             })
+        if u.path == "/api/pipeline":
+            return self._pipeline()
+        if u.path == "/api/columns":
+            return self._columns((q.get("run") or [""])[0],
+                                 (q.get("level") or [""])[0])
+        if u.path == "/api/query":
+            try:
+                limit = int((q.get("limit") or ["20"])[0])
+            except ValueError:
+                limit = 20
+            return self._query((q.get("run") or [""])[0],
+                               (q.get("level") or ["gene"])[0],
+                               (q.get("where") or [""])[0], limit)
         if u.path == "/api/inputs":
             return self._json({"files": self._candidate_inputs()})
         if u.path == "/api/artifacts":
@@ -528,7 +625,9 @@ class Handler(BaseHTTPRequestHandler):
             # single-run URL is unchanged.
             return self._projection((q.get("run") or [""])[0],
                                     (q.get("mode") or ["reference"])[0],
-                                    (q.get("b") or [""])[0])
+                                    (q.get("b") or [""])[0],
+                                    (q.get("color") or [""])[0],
+                                    (q.get("filter") or [""])[0])
         if u.path == "/api/preview":
             try:
                 limit = int((q.get("limit") or ["0"])[0]) or PREVIEW_ROWS
@@ -557,18 +656,34 @@ class Handler(BaseHTTPRequestHandler):
         return self._err(404, "not found")
 
     # -- handlers
-    def _candidate_hmms(self) -> list[dict]:
-        """Profile databases for s05. Without one the stage is a pass-through
-        and every protein goes to the GPU, so the UI should not make finding
-        it a matter of knowing a path."""
+    def _candidate_data(self) -> list[dict]:
+        """Files under data/ that some path parameter could be pointed at.
+
+        The suffixes come from the parameters themselves, so a new stage that
+        wants a ``.dmnd`` gets a working file picker without this server
+        learning what Diamond is. Without a Pfam database, for instance, s05 is
+        a pass-through and every protein reaches the GPU - the UI should not
+        make finding it a matter of knowing a path.
+        """
+        wanted = {sfx.lower()
+                  for st in (REGISTRY or []) for prm in st.params
+                  if prm.path for sfx in prm.suffixes}
+        if not wanted:
+            return []
         out = []
         for root in self.cfg["data"]:
             if not root.is_dir():
                 continue
-            for p in sorted(root.rglob("*.hmm")):
-                if p.is_file() and not p.name.startswith("."):
-                    out.append({"path": str(p), "name": p.name,
-                                "bytes": p.stat().st_size})
+            for p in sorted(root.rglob("*")):
+                if len(out) >= MAX_LISTING:
+                    break
+                if not p.is_file() or p.name.startswith("."):
+                    continue
+                if p.suffix.lower() not in wanted:
+                    continue
+                out.append({"path": str(p), "name": p.name,
+                            "suffix": p.suffix.lower(),
+                            "bytes": p.stat().st_size})
         return out
 
     def _candidate_inputs(self) -> list[dict]:
@@ -605,16 +720,97 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("no such run")
         return d
 
+    def _pipeline(self):
+        """The whole pipeline, described well enough to render a UI from.
+
+        Stages, their parameters with types / defaults / choices / help, the
+        entity levels and their keys, which external tools are actually
+        installed. The frontend builds its form out of this and holds no
+        knowledge of any stage.
+        """
+        if REGISTRY is None:
+            return self._err(503, "the pipeline registry is unavailable")
+        body = REGISTRY.to_json()
+        body["roles"] = sorted({r for s in REGISTRY for r in s.roles})
+        return self._json(body)
+
+    def _columns(self, run_id: str, level: str):
+        """What can be predicated on for this run, and who wrote each column.
+
+        This is the vocabulary a person needs to write a selection, and it is
+        read from the run rather than declared - a column exists here because
+        some stage actually produced it.
+        """
+        if entities is None:
+            return self._err(503, "the pipeline registry is unavailable")
+        try:
+            run_dir = self._run_dir(run_id)
+        except ValueError as exc:
+            return self._err(404, str(exc))
+        levels = entities.levels_present(run_dir)
+        level = level or (levels[0] if levels else "")
+        if not level:
+            return self._json({"run": run_id, "levels": [], "level": None,
+                               "columns": []})
+        a = entities.assemble(run_dir, level)
+        if a is None:
+            return self._err(404, f"this run has no {level!r} level")
+        try:
+            n = entities.count(run_dir, level, roots=self.cfg["roots"])
+        except Exception:
+            n = None
+        return self._json({
+            "run": run_id, "levels": levels, "level": level, "rows": n,
+            "key": list(entities.LEVELS[level].key) if level in entities.LEVELS else [],
+            "columns": a.columns, "collisions": a.collisions,
+            # Sibling samples are queryable as "<sample>".<level>, so the UI can
+            # offer them rather than making people guess the syntax.
+            "samples": sorted({p.name for root in self.cfg["roots"]
+                               if root.is_dir()
+                               for p in root.iterdir()
+                               if p.is_dir() and not p.name.startswith(".")
+                               and entities.levels_present(p)}),
+        })
+
+    def _query(self, run_id: str, level: str, where: str, limit: int):
+        """How many rows a predicate selects, and a look at them.
+
+        The point of the endpoint is that you can see what a selection does
+        before spending a GPU on it. It is read-only: the predicate is guarded,
+        and it runs against a throwaway in-memory connection over parquet.
+        """
+        if entities is None:
+            return self._err(503, "the pipeline registry is unavailable")
+        try:
+            run_dir = self._run_dir(run_id)
+        except ValueError as exc:
+            return self._err(404, str(exc))
+        try:
+            expr = entities.guard_predicate(where) or None
+        except ValueError as exc:
+            return self._err(400, str(exc))
+        roots = self.cfg["roots"]
+        try:
+            n = entities.count(run_dir, level, expr, roots=roots)
+            # `seq` is megabytes of amino acids nobody is reading in a preview.
+            a = entities.assemble(run_dir, level)
+            cols = [c["name"] for c in (a.columns if a else []) if c["name"] != "seq"]
+            rows = entities.select(run_dir, level, expr, columns=cols or None,
+                                   limit=max(1, min(limit, 500)), roots=roots)
+        except Exception as exc:
+            return self._err(422, f"{type(exc).__name__}: {exc}".strip()[:400])
+        return self._json({"run": run_id, "level": level, "where": expr,
+                           "matched": n, "columns": rows.column_names,
+                           "rows": rows.to_pylist()})
+
     def _artifacts(self, run_id: str):
         try:
             run_dir = self._run_dir(run_id)
         except ValueError as exc:
             return self._err(404, str(exc))
         out: dict[str, list] = {}
-        for stage in STAGES:
+        for stage in stage_dirs(run_dir):
             sd = run_dir / stage
-            if not sd.is_dir():
-                continue
             files = []
             for f in sorted(sd.iterdir()):
                 if not f.is_file() or f.name.startswith("."):
@@ -636,24 +832,67 @@ class Handler(BaseHTTPRequestHandler):
         return self.cfg["reference"]
 
     def _features(self, run_id: str):
-        """A run's s06 output as (dir, gene ids, L2-normalised sparse matrix).
+        """A run's feature hits as (dir, gene ids, L2-normalised sparse matrix).
 
-        ValueError means "no such run, or nothing to plot in it" and is the
-        caller's 404; ImportError is let through so a missing dependency is
-        reported as one rather than as a bad request.
+        The stage is found by the role it declares, not by name: any stage that
+        says it fills ``projection`` can be the source, so a pipeline that
+        embeds differently still draws a map. ValueError means "no such run, or
+        nothing to plot in it" and is the caller's 404; ImportError is let
+        through so a missing dependency is reported as one rather than as a bad
+        request.
         """
         run_dir = self._run_dir(run_id)
-        found = sorted((run_dir / "s06_embed").glob("*.sae_features.parquet"))
+        found = []
+        for st in (REGISTRY.by_role("projection") if REGISTRY else []):
+            found += sorted((run_dir / st.name).glob("*.sae_features.parquet"))
         if not found:
-            raise ValueError(f"{run_dir.name} has no s06_embed output")
+            raise ValueError(f"{run_dir.name} has nothing to project")
         ids, m = sparse_features(found[0])
         return run_dir, ids, normalise(m)
 
-    def _classes(self, run_dir: Path) -> dict[str, str]:
-        found = sorted((run_dir / "s05_prefilter").glob("*.classification.tsv"))
-        return _groups_from_classification(next(iter(found), run_dir / "missing"))
+    def _meta(self, run_dir: Path):
+        """(column descriptors, gene_id -> row) for a run, cached per process.
 
-    def _projection(self, run_id: str, mode: str, b_id: str = ""):
+        This replaces a lookup of `category` alone. Category was never special
+        - it is one column a stage happened to write - and the map colours and
+        filters by any of them, so the map reads the whole gene level and lets
+        the page choose. Re-read only when a manifest under the sample is newer
+        than the cache, so re-running a stage shows up without a restart.
+        """
+        cache = self.cfg.setdefault("meta_cache", {})
+        key = str(run_dir)
+        stamp = max((f.stat().st_mtime
+                     for f in run_dir.glob("*/*.manifest.json")), default=0.0)
+        hit = cache.get(key)
+        if hit and hit[0] == stamp:
+            return hit[1], hit[2]
+        try:
+            descs, rows = metadata.load(run_dir)
+        except Exception:
+            descs, rows = [], {}
+        cache[key] = (stamp, descs, rows)
+        return descs, rows
+
+    def _color_choice(self, requested: str, usable: list, comparing: bool):
+        """Which column the plot is coloured by, and its fixed domain.
+
+        An overlay defaults to colouring by sample, because telling the two
+        runs apart is the question it was opened to answer. A single run
+        defaults to the triage class, which is what the map has always shown.
+        A request naming a column this run does not have falls back rather
+        than failing - switching runs should not 400.
+        """
+        by_name = {d["name"]: d for d in usable}
+        if comparing and requested in ("", "sample"):
+            return None, None, None
+        want = requested or ("category" if "category" in by_name else "")
+        d = by_name.get(want)
+        if d is None:
+            return None, None, None
+        return d["name"], metadata.color_domain(d), d
+
+    def _projection(self, run_id: str, mode: str, b_id: str = "",
+                    color: str = "", filt: str = ""):
         """One run's proteins in 2D, or two runs drawn in the same 2D.
 
         The overlay is the reason the layout is fixed rather than fitted per
@@ -723,10 +962,44 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             return self._err(422, f"projection failed: {exc}")
 
-        points = _points(ids, xy, self._classes(run_dir),
+        # Colour and filter by any column the gene level carries. Which columns
+        # exist is read from the run, so a stage added later is another thing
+        # to colour by with no change here or in the page.
+        descs_a, rows_a = self._meta(run_dir)
+        descs_b, rows_b = self._meta(b_dir) if other is not None else ([], {})
+        # An overlay may only offer columns both sides have: a scale shown over
+        # two runs has to mean the same thing on both.
+        usable = metadata.merge(descs_a, descs_b) if other is not None else descs_a
+        column, domain, _ = self._color_choice(color, usable, other is not None)
+
+        keep_a = keep_b = None
+        where = ""
+        if filt:
+            try:
+                terms = json.loads(filt)
+            except json.JSONDecodeError:
+                return self._err(400, "filter must be a JSON array of terms")
+            try:
+                where = metadata.build_where(terms, usable)
+            except metadata.BadFilter as exc:
+                return self._err(400, str(exc))
+            if where:
+                keep_a = metadata.matching(run_dir, where)
+                if other is not None:
+                    keep_b = metadata.matching(b_dir, where)
+
+        points = _points(ids, xy, rows_a, column, domain, keep_a,
                          "a" if other is not None else None)
         if other is not None:
-            points += _points(b_ids, b_xy, self._classes(b_dir), "b")
+            points += _points(b_ids, b_xy, rows_b, column, domain, keep_b, "b")
+        if not points:
+            return self._err(422, "the filter matched nothing in this run")
+        # The page's legend still reads `group`, from when the map could only
+        # colour by triage class. Carry it while that is the chosen column, so
+        # a page older than this server keeps rendering.
+        if column == "category":
+            for p in points:
+                p["group"] = p.get("v")
 
         # With top-K over a 16,384-wide codebook two proteins may share no
         # features at all, and then the layout is noise. Say so rather than let
@@ -738,8 +1011,12 @@ class Handler(BaseHTTPRequestHandler):
         shared = int((counts > 1).sum())
         body = {
             "run": run_id, "mode": used, "n": len(points), "points": points,
-            "groups": sorted({p["group"] for p in points if p["group"]}),
+            "groups": sorted({p["group"] for p in points if p.get("group")}),
             "context": context,
+            # What the plot is coloured by, the columns it could be coloured or
+            # filtered by instead, and the filter actually applied.
+            "color": column, "domain": domain, "columns": usable,
+            "filter": where or None,
             "distinct_features": distinct, "shared_features": shared,
             "shared_frac": round(shared / distinct, 3) if distinct else 0.0,
         }
@@ -767,7 +1044,7 @@ class Handler(BaseHTTPRequestHandler):
             run_dir = self._run_dir(run_id)
         except ValueError as exc:
             return self._err(404, str(exc))
-        if stage not in STAGES:
+        if stage not in stage_dirs(run_dir):
             return self._err(400, "unknown stage")
         if "/" in name or "\\" in name or not SAFE_NAME.match(name):
             return self._err(400, "bad filename")

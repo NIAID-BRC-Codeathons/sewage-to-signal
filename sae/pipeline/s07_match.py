@@ -4,6 +4,12 @@ Joins the parquet from s06 against the published SAE feature table (adding
 human-readable descriptions) and then against the local ESM Atlas
 representatives.
 
+It annotates the **feature** level, not the hit table: a summary is a property
+of a codebook feature, so it is stored once per feature rather than once per
+gene that happened to activate it. Anything wanting both joins them - which is
+what the level key is for. Cluster matches are many-per-feature, so they are
+their own level.
+
 The cluster join bridges through UniRef accessions because the local tables
 carry no SAE-feature column. That bridge covers only ~2.3% of the feature
 table's accessions, so treat recovered clusters as leads, not as a survey.
@@ -17,7 +23,22 @@ import argparse
 import time
 from pathlib import Path
 
-from common import StageResult, workdir, write_manifest
+from common import StageResult, is_current, workdir, write_fragment, write_manifest
+from stage import Column, Param, Stage
+
+FEATURE_HELP = {
+    "summary": "human-readable description of what the feature detects",
+    "feature_category": "the feature table's own category for it",
+    "threshold": "activation the published table considers meaningful",
+    "uniref90_frequency": "how common the feature is across UniRef90",
+}
+CLUSTER_HELP = {
+    "cluster_rep_protein_hash": "ESM Atlas cluster representative",
+    "uniref_match_accession": "accession that bridged feature to cluster",
+    "lca_taxonomy": "lowest common ancestor of the cluster",
+    "product_name": "product name recorded for the cluster",
+    "pfam": "top Pfam names for the cluster",
+}
 
 FEATURE_REPO = "biohub/ESMC-SAE-Features"
 FEATURE_FILE = "uniref90_feature_table.parquet"
@@ -39,39 +60,53 @@ def load_features(feature_ids):
 
 
 def run(
-    features_parquet: Path,
+    rows,
     out_dir: Path,
     sample: str,
-    reps: Path,
+    source: Path | None = None,
+    where: str | None = None,
+    reps: Path | None = None,
     uniref_per_feature: int = 100,
     skip_clusters: bool = False,
     force: bool = False,
 ) -> StageResult:
     import pyarrow as pa
-    import pyarrow.compute as pc
     import pyarrow.dataset as ds
-    import pyarrow.parquet as pq
 
-    features_parquet = Path(features_parquet)
-    out = Path(out_dir) / f"{sample}.annotated.parquet"
+    out = Path(out_dir) / f"{sample}.feature_meta.parquet"
     clusters_out = Path(out_dir) / f"{sample}.clusters.parquet"
-    t0 = time.time()
+    params = {"uniref_per_feature": uniref_per_feature,
+              "skip_clusters": skip_clusters, "where": where}
+    deps = [Path(source)] if source else []
+    if not force and is_current(out, deps, params):
+        return StageResult("s07_match", out, {}, skipped=True,
+                           produced={"feature": None, "cluster_hit": None})
 
-    feats = pq.read_table(features_parquet)
-    fids = set(feats.column("feature_id").to_pylist())
+    t0 = time.time()
+    fids = sorted(set(rows.column("feature_id").to_pylist()))
+    if not fids:
+        raise SystemExit("the selection is empty - no features to annotate"
+                         + (f" (predicate: {where})" if where else ""))
     table = load_features(fids)
 
-    ann = feats.append_column(
-        "summary",
-        pa.array([(table.get(f) or {}).get("summary") for f in feats.column("feature_id").to_pylist()]),
-    ).append_column(
-        "category",
-        pa.array([(table.get(f) or {}).get("category") for f in feats.column("feature_id").to_pylist()]),
-    )
-    pq.write_table(ann, out, compression="zstd")
-    stats = {"rows": ann.num_rows, "distinct_features": len(fids)}
+    # One row per feature, not per hit: `category` is renamed because s05
+    # already owns that name on the gene level, and two columns called
+    # `category` meaning different things is exactly the confusion the
+    # fragment model is meant to prevent.
+    meta = pa.table({
+        "feature_id": pa.array(fids, pa.int32()),
+        "summary": pa.array([(table.get(f) or {}).get("summary") for f in fids]),
+        "feature_category": pa.array([(table.get(f) or {}).get("category") for f in fids]),
+        "threshold": pa.array([(table.get(f) or {}).get("threshold") for f in fids],
+                              pa.float64()),
+        "uniref90_frequency": pa.array(
+            [(table.get(f) or {}).get("uniref90_frequency") for f in fids], pa.float64()),
+    })
+    frags = [write_fragment(out, meta, "feature", help=FEATURE_HELP)]
+    stats = {"features": len(fids),
+             "described": sum(1 for f in fids if f in table)}
 
-    if not skip_clusters and Path(reps).exists():
+    if not skip_clusters and reps and Path(reps).exists():
         nominations: dict[int, dict[str, float]] = {}
         for fid in fids:
             row = table.get(fid)
@@ -108,14 +143,48 @@ def run(
                         "pfam": "; ".join(f"{a} ({b})" for a, b in (r["cluster_top_pfam_names"] or [])[:3]),
                     })
             if rows:
-                pq.write_table(pa.Table.from_pylist(rows), clusters_out, compression="zstd")
+                frags.append(write_fragment(
+                    clusters_out, pa.Table.from_pylist(rows), "cluster_hit",
+                    role="base", help=CLUSTER_HELP))
             stats["cluster_rows"] = len(rows)
             stats["uniref_probed"] = len(wanted)
 
     el = time.time() - t0
-    write_manifest(out, [features_parquet], {"uniref_per_feature": uniref_per_feature},
-                   stats, seconds=el)
-    return StageResult("s07_match", out, stats, seconds=el)
+    write_manifest(out, deps, params, stats, seconds=el, tables=frags,
+                   stage="s07_match")
+    return StageResult("s07_match", out, stats, seconds=el,
+                       produced={"feature": None, "cluster_hit": None})
+
+
+STAGE = Stage(
+    name="s07_match",
+    title="Annotate features",
+    summary="Join SAE features to the published description table, and bridge "
+            "through UniRef to candidate ESM Atlas clusters.",
+    run=run,
+    consumes="feature",
+    produces="feature",
+    also_produces=("cluster_hit",),
+    order=70,
+    roles=("descriptions",),
+    adds=(
+        Column("summary", "string", FEATURE_HELP["summary"]),
+        Column("feature_category", "string", FEATURE_HELP["feature_category"]),
+        Column("threshold", "double", FEATURE_HELP["threshold"]),
+        Column("uniref90_frequency", "double", FEATURE_HELP["uniref90_frequency"]),
+    ),
+    params=(
+        Param("reps", str, None, group="match", path=True,
+              suffixes=(".parquet",),
+              help="ESM Atlas representative_proteins.parquet; without it the "
+                   "cluster bridge is skipped"),
+        Param("uniref_per_feature", int, 100, group="match",
+              help="UniRef accessions probed per feature"),
+        Param("skip_clusters", bool, False, group="match",
+              help="descriptions only; do not touch the atlas tables"),
+    ),
+    requires=(),
+)
 
 
 def main():
@@ -126,9 +195,14 @@ def main():
     p.add_argument("--reps", type=Path,
                    default=Path(__file__).resolve().parent.parent / "representative_proteins.parquet")
     p.add_argument("--skip-clusters", action="store_true")
+    p.add_argument("--force", action="store_true")
     a = p.parse_args()
-    r = run(a.features, workdir(a.work, a.sample, "s07_match"), a.sample,
-            reps=a.reps, skip_clusters=a.skip_clusters)
+    import pyarrow.parquet as pq
+
+    feats = pq.read_table(a.features, columns=["feature_id"])
+    r = run(feats, workdir(a.work, a.sample, "s07_match"), a.sample,
+            source=a.features, reps=a.reps, skip_clusters=a.skip_clusters,
+            force=a.force)
     print(r.describe())
 
 

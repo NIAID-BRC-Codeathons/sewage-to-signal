@@ -12,6 +12,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from stage import Param, Stage, Tool
 from common import (
     StageResult,
     is_current,
@@ -140,6 +141,33 @@ def run(
     r = StageResult("s01_qc", out, stats, seconds=el)
     r.mate = out2
     return r
+
+
+STAGE = Stage(
+    name="s01_qc",
+    title="Read QC",
+    summary="Sliding-window quality trimming, length and N filtering, with "
+            "optional subsampling. Reads stay files: a per-read table is the "
+            "one place the annotation model does not pay.",
+    run=run,
+    consumes="reads",
+    produces="reads",
+    order=10,
+    input_arg="fastq",
+    params=(
+        Param("min_q", int, 20, group="qc",
+              help="mean quality a window must reach"),
+        Param("window", int, 4, group="qc", help="sliding window size"),
+        Param("min_len", int, 50, group="qc",
+              help="drop reads shorter than this after trimming"),
+        Param("max_n_frac", float, 0.1, group="qc",
+              help="drop reads with more than this fraction of Ns"),
+        Param("max_reads", int, None, group="qc",
+              help="subsample to this many reads"),
+    ),
+    requires=(Tool("fastp", optional=True,
+                   hint="far faster and adaptor-aware; pyfastx is used without it"),),
+)
 
 
 def main():

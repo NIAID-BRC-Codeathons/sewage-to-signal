@@ -128,6 +128,26 @@
   .seg button{border:0;border-radius:0;padding:3px 9px;font:11px var(--mono);
               font-weight:400;background:var(--bg);color:var(--dim);width:auto}
   .seg button.on{background:var(--ink);color:var(--bg)}
+  /* Generated launch form. Every control below is built from /api/pipeline,
+     so these rules style shapes — a fieldset per stage, a hint under a
+     control — and never a particular stage or parameter. */
+  .plan{display:flex;gap:3px;flex-wrap:wrap;margin:8px 0 2px;align-items:center}
+  .plan .sub{margin-right:4px}
+  .plan .cell{flex:0 0 auto;min-width:0;padding:3px 8px}
+  fieldset{border:1px solid var(--line);border-radius:6px;padding:8px 12px 12px;
+           margin:10px 0 0;min-width:0}
+  legend{font:12px var(--mono);color:var(--ink);padding:0 6px}
+  legend .sub{font-weight:400}
+  .hint{color:var(--dim);font-size:11px;font-family:var(--mono);margin-top:3px;
+        line-height:1.4}
+  .hint.bad{color:var(--bad)}
+  .sel{margin-top:8px}
+  .sel input{font-size:12px}
+  .cols{margin-top:4px;display:flex;gap:4px;flex-wrap:wrap;align-items:baseline}
+  .col{font:10.5px var(--mono);padding:1px 5px;border-radius:3px;
+       border:1px solid var(--line);color:var(--dim)}
+  code{font:11px var(--mono);background:var(--bg);padding:1px 4px;
+       border-radius:3px;border:1px solid var(--line)}
 </style>
 </head>
 <body>
@@ -160,31 +180,15 @@
       <div><label for="sample">Sample name</label>
         <input id="sample" placeholder="CHI-B" maxlength="64"></div>
     </div>
-    <details>
-      <summary>Stage range and prefilter options</summary>
-      <div class="row">
-        <div><label for="from">from</label><select id="from"></select></div>
-        <div><label for="to">to</label><select id="to"></select></div>
-        <div><label for="hmm">--hmm (profile database)</label>
-          <select id="hmm"></select></div>
-      </div>
-      <div class="row">
-        <div><label for="bit_cutoffs">--bit-cutoffs</label>
-          <select id="bit_cutoffs"><option value="">—</option>
-            <option>gathering</option><option>noise</option><option>trusted</option>
-          </select></div>
-        <div><label for="min_coverage">--min-coverage</label>
-          <input id="min_coverage" placeholder="0.80"></div>
-        <div><label for="confident_evalue">--confident-evalue</label>
-          <input id="confident_evalue" placeholder="1e-20"></div>
-        <div><label for="limit">--limit (cap GPU stage)</label>
-          <input id="limit" placeholder="e.g. 50"></div>
-        <div><label for="model">model (s06)</label>
-          <select id="model">
-            <option value="">6b — needs ~12 GB + GPU</option>
-            <option value="300m">300m — runs on CPU, no descriptions</option>
-          </select></div>
-      </div>
+    <div class="row">
+      <div><label for="target">Produce</label><select id="target"></select></div>
+    </div>
+    <!-- Everything below is generated from /api/pipeline. There is no stage
+         name, parameter name or predicate in this file. -->
+    <div id="plan" class="plan"></div>
+    <details id="opts-wrap">
+      <summary>Stage options and selections</summary>
+      <div id="opts"></div>
     </details>
     <div style="margin-top:12px"><button id="go">Start run</button></div>
     <div class="msg" id="msg"></div>
@@ -203,6 +207,10 @@
 <script>
 const $ = id => document.getElementById(id);
 let STAGES = [], openRun = null, openJob = null, readOnly = false;
+// The pipeline's description of itself, from /api/pipeline: stages, their
+// parameters, the entity levels, which stage fills which role. Every control
+// and every label below is built out of this, so this file names no stage.
+let PIPELINE = null, DATA_FILES = [];
 // Artifact browsing. The server normalises every file to text / table / json,
 // so nothing here knows a stage's schema — a stage can change its columns, or
 // a new stage appear, with no change to this file.
@@ -265,14 +273,22 @@ async function api(path, opts) {
   return d;
 }
 
+// The strip shows the stages this run actually has, in the order the server
+// found them — not a fixed list. A run from a different pipeline, or from a
+// version of this one with stages since removed, still draws correctly.
 function stageCells(run, activeStage) {
-  return STAGES.map(s => {
+  const known = {};
+  for (const s of (PIPELINE?.stages || [])) known[s.name] = s;
+  return (run.order || Object.keys(run.stages)).map(s => {
     const st = run.stages[s];
     let cls = "cell";
     if (st && st.state === "done") cls += " done";
     else if (st) cls += " started";
     if (s === activeStage) cls += " active";
-    return `<div class="${cls}" title="${s}">${s.replace(/^s\d+_/, "")}</div>`;
+    const d = known[s];
+    const tip = d ? `${s} — ${d.title}: ${d.summary}` : s;
+    return `<div class="${cls}" title="${esc(tip)}">` +
+           `${esc(d ? d.title : s.replace(/^s\d+_/, ""))}</div>`;
   }).join("");
 }
 
@@ -426,19 +442,30 @@ function renderMap(run) {
 
 function renderDetail(run) {
   const known = artifacts[run.id];
-  const rows = STAGES.filter(s => run.stages[s]).map(s => {
+  const rows = (run.order || Object.keys(run.stages)).map(s => {
     const d = run.stages[s];
     const files = renderFiles(run.id, s);
     const fileRow = files ? `<tr><td colspan="4">${files}</td></tr>` : "";
     if (d.state !== "done")
       return `<tr><td class="k">${esc(s)}</td><td colspan="3">${esc(d.state)}</td></tr>${fileRow}`;
     const stats = Object.entries(d.stats).map(([k, v]) => `${k}=${v}`).join("  ");
+    // Columns the stage contributed, and the selection it ran on. Both come
+    // from the manifest, so this renders for a stage nothing here knows.
+    const cols = (d.tables || []).map(t =>
+      `<div class="cols"><span class="sub">${esc(t.level)}${
+        t.where ? " where " + esc(t.where) : ""}:</span> ` +
+      t.columns.map(c => `<span class="col">${esc(c)}</span>`).join("") + `</div>`
+    ).join("");
     return `<tr><td class="k">${esc(s)}</td><td>${fmtSecs(d.seconds)}</td>` +
            `<td>${esc(d.output)} <span class="sub">${fmtBytes(d.bytes)}</span></td>` +
-           `<td>${esc(stats || "—")}</td></tr>${fileRow}`;
+           `<td>${esc(stats || "—")}${cols}</td></tr>${fileRow}`;
   }).join("");
   const note = known ? "" : `<p class="empty">loading files…</p>`;
-  const map = run.stages["s06_embed"] ? renderMap(run) : "";
+  // Drawn when some stage that declares the projection role has run here —
+  // a capability, not a stage name.
+  const plotters = (PIPELINE?.stages || [])
+    .filter(x => x.roles.includes("projection")).map(x => x.name);
+  const map = plotters.some(n => run.stages[n]) ? renderMap(run) : "";
   return `<div class="detail"><table><tr><th>stage</th><th>time</th>` +
          `<th>output</th><th>stats</th></tr>${rows}</table>${note}` +
          map + renderPreview() + `</div>`;
@@ -607,31 +634,191 @@ function jobPanes(j) {
              : (jobLog[j.id] ?? "loading…"))}</pre>`;
 }
 
+// ---------------------------------------------------------------------------
+// The launch form, generated from the pipeline's own description of itself.
+//
+// Nothing below names a stage, a parameter or a column. The server sends the
+// stages, each stage's parameters with type / default / choices / help, which
+// entity level each one reads, and whether it takes a selection; this builds
+// controls out of that. A new stage, a renamed flag or a different pipeline
+// entirely all arrive as data.
+// ---------------------------------------------------------------------------
+function paramControl(stage, p) {
+  const id = `p|${stage.name}|${p.name}`;
+  const ph = p.default === null || p.default === undefined ? "" : String(p.default);
+  let control;
+  if (p.path) {
+    // Options are filled in by fillPathOptions once /api/state has listed what
+    // is actually on disk, filtered by the suffixes this parameter declares.
+    control = `<select id="${esc(id)}" data-path="${esc(p.suffixes.join(","))}" ` +
+              `data-prefer="${p.prefer_available ? "1" : "0"}"></select>`;
+  } else if (p.choices) {
+    control = `<select id="${esc(id)}">` +
+      (p.default === null ? `<option value="">—</option>` : "") +
+      p.choices.map(c =>
+        `<option${c === String(p.default) ? " selected" : ""}>${esc(c)}</option>`
+      ).join("") + `</select>`;
+  } else if (p.type === "bool") {
+    control = `<select id="${esc(id)}">` +
+      `<option value=""${p.default ? " selected" : ""}>yes (default)</option>` +
+      `<option value="0"${p.default ? "" : " selected"}>no</option></select>`;
+  } else {
+    control = `<input id="${esc(id)}" placeholder="${esc(ph)}">`;
+  }
+  return `<div><label for="${esc(id)}" title="${esc(p.help)}">${esc(p.name)}` +
+         `</label>${control}` +
+         (p.help ? `<div class="hint">${esc(p.help)}</div>` : "") + `</div>`;
+}
+
+function renderOptions() {
+  if (!PIPELINE) return;
+  const target = $("target").value;
+  const plan = planFor(target);
+  $("plan").innerHTML = plan.length
+    ? `<span class="sub">plan:</span> ` + plan.map(s =>
+        `<span class="cell done" title="${esc(s.summary)}">${esc(s.title)}</span>`).join("")
+    : `<span class="sub">nothing to run for that target</span>`;
+
+  const html = plan.map(s => {
+    const missing = s.requires.filter(t => !t.available && !t.optional);
+    const soft = s.requires.filter(t => !t.available && t.optional);
+    const sel = s.selectable ? `
+      <div class="sel">
+        <label for="w|${esc(s.name)}">selection — SQL over the
+          <code>${esc(s.consumes)}</code> level</label>
+        <input id="w|${esc(s.name)}" class="where" data-stage="${esc(s.name)}"
+               data-level="${esc(s.consumes)}"
+               placeholder="${esc(s.default_where || "all rows")}">
+        <div class="hint" id="wc|${esc(s.name)}">${
+          s.default_where
+            ? "default: " + esc(s.default_where)
+            : "leave empty to take every row"}</div>
+      </div>` : "";
+    return `<fieldset>
+      <legend>${esc(s.title)} <span class="sub">${esc(s.name)} ·
+        ${esc(s.consumes)} → ${esc(s.produces)}</span></legend>
+      <div class="hint">${esc(s.summary)}</div>
+      ${missing.length ? `<div class="msg err">needs ${missing.map(t =>
+          esc(t.name)).join(", ")} — not installed</div>` : ""}
+      ${soft.length ? `<div class="hint">without ${soft.map(t =>
+          esc(t.name) + (t.hint ? " (" + esc(t.hint) + ")" : "")).join(", ")}</div>` : ""}
+      ${sel}
+      ${s.params.length ? `<div class="row">` +
+        s.params.map(p => paramControl(s, p)).join("") + `</div>` : ""}
+    </fieldset>`;
+  }).join("");
+  if ($("opts")._html !== html) { $("opts").innerHTML = html; $("opts")._html = html; }
+  fillPathOptions();
+  $("opts").querySelectorAll(".where").forEach(n => {
+    n.oninput = () => scheduleCount(n);
+  });
+}
+
+// The stages that would run, resolved the same way the driver resolves them:
+// walk ports from what the chosen input provides to what the target is, and
+// fold in every stage that annotates a port already live. Kept in step with
+// Registry.plan by construction — both read the same consumes/produces.
+function planFor(target) {
+  if (!PIPELINE) return [];
+  const kind = $("kind").value;
+  const stages = PIPELINE.stages;
+  let live = [kind], out = [], guard = 0;
+  const sameFirst = port => stages.filter(s =>
+    s.consumes === port && s.produces === port && !out.includes(s));
+  while (guard++ < 50) {
+    if (live.includes(target)) break;
+    const next = stages.find(s =>
+      live.includes(s.consumes) && s.produces !== s.consumes && !out.includes(s));
+    if (!next) break;
+    out.push(...sameFirst(next.consumes));
+    out.push(next);
+    live.push(next.produces, ...next.also_produces);
+  }
+  out.push(...sameFirst(target));
+  return out;
+}
+
+// A path parameter offers whatever the server found under data/ with one of
+// the suffixes that parameter declared.
+function fillPathOptions() {
+  const files = DATA_FILES;
+  $("opts").querySelectorAll("select[data-path]").forEach(n => {
+    const want = n.dataset.path.split(",").filter(Boolean);
+    const hits = files.filter(f => !want.length || want.includes(f.suffix));
+    const html = `<option value="">—</option>` + hits.map(f =>
+      `<option value="${esc(f.path)}">${esc(f.name)} (${fmtBytes(f.bytes)})</option>`
+    ).join("");
+    if (n._html === html) return;
+    const keep = n.value;
+    n.innerHTML = html; n._html = html;
+    // Only parameters that asked for it are pre-filled. A path parameter left
+    // empty usually means "do not do this part", and choosing a file for one
+    // on the strength of a matching extension picks a backend nobody asked
+    // for — the declaration says which ones want a default.
+    n.value = keep ||
+      (n.dataset.prefer === "1" && hits.length ? hits[0].path : "");
+  });
+}
+
+// Live match count for a predicate, when the sample named in the form already
+// has rows to count. That is the whole point of writing one in a box rather
+// than in a shell: you see what it selects before spending a GPU on it.
+let countTimer = null;
+function scheduleCount(node) {
+  clearTimeout(countTimer);
+  countTimer = setTimeout(() => runCount(node), 350);
+}
+async function runCount(node) {
+  const el = $("wc|" + node.dataset.stage);
+  if (!el) return;
+  const sample = $("sample").value.trim();
+  const run = allRuns.find(r => r.sample === sample);
+  const where = node.value.trim();
+  if (!run || !run.levels?.includes(node.dataset.level)) {
+    el.textContent = where
+      ? "no existing rows for this sample to count against"
+      : (node.placeholder === "all rows" ? "leave empty to take every row"
+                                         : "default: " + node.placeholder);
+    return;
+  }
+  try {
+    const d = await api("/api/query?run=" + encodeURIComponent(run.id) +
+      "&level=" + encodeURIComponent(node.dataset.level) +
+      "&limit=1&where=" + encodeURIComponent(where));
+    el.textContent = `${d.matched} of ${run.sample}'s ${node.dataset.level} rows`;
+    el.className = "hint";
+  } catch (e) { el.textContent = e.message; el.className = "hint bad"; }
+}
+
+async function loadPipeline() {
+  PIPELINE = await api("/api/pipeline");
+  // Targets are ports something can produce — levels and file kinds alike, so
+  // "assemble only" and "all the way to features" are the same kind of choice.
+  const ports = [...new Set(PIPELINE.stages.flatMap(s =>
+    [s.produces, ...s.also_produces]))];
+  const label = {};
+  for (const l of PIPELINE.levels) label[l.name] = l.title || l.name;
+  for (const k of PIPELINE.file_kinds) label[k.name] = k.summary;
+  $("target").innerHTML = ports.map(p =>
+    `<option value="${esc(p)}">${esc(label[p] || p)} (${esc(p)})</option>`).join("");
+  $("target").value = ports.includes("feature") ? "feature" : ports[ports.length - 1];
+  $("kind").innerHTML = PIPELINE.file_kinds.map(k =>
+    `<option value="${esc(k.name)}">${esc(k.name)} — ${esc(k.summary)}</option>`).join("");
+  $("target").onchange = renderOptions;
+  $("kind").onchange = renderOptions;
+  renderOptions();
+}
+
 async function refresh() {
   try {
     const s = await api("/api/state");
     STAGES = s.stages; readOnly = s.read_only;
+    DATA_FILES = s.data_files || [];
     $("env").textContent =
       `${s.container ? s.container + " container" : "host"} · work: ${s.roots.join("  ")}` +
       (readOnly ? " · read-only" : "");
-    // Default to a provisioned HMM set when there is one: without it s05 is a
-    // pass-through and every protein reaches the GPU stage.
-    if (!$("hmm").options.length || $("hmm").dataset.n !== String((s.hmms || []).length)) {
-      const hs = s.hmms || [];
-      $("hmm").dataset.n = String(hs.length);
-      $("hmm").innerHTML =
-        `<option value="">none — s05 becomes a pass-through</option>` +
-        hs.map(h => `<option value="${esc(h.path)}">${esc(h.name)} ` +
-                    `(${fmtBytes(h.bytes)})</option>`).join("");
-      if (hs.length) $("hmm").value = hs[0].path;
-    }
-    if (!$("from").options.length) {
-      for (const sel of ["from", "to"]) {
-        $(sel).innerHTML = '<option value="">—</option>' +
-          STAGES.map(x => `<option>${x}</option>`).join("");
-      }
-    }
     if (readOnly) { $("new-run").style.display = "none"; }
+    else if (PIPELINE) fillPathOptions();
     renderJobs(s.jobs);
     renderRuns(s.runs, s.jobs);
   } catch (e) { $("env").textContent = "server unreachable: " + e.message; }
@@ -658,15 +845,23 @@ $("file").onchange = async e => {
 };
 
 $("go").onclick = async () => {
-  const options = {};
-  for (const k of ["from", "to", "hmm", "bit_cutoffs", "min_coverage",
-                   "confident_evalue", "limit", "model"]) {
-    const v = $(k).value.trim(); if (v) options[k] = v;
-  }
+  // Collected by walking the generated controls, so the body carries exactly
+  // the parameters the stages declared and nothing this file decided on.
+  const params = {}, where = {};
+  $("opts").querySelectorAll("[id^='p|']").forEach(n => {
+    const [, stage, name] = n.id.split("|");
+    const v = String(n.value).trim();
+    if (v === "") return;
+    (params[stage] ||= {})[name] = v;
+  });
+  $("opts").querySelectorAll(".where").forEach(n => {
+    const v = n.value.trim();
+    if (v) where[n.dataset.stage] = v;
+  });
   const body = {
     sample: $("sample").value.trim(), input_kind: $("kind").value,
     input_path: $("input").value, input_path2: $("input2").value || null,
-    options,
+    target: $("target").value, params, where,
   };
   $("go").disabled = true; $("msg").className = "msg"; $("msg").textContent = "starting…";
   try {
@@ -678,6 +873,10 @@ $("go").onclick = async () => {
   $("go").disabled = false;
 };
 
+loadPipeline().catch(e => {
+  $("msg").className = "msg err";
+  $("msg").textContent = "cannot read the pipeline description: " + e.message;
+});
 refresh(); loadInputs().catch(() => {});
 setInterval(refresh, 2000);
 </script>

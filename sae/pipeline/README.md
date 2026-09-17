@@ -6,8 +6,16 @@ manifest, and is idempotent — re-running resumes rather than recomputes.
 
 ```
 s01_qc → s02_assemble → s03_genes → s04_derep → s05_prefilter → s06_embed → s07_match
- reads     contigs        proteins     nr.faa     analyze.faa     parquet     clusters
+ reads     contigs       ╰──────── the gene level ────────╯      feature_hit   feature
+                          + rep_id   + category, family          + summary, clusters
 ```
+
+Stages up to `s03` pass **files**. From `s03` on they pass **rows**: `s03` emits
+one row per gene, and everything after it adds *columns* to those rows rather
+than writing a filtered copy. What a stage reads is a SQL predicate over those
+columns — `is_representative AND category <> 'known'` is the GPU stage's default
+— which is why dereplication and triage are labels here rather than filters.
+See `entities.py` for the model and `stage.py` for how a stage describes itself.
 
 ## Why this shape
 
@@ -57,9 +65,9 @@ Coverage is the union of *all* significant domain envelopes across *all*
 families, so a genuine multi-domain protein is called complete rather than
 penalised for matching several models.
 
-All three FASTAs are written for audit; `analyze.faa` (partial + dark) flows to
-s06, and `classification.tsv` records `gene_id, category, family, family_acc,
-evalue, coverage, n_domains, aa_len`. The family label on `partial` is the
+The classification is columns on the gene level — `category, family,
+family_acc, evalue, coverage, n_domains` — so `partial + dark` is the predicate
+`category <> 'known'` rather than a file. The family label on `partial` is the
 conditioning key for asking whether a protein is unusual *for its own family* —
 as opposed to `dark`, which has no prior and can only be compared against the
 global atlas.
@@ -81,8 +89,59 @@ python run.py --proteins prot.faa  --sample S1 --model 300m    # CPU-sized
 python s03_genes.py contigs.fa --sample S1       # stages run standalone too
 ```
 
-`--from`/`--to` bound the range, `--force` overrides the idempotency check.
-`../web/` drives the same thing from a browser.
+`--to` names what to produce — a level or a file kind, not a stage — and the
+plan is resolved from there:
+
+```bash
+python run.py --list                    # the stage graph and the levels
+python run.py --contigs c.fa --sample S1 --to gene --plan     # what would run
+python run.py --sample S1 --next        # what could run against S1 as it is
+```
+
+`--force` overrides the idempotency check; `--only`/`--skip` edit the plan.
+`../web/` drives the same thing from a browser, and builds its form out of the
+stage descriptors rather than a copy of these flags.
+
+### Selecting what a stage reads
+
+Every stage that reads an entity level takes a predicate, defaulting to the one
+that reproduces the linear pipeline. Because the columns are a real table, a
+selection can reference another sample:
+
+```bash
+# only the long dark proteins
+python run.py --sample S1 --from gene --to feature_hit \
+    --where s06_embed="category = 'dark' AND aa_len > 200"
+
+# only what a second sample also found dark — joined on the sequence hash,
+# because gene_id is per-assembly and means nothing across samples
+python run.py --sample S1 --from gene --to feature_hit --where s06_embed=\
+    "seq_sha1 IN (SELECT seq_sha1 FROM \"CHI-A\".gene WHERE category='dark')"
+```
+
+Parameters are addressed per stage, so nothing is ambiguous when two stages
+share a name for one: `--set s05_prefilter.min_coverage=0.9`. The older flat
+flags (`--hmm`, `--min-coverage`, `--model`, …) still work and are rewritten to
+the same thing.
+
+### Entity levels
+
+| Level | Key | Written by | Then annotated by |
+|---|---|---|---|
+| `gene` | `gene_id` | s03_genes (or s00_ingest) | s04_derep, s05_prefilter, s06_embed |
+| `feature_hit` | `gene_id, feature_id` | s06_embed | — |
+| `feature` | `feature_id` | s06_embed | s07_match |
+| `cluster_hit` | `feature_id, cluster_rep_protein_hash` | s07_match | — |
+
+Each stage writes only its own columns, as its own parquet fragment under its
+own directory; the level is the join of those fragments, assembled on demand.
+So a stage can be re-run, with different parameters or a different selection,
+without rewriting anybody else's output — and a reader discovers the columns
+from the manifests rather than from a schema it was told.
+
+`gene` carries `seq`, so any predicate reconstitutes the exact FASTA a stage
+was given. That replaced `nr.faa` and the four classification FASTAs, which
+existed only to hand the next stage a subset somebody had chosen in advance.
 
 ## Stages
 
@@ -90,11 +149,18 @@ python s03_genes.py contigs.fa --sample S1       # stages run standalone too
 |---|---|---|
 | s01_qc | pyfastx, or fastp if present | paired via `--fastq2` |
 | s02_assemble | MEGAHIT / metaSPAdes | **external binary required** |
-| s03_genes | pyrodigal | pure wheel |
-| s04_derep | exact hash, MMseqs2 if present | exact-only without MMseqs2 |
+| s00_ingest | — | import a protein FASTA as the gene level |
+| s03_genes | pyrodigal | pure wheel; emits the gene level |
+| s04_derep | exact hash, MMseqs2 if present | exact-only without MMseqs2; labels, does not filter |
 | s05_prefilter | pyhmmer (`--hmm`) or pyswrd (`--ref`) | pass-through if neither given |
 | s06_embed | ESMC + SAE | `--model {6b,300m}` |
 | s07_match | pyarrow join | — |
+
+A stage is a module in this directory exporting a `STAGE` descriptor — name,
+what it consumes and produces, its parameters with types and help, the columns
+it adds, the tools it needs. Nothing enumerates them: the driver, the container
+check and the web UI all discover whatever is here. Adding a stage is adding a
+file.
 
 s02 is the only stage needing something `requirements.txt` cannot install.
 `../../container/` carries megahit, mmseqs2 and fastp pinned, which is the
@@ -108,7 +174,9 @@ memory-bandwidth-bound; on CUDA expect the usual gain. Top-K is taken straight
 off the sparse COO values with a scatter-reduce into a batch × codebook buffer —
 2 MB at batch=32 regardless of sequence length, rather than densifying an
 L × 16,384 matrix per sequence. Output is long-format parquet
-`(gene_id, feature_id, activation, raw_activation)`.
+`(gene_id, feature_id, activation, raw_activation)` — the `feature_hit` level —
+plus the `feature` level it implies and an `embedded` / `n_features` /
+`top_feature` annotation back onto the genes that went through.
 
 ## Known limits
 

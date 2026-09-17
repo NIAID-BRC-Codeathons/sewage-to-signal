@@ -17,6 +17,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from stage import Param, Stage, Tool
 from common import MissingTool, StageResult, is_current, read_fasta, which, workdir, write_manifest
 
 INSTALL_HINT = (
@@ -93,6 +94,31 @@ def run(
     el = time.time() - t0
     write_manifest(out, deps, params, stats, tools={tool: "external"}, seconds=el)
     return StageResult("s02_assemble", out, stats, seconds=el)
+
+
+STAGE = Stage(
+    name="s02_assemble",
+    title="Assemble",
+    summary="MEGAHIT or metaSPAdes. Not optional for read input: a 50 aa "
+            "translated fragment is too short to carry a domain, and one indel "
+            "garbles the frame.",
+    run=run,
+    consumes="reads",
+    produces="contigs",
+    order=20,
+    input_arg="fastq",
+    params=(
+        Param("min_contig", int, 500, group="assembly",
+              help="drop contigs shorter than this"),
+        Param("assembler", str, "auto", choices=("auto", "megahit", "spades"),
+              group="assembly",
+              help="megahit is fast and low memory; spades is slower with "
+                   "better contiguity"),
+        Param("memory_frac", float, 0.5, group="assembly",
+              help="fraction of system memory the assembler may use"),
+    ),
+    requires=(Tool("megahit", optional=True, hint="or metaspades.py"),),
+)
 
 
 def main():

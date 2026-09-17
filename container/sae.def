@@ -118,15 +118,21 @@ From: ubuntu:24.04
     test -x "$(readlink -f /opt/venv/bin/python)" || { echo "BROKEN: venv interpreter unreachable"; exit 1; }
     readlink -f /opt/venv/bin/python
     echo "--- python deps ---"
-    /opt/venv/bin/python -c "import torch, esm, pyarrow, pyrodigal, pyhmmer, pyfastx; \
+    /opt/venv/bin/python -c "import torch, esm, pyarrow, pyrodigal, pyhmmer, pyfastx, duckdb; \
 print('torch', torch.__version__); print('esm', esm.__version__); \
-print('pyrodigal', pyrodigal.__version__)"
+print('pyrodigal', pyrodigal.__version__); print('duckdb', duckdb.__version__)"
     echo "--- external binaries ---"
     for t in megahit mmseqs fastp; do command -v $t >/dev/null || { echo "MISSING $t"; exit 1; }; done
     megahit --version; mmseqs version; fastp --version 2>&1 | head -1
     echo "--- pipeline imports ---"
+    # Discovery, not a list: a stage that fails to import is skipped with a
+    # warning rather than crashing the registry, so check the count as well as
+    # the import. Enumerating stage modules here would just be one more place
+    # to forget when one is added.
     cd /opt/sae/sae/pipeline && /opt/venv/bin/python -c \
-      "import common, s01_qc, s02_assemble, s03_genes, s04_derep, s05_prefilter, s06_embed, s07_match, run; print('all stages import')"
+      "import run; from stage import registry; r = registry(); \
+assert len(r) >= 7, f'only {len(r)} stages discovered: {r.names}'; \
+print('stages discovered:', ', '.join(r.names))"
 
 %labels
     Name        wastewater-sae

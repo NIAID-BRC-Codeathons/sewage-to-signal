@@ -3,6 +3,12 @@
 Progress dashboard for `sae/pipeline`, plus uploading an input and starting a
 run. Stdlib only — it adds no entry to `requirements.txt`.
 
+**It has no list of stages.** The launch form, the parameter fields, the stage
+strip, the plan preview and the predicate boxes are all generated from
+`GET /api/pipeline`, which is the pipeline describing itself. A stage that is
+added, renamed or removed shows up with no change here, and a work directory
+written by a different pipeline renders from its own manifests.
+
 ```bash
 python sae/web/server.py            # host    -> http://127.0.0.1:8765
 container/run.sh web                # container -> http://127.0.0.1:8765
@@ -25,6 +31,30 @@ Two sources, because neither alone is enough:
 
 So a run started from the CLI shows accurate completed stages but no live
 cursor; a run started from the UI shows both.
+
+## Building the form from the pipeline
+
+`GET /api/pipeline` returns every stage with its parameters — type, default,
+choices, help text, whether the value is a path and which suffixes it takes —
+along with the entity levels and the roles each stage fills. The frontend turns
+that into controls:
+
+* a **plan strip** showing which stages a given input and target imply;
+* a **fieldset per stage**, with its summary, its missing tools, and one
+  control per declared parameter;
+* a **selection box** for every stage that says it takes a predicate, showing
+  the stage's own default as the placeholder.
+
+Typing a predicate against a sample that already has rows queries
+`GET /api/query`, so the match count updates as you type — you see what a
+selection takes before spending a GPU on it. Cross-sample predicates work here
+too, because sibling samples are registered as SQL schemas:
+`seq_sha1 IN (SELECT seq_sha1 FROM "CHI-A".gene WHERE category='dark')`.
+
+Capabilities are looked up by **role**, never by stage name. The feature map is
+drawn when some stage declaring `projection` has run; the point colours come
+from whatever wrote the `category` column. A pipeline that fills those roles
+differently still gets a map.
 
 ## Viewing stage outputs
 
@@ -278,10 +308,17 @@ bound to localhost, and should not be exposed. Beyond that:
 
 * Sample names and uploaded filenames must match `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`
   — they become path components, so they are restricted rather than escaped.
-* Input paths (including `--hmm` and `--ref`) are resolved and must land under
-  an allowed root: uploads, a `--data` directory, or a work root.
-* Only the options in `OPTIONS` reach `run.py`; an unlisted key is a 400, so a
-  request body cannot introduce a new flag.
+* Any parameter a stage declared as a path is resolved and must land under an
+  allowed root: uploads, a `--data` directory, or a work root.
+* A parameter reaches `run.py` only if some stage declares it, and only after
+  that stage's own `Param` has coerced it; an unknown stage or key is a 400, so
+  a request body cannot introduce a new flag.
+* Predicates are checked by `entities.guard_predicate` before being forwarded
+  or evaluated: one expression, no `;`, and none of the statements that would
+  write, attach or install. They are evaluated against a throwaway in-memory
+  DuckDB connection whose only tables are read-only views over parquet. This
+  matters because a `WHERE` clause can otherwise reach `COPY ... TO`, and this
+  server writes files.
 * `subprocess` is called with an argument list and never a shell.
 * Uploads are capped at 16 GiB and streamed to a `.part` file, renamed only on
   a complete transfer.
@@ -291,12 +328,14 @@ bound to localhost, and should not be exposed. Beyond that:
 
 | | |
 |---|---|
-| `GET /api/state` | runs, jobs, stage list, roots, environment |
+| `GET /api/state` | runs, jobs, stage list, roots, environment; `data_files` lists files matching any path parameter's declared suffixes |
+| `GET /api/pipeline` | the whole pipeline: stages, parameters, levels, roles, tool availability |
+| `GET /api/columns?run=&level=` | a level's columns, with which stage wrote each |
+| `GET /api/query?run=&level=&where=&limit=` | how many rows a predicate selects, plus a look at them |
 | `GET /api/inputs` | files eligible to start a run |
-| `GET /api/state` | also lists `hmms` — profile databases found under the data dirs |
 | `GET /api/artifacts?run=` | files in each stage directory, with shape and size |
 | `GET /api/preview?run=&stage=&file=&limit=` | one artifact as text, table or json |
 | `GET /api/log?id=` | tail of a job's log |
 | `GET /api/script?id=` | the script the job was run as |
 | `POST /api/upload?name=` | raw body is the file; no multipart, so no `cgi` |
-| `POST /api/run` | JSON `{sample, input_kind, input_path, input_path2?, options}` |
+| `POST /api/run` | JSON `{sample, input_kind, input_path, input_path2?, target?, params?, where?, only?, skip?, force?}` — `params` and `where` are keyed by stage name |

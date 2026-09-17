@@ -4,6 +4,15 @@ Wastewater surveillance resequences the same sewershed over and over, so the
 protein set across samples is heavily redundant. Collapsing it before the GPU
 stage is the cheapest large saving in the whole pipeline.
 
+This stage does not remove anything. It *labels*: every gene gets the id of its
+cluster representative and a flag saying whether it is that representative.
+Dereplication then stops being a position in the pipeline and becomes a
+predicate - ``is_representative`` - that any later stage can opt into or
+ignore. That matters because the right answer differs by question: the GPU
+stage wants one protein per cluster, while counting how much of a sample a
+family covers wants all of them. The old ``nr.faa`` silently made that choice
+once, for everybody.
+
 Exact dedup (by sequence hash) is pure Python and always available. Clustering
 at sub-100% identity needs MMseqs2; when it is missing the stage still runs and
 reports how much exact dedup alone achieved.
@@ -17,58 +26,59 @@ import subprocess
 import time
 from pathlib import Path
 
-from common import StageResult, is_current, read_fasta, which, workdir, write_fasta, write_manifest
+from common import (StageResult, is_current, which, workdir, write_fasta,
+                    write_fragment, write_manifest)
+from entities import fasta_records, table_from_fasta
+from stage import Column, Param, Stage, Tool
+
+COLUMN_HELP = {
+    "rep_id": "gene_id of this gene's cluster representative",
+    "is_representative": "true when the gene represents its own cluster",
+    "cluster_size": "how many genes collapsed into this one's cluster",
+}
 
 
 def run(
-    proteins: Path,
+    rows,
     out_dir: Path,
     sample: str,
+    source: Path | None = None,
+    where: str | None = None,
     identity: float = 0.95,
     coverage: float = 0.8,
     threads: int = 4,
     use_mmseqs: bool = True,
     force: bool = False,
 ) -> StageResult:
-    proteins = Path(proteins)
-    out = Path(out_dir) / f"{sample}.nr.faa"
-    mapping = Path(out_dir) / f"{sample}.derep.tsv"
+    out_dir = Path(out_dir)
+    out = out_dir / f"{sample}.derep.parquet"
     engine = "mmseqs" if (use_mmseqs and which("mmseqs")) else "exact"
-    params = {"identity": identity, "coverage": coverage, "engine": engine}
-    if not force and is_current(out, [proteins], params):
-        return StageResult("s04_derep", out, {"engine": engine}, skipped=True)
+    params = {"identity": identity, "coverage": coverage, "engine": engine,
+              "where": where}
+    deps = [Path(source)] if source else []
+    if not force and is_current(out, deps, params):
+        return StageResult("s04_derep", out, {"engine": engine}, skipped=True,
+                           produced={"gene": None})
+
+    import pyarrow as pa
 
     t0 = time.time()
+    records = fasta_records(rows)
     # Exact dedup first: it is free and shrinks the input to any clusterer.
-    seen: dict[str, str] = {}
-    members: dict[str, list[str]] = {}
-    n_in = 0
-    for header, seq in read_fasta(proteins):
-        n_in += 1
-        gid = header.split()[0]
+    first: dict[str, str] = {}          # sha1 -> first gene_id with it
+    rep_of: dict[str, str] = {}
+    for gid, seq in records:
         h = hashlib.sha1(seq.encode()).hexdigest()
-        if h in seen:
-            members[seen[h]].append(gid)
-            continue
-        seen[h] = gid
-        members[gid] = [gid]
-    uniq = [(g, s) for (g, s) in ((seen[h], None) for h in seen)]
-    # re-read to pull the representative sequences in one pass
-    rep_ids = set(seen.values())
-    reps = [(hd.split()[0], sq) for hd, sq in read_fasta(proteins) if hd.split()[0] in rep_ids]
-    seen_once, deduped = set(), []
-    for gid, sq in reps:
-        if gid not in seen_once:
-            seen_once.add(gid)
-            deduped.append((gid, sq))
-
-    stats = {"proteins_in": n_in, "after_exact": len(deduped)}
+        rep_of[gid] = first.setdefault(h, gid)
+    n_in = len(records)
+    exact_reps = [(gid, seq) for gid, seq in records if rep_of[gid] == gid]
+    stats = {"genes_in": n_in, "after_exact": len(exact_reps)}
 
     if engine == "mmseqs":
-        tmp = Path(out_dir) / "_mm"
+        tmp = out_dir / "_mm"
         tmp.mkdir(exist_ok=True)
         exact_fa = tmp / "exact.faa"
-        write_fasta(exact_fa, deduped)
+        write_fasta(exact_fa, exact_reps)
         pref = tmp / "clu"
         subprocess.run(
             ["mmseqs", "easy-linclust", str(exact_fa), str(pref), str(tmp / "tmp"),
@@ -76,28 +86,69 @@ def run(
              "--threads", str(threads)],
             check=True, capture_output=True,
         )
-        rep_fa = Path(str(pref) + "_rep_seq.fasta")
-        final = list(read_fasta(rep_fa))
-        final = [(h.split()[0], s) for h, s in final]
         clu_tsv = Path(str(pref) + "_cluster.tsv")
         if clu_tsv.exists():
-            mapping.write_text(clu_tsv.read_text())
-        stats["after_cluster"] = len(final)
-    else:
-        final = deduped
-        with open(mapping, "w") as fh:
-            fh.write("representative\tmember\n")
-            for rep, mem in members.items():
-                for m in mem:
-                    fh.write(f"{rep}\t{m}\n")
+            # mmseqs clusters the exact representatives; fold its mapping back
+            # onto every original gene so the column is complete.
+            second = {}
+            for line in clu_tsv.read_text().splitlines():
+                rep, mem = line.split("\t")[:2]
+                second[mem] = rep
+            rep_of = {gid: second.get(r, r) for gid, r in rep_of.items()}
+        stats["after_cluster"] = len(set(rep_of.values()))
 
-    write_fasta(out, final)
-    stats["representatives"] = len(final)
-    stats["reduction"] = round(1 - len(final) / n_in, 4) if n_in else 0.0
+    sizes: dict[str, int] = {}
+    for r in rep_of.values():
+        sizes[r] = sizes.get(r, 0) + 1
+    out_rows = [{"gene_id": gid, "rep_id": rep_of[gid],
+                 "is_representative": rep_of[gid] == gid,
+                 "cluster_size": sizes[rep_of[gid]]}
+                for gid, _ in records]
+    table = pa.Table.from_pylist(out_rows, schema=pa.schema([
+        ("gene_id", pa.string()), ("rep_id", pa.string()),
+        ("is_representative", pa.bool_()), ("cluster_size", pa.int32()),
+    ]))
+    frag = write_fragment(out, table, "gene", where=where, help=COLUMN_HELP)
+
+    n_reps = sum(1 for r in out_rows if r["is_representative"])
+    stats["representatives"] = n_reps
+    stats["reduction"] = round(1 - n_reps / n_in, 4) if n_in else 0.0
     stats["engine"] = engine
     el = time.time() - t0
-    write_manifest(out, [proteins], params, stats, seconds=el)
-    return StageResult("s04_derep", out, stats, seconds=el)
+    write_manifest(out, deps, params, stats, seconds=el, tables=[frag],
+                   stage="s04_derep")
+    return StageResult("s04_derep", out, stats, seconds=el,
+                       produced={"gene": None})
+
+
+STAGE = Stage(
+    name="s04_derep",
+    title="Dereplicate",
+    summary="Label each gene with its cluster representative. Removes nothing; "
+            "downstream stages select on is_representative when they want one "
+            "protein per cluster.",
+    run=run,
+    consumes="gene",
+    produces="gene",
+    order=40,
+    selectable=True,
+    roles=("dereplication",),
+    adds=(
+        Column("rep_id", "string", COLUMN_HELP["rep_id"]),
+        Column("is_representative", "bool", COLUMN_HELP["is_representative"]),
+        Column("cluster_size", "int32", COLUMN_HELP["cluster_size"]),
+    ),
+    params=(
+        Param("identity", float, 0.95, group="derep",
+              help="MMseqs2 clustering identity; ignored without mmseqs"),
+        Param("coverage", float, 0.8, group="derep",
+              help="MMseqs2 alignment coverage"),
+        Param("use_mmseqs", bool, True, group="derep",
+              help="cluster below 100% identity when mmseqs is on PATH"),
+    ),
+    requires=(Tool("mmseqs", optional=True,
+                   hint="without it only exact duplicates collapse"),),
+)
 
 
 def main():
@@ -109,8 +160,9 @@ def main():
     p.add_argument("--no-mmseqs", action="store_true")
     p.add_argument("--force", action="store_true")
     a = p.parse_args()
-    r = run(a.proteins, workdir(a.work, a.sample, "s04_derep"), a.sample,
-            identity=a.identity, use_mmseqs=not a.no_mmseqs, force=a.force)
+    r = run(table_from_fasta(a.proteins), workdir(a.work, a.sample, "s04_derep"), a.sample,
+            source=a.proteins, identity=a.identity,
+            use_mmseqs=not a.no_mmseqs, force=a.force)
     print(r.describe())
 
 

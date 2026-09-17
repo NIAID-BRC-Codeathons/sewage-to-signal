@@ -46,9 +46,15 @@ description.
 
 * **`sae/sae_testing_script.py`** — one query sequence (protein or nucleotide),
   end to end, with human-readable feature descriptions.
-* **`sae/pipeline/`** — seven modular stages from reads to candidate clusters,
-  resumable, each writing a provenance manifest.
-* **`sae/web/`** — progress dashboard, artifact browser, and run launcher.
+* **`sae/pipeline/`** — modular stages from reads to candidate clusters,
+  resumable, each writing a provenance manifest. Stages describe themselves, so
+  the runnable path is planned from what you have to what you want rather than
+  being a fixed list. From gene calling on they *annotate* — adding columns to
+  an entity level — and each one picks its input with a SQL predicate over
+  those columns.
+* **`sae/web/`** — progress dashboard, artifact browser, and run launcher. It
+  holds no list of stages: the form is generated from the pipeline's own
+  description of itself.
 * **`container/`** — Apptainer image for cluster use.
 
 Where it does **not** yet meet the pitch, and these are the open gaps:
@@ -156,9 +162,22 @@ curl -s "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id
 ```
 
 That is the validation case, so you can check the answer: s03 calls 9 genes,
-and s05 discards 8 of them as fully explained by Pfam, leaving ORF1a — a
+and s05 labels 8 of them `known` — fully explained by Pfam — leaving ORF1a, a
 polyprotein that matches 17 Pfam domains and is still a quarter unaccounted
 for. Results land in `work/SARS2/`.
+
+**Selecting what to spend the GPU on.** Stages that read genes take a SQL
+predicate over the columns earlier stages wrote, and a selection can reference
+another sample:
+
+```bash
+./sae/.venv/bin/python sae/pipeline/run.py --sample SARS2 --list   # the graph
+./sae/.venv/bin/python sae/pipeline/run.py --sample SARS2 --next   # what could run now
+
+./sae/.venv/bin/python sae/pipeline/run.py \
+    --sample SARS2 --from gene --to feature_hit \
+    --where s06_embed="category = 'dark' AND aa_len > 200"
+```
 
 **From raw reads.** Needs an assembler, so use the container; `/data` and
 `/work` are bind mounts onto `data/` and `./work`.
@@ -221,7 +240,10 @@ sae/
   sae_testing_script.py       single-query tool
   README.md                   caveats, benchmarks, model choice
   codeathon_proposal.html     project proposal
-  pipeline/                   s01…s07 + run.py, README
+  pipeline/                   stages + run.py, README
+    entities.py               entity levels, column fragments, predicates
+    stage.py                  stage descriptors, registry, planner
+    s0*.py                    one stage each; a file here is a stage
   web/                        progress dashboard + run launcher (stdlib only)
 chicago_wastewater_sra*.{md,csv,txt}   cohort definition and accession list
 ```

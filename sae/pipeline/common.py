@@ -11,6 +11,12 @@ Every stage follows the same contract:
 
 Stages are independently runnable, so you can enter the pipeline at whatever
 point your data already reaches (reads, contigs, or proteins).
+
+Most stages also *annotate* rather than transform: they add columns to an
+entity level instead of writing a filtered copy of their input. Those columns
+go in a parquet fragment and are recorded in the manifest's ``tables`` list,
+which is how a reader discovers them without being told the stage list. See
+``entities.py``.
 """
 
 from __future__ import annotations
@@ -22,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2          # 2 added the `tables` fragment record
 
 
 def open_maybe_gzip(path: Path, mode: str = "rt"):
@@ -92,20 +98,41 @@ def is_current(output: Path, inputs: list[Path], params: dict) -> bool:
     return old.get("inputs") == [fingerprint(p) for p in inputs]
 
 
-def write_manifest(output: Path, inputs, params, stats, tools=None, seconds=None):
+def write_manifest(output: Path, inputs, params, stats, tools=None, seconds=None,
+                   tables=None, stage=None):
     payload = {
         "schema_version": SCHEMA_VERSION,
-        "stage": Path(output).parent.name,
+        "stage": stage or Path(output).parent.name,
         "output": fingerprint(output),
         "inputs": [fingerprint(p) for p in inputs],
         "params": params,
         "stats": stats,
         "tools": tools or {},
+        "tables": tables or [],
         "seconds": None if seconds is None else round(seconds, 2),
         "written": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     manifest_path(output).write_text(json.dumps(payload, indent=2))
     return payload
+
+
+def write_fragment(path: Path, table, level: str, role: str = "annotation",
+                   where: str | None = None, help: dict | None = None) -> dict:
+    """Write a stage's columns for one entity level, and describe them.
+
+    The return value goes straight into ``write_manifest(tables=[...])``; that
+    record is the only thing a reader needs in order to find these columns and
+    know what they mean, which is what keeps readers from having to know the
+    stage list.
+    """
+    import pyarrow.parquet as pq
+
+    from entities import describe_table
+
+    path = Path(path)
+    pq.write_table(table, path, compression="zstd")
+    return {"path": str(path),
+            **describe_table(table, level, role, where=where, help=help)}
 
 
 @dataclass
@@ -116,6 +143,10 @@ class StageResult:
     skipped: bool = False
     seconds: float = 0.0
     mate: Path | None = None          # second mate, for paired stages
+    # Ports this stage filled, for the driver to carry forward: a file kind
+    # maps to a path, a level maps to None because a level lives in the work
+    # directory rather than in any one file.
+    produced: dict = field(default_factory=dict)
 
     def describe(self) -> str:
         tag = "cached" if self.skipped else f"{self.seconds:.1f}s"
