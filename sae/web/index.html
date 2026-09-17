@@ -65,6 +65,8 @@
       white-space:pre-wrap;word-break:break-word;margin:6px 0 0}
   .badge{font:11px var(--mono);padding:2px 7px;border-radius:99px;
          border:1px solid var(--line);color:var(--dim)}
+  .badge.pending{color:var(--dim);border-color:var(--line);
+                 border-style:dashed}
   .badge.running{color:var(--run);border-color:var(--run)}
   .badge.finished{color:var(--accent);border-color:var(--accent)}
   .badge.failed{color:var(--bad);border-color:var(--bad)}
@@ -97,6 +99,9 @@
   .map circle{cursor:pointer}
   .key{display:inline-flex;gap:4px;align-items:center}
   .key i{width:9px;height:9px;border-radius:50%;display:inline-block}
+  .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+       font:11px var(--mono);color:var(--dim);margin-top:8px}
+  .bar .path{word-break:break-all}
   .seg{display:inline-flex;border:1px solid var(--line);border-radius:5px;
        overflow:hidden}
   .seg button{border:0;border-radius:0;padding:3px 9px;font:11px var(--mono);
@@ -182,6 +187,12 @@ let STAGES = [], openRun = null, openJob = null, readOnly = false;
 // a new stage appear, with no change to this file.
 let artifacts = {}, pendingArtifacts = {}, sel = null, selData = null;
 let jobLog = {};                 // job id -> last fetched log text
+// The script each job ran as: {text, ok}. Unlike the log it cannot
+// change once the job has started, so a successful fetch is kept and never repeated —
+// but only a successful one. Caching a failure would outlive its cause: a
+// server restarted mid-poll would leave the pane reading "Failed to fetch"
+// for as long as the tab stayed open, with nothing to retry it.
+let jobScript = {}, jobPane = "output";
 // Feature map: s06's top-K vectors reduced to 2D. Fetched only when asked,
 // because t-SNE over a thousand proteins takes seconds.
 let mapRun = null, mapMode = "reference", mapData = null, mapErr = null, mapHover = null;
@@ -427,22 +438,70 @@ function renderJobs(jobs) {
   const html = jobs.map(j => `<div class="run" data-job="${j.id}">
       <div class="run-head"><span class="name">${j.sample}</span>
         <span class="badge ${j.state}">${j.state}</span>
-        <span class="sub">${j.stage || "starting"} · ${fmtSecs(j.elapsed)}</span></div>
+        <span class="sub">${j.stage || "starting"} · ${fmtSecs(j.elapsed)}</span>
+        ${j.backend_id ? `<span class="sub">${esc(j.backend || "")} ${esc(j.backend_id)}</span>` : ""}</div>
       ${j.hint ? `<div class="msg err">${esc(j.hint)}</div>` : ""}
-      ${openJob === j.id
-          ? `<pre data-key="log|${j.id}">${esc(jobLog[j.id] ?? "loading…")}</pre>`
-          : ""}
+      ${openJob === j.id ? jobPanes(j) : ""}
     </div>`).join("");
   paint(el, html);
   el.querySelectorAll(".run").forEach(n => n.onclick = () => {
     openJob = openJob === n.dataset.job ? null : n.dataset.job; refresh();
   });
+  el.querySelectorAll("[data-pane]").forEach(n => n.onclick = ev => {
+    ev.stopPropagation();                       // do not collapse the job
+    jobPane = n.dataset.pane; refresh();
+  });
   // Stash the text and let the next poll render it. Patching the node after
   // paint would be undone by the following repaint; calling refresh() from
-  // here would recurse.
-  if (openJob) api("/api/log?id=" + encodeURIComponent(openJob))
-    .then(d => { jobLog[openJob] = d.log || "(no output yet)"; })
-    .catch(() => {});
+  // here would recurse. The id is captured because the poll is in flight
+  // while the user can still switch jobs.
+  const jid = openJob;
+  if (!jid) return;
+  api("/api/log?id=" + encodeURIComponent(jid))
+    .then(d => { jobLog[jid] = d.log || "(no output yet)"; })
+    // Say why, rather than leaving "loading…" up forever — a silent failure
+    // here is indistinguishable from a job that has printed nothing. Text
+    // already fetched is kept: the poll retries, so one bad tick is not worth
+    // throwing away a log over.
+    .catch(e => { jobLog[jid] ??= "(no output: " + e.message + ")"; });
+  const got = jobScript[jid];
+  if (got?.ok) return;                          // have it; it cannot change
+  const job = jobs.find(x => x.id === jid);
+  if (job && job.script_path === undefined) {
+    // The page is read from disk on every request, so it can be newer than the
+    // process serving it, and then /api/script is simply not there. Its 404
+    // would read as "this job has no script", which is the wrong thing to go
+    // looking for. Left not-ok, so restarting the server clears it.
+    jobScript[jid] = {text: "(this server was started before the script view " +
+                            "existed — restart it to see submitted scripts)"};
+  } else if (!got?.pending) {
+    // Keep showing the last message while the retry is in flight, rather than
+    // flicking back to "loading…" every couple of seconds.
+    jobScript[jid] = {pending: true, text: got?.text ?? "loading…"};
+    api("/api/script?id=" + encodeURIComponent(jid))
+      .then(d => { jobScript[jid] = {ok: true, text: d.script
+                     || "(the script is no longer on disk" +
+                        (d.path ? ": " + d.path : "") + ")"}; })
+      .catch(e => { jobScript[jid] = {text: "(" + e.message + ")"}; });
+  }
+}
+
+// What was run, next to what it printed. The script is the whole job —
+// limits included — read back from disk rather than reconstructed, so it is
+// evidence about *this* job rather than about what the server would run now.
+function jobPanes(j) {
+  const script = jobPane === "script";
+  const path = script ? j.script_path : j.log_path;
+  return `<div class="bar">
+      <span class="seg">
+        <button data-pane="output" class="${script ? "" : "on"}">output</button>
+        <button data-pane="script" class="${script ? "on" : ""}">script</button>
+      </span>
+      <span class="path">${esc(path || "")}</span>
+    </div>
+    <pre data-key="${script ? "script" : "log"}|${j.id}">${esc(
+      script ? (jobScript[j.id]?.text ?? "loading…")
+             : (jobLog[j.id] ?? "loading…"))}</pre>`;
 }
 
 async function refresh() {

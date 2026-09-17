@@ -120,67 +120,101 @@ expected by chance — along a known → partial → dark gradient.
 
 ## Where runs execute
 
-The server does not run the pipeline. It **submits** it, and polls the
-scheduler. There is exactly one execution path: `sbatch`. Nothing is ever
-forked from the server.
+The server runs the pipeline here, on this machine, **one run at a time**. Each
+job is detached into its own session, so it outlives the server rather than
+dying with it.
 
 ```
 GET  /api/state      -> .launcher tells you which backend is in use
-POST /api/cancel?id= -> scancel, or terminate for a local fork
+GET  /api/script?id= -> the script exactly as it was run
+POST /api/cancel?id= -> SIGTERM to the job's process group
 ```
 
-Jobs survive a restart of the server. Each submission records its identity
-next to its log, and on start-up those are adopted and their state refreshed
-from the scheduler — otherwise restarting orphans a running job, which looks
-exactly like a failure even though the scheduler is still running it.
+Every job is written as a shell script next to its log, limits included, and
+that file — read back from disk, not reconstructed — is what the Jobs panel
+shows beside the job's output. So a job is answerable after the fact: what it
+asked for, what it ran, and what it printed, rather than what the server would
+run today under whatever settings it now has.
 
-Forking was wrong on a cluster twice over: the run died with the server, and it
-was confined to the *UI's* allocation, so a dashboard sized for browsing could
-never start real work. Submitting removes both problems and the sizing question
-with them.
+The **Runs** panel stays output-only. It reads manifests, which is how runs
+started outside this UI appear at all, and those have no script to show.
 
-There was briefly a local fork as a fallback. It is gone — two execution paths
-meant the deployment changed shape depending on where it ran, and the default
-quietly chose the weaker one. **Without a scheduler the server still serves the
-dashboard** (reading manifests needs nothing) and refuses to launch with a
-message saying how to get one. That is a missing capability, not a second code
-path.
+### Serial, and why that is the whole scheduler
 
-**Run the server on the login node.** It only reads manifests and submits, so
-it needs no allocation — one long-lived lightweight process, with every
-expensive thing in its own job.
+One run at a time, and it sees every GPU on the box. On a single host the
+useful question is not which GPU a run gets but whether two runs are competing
+for the same one, and a queue of one answers it without a slot table to keep
+correct. A second submission waits, visibly, as `pending`.
 
-A submitted job lands on a compute node that has the image but not this
-server's interpreter, so by default it runs `container/run.sh` and any path in
-its arguments is rewritten to the path the image sees — `/data`, `/work`,
-`/atlas`, mirroring run.sh's bind table. `--job-runner python` submits the
-interpreter instead, which only works where that path is visible on the node.
+For a cohort rather than a single run, `container/run_batch.sh` is the other
+trade: it fans samples out across all the GPUs at once, one sample pinned per
+GPU. Use the UI to watch one run; use the batch script to process many.
 
-`--job-cpus`, `--job-mem`, `--job-time`, `--partition`, `--account` and
-`--job-gres` size the jobs. Site-specific options are only sent when set: an
-undefined gres or a missing partition is rejected at submission, not later.
+### Surviving a restart
 
-### Running SLURM locally
+Jobs survive a restart of the server, which is the one property the scheduler
+used to provide for free. Two mechanisms replace it.
 
-So the deployment does not change shape between a laptop and a cluster:
+`start_new_session` puts each job in its own session, so killing the server
+leaves it running and `killpg` can still take down the whole tree — the
+container child included, not just the wrapper shell.
 
-```bash
-container/slurm-local/up.sh                 # SLURM + Apptainer in Docker
-eval "$(container/slurm-local/up.sh env)"   # put the shims on PATH
-./sae/.venv/bin/python sae/web/server.py    # now submits instead of forking
-container/slurm-local/up.sh down
-```
+The job records its own exit code in `<id>.rc`. That file is the local
+stand-in for `sacct`: after a restart there is no parent left to reap the
+process, so without it a finished job could only be reported as "gone", which
+looks exactly like a failure. On start-up the records next to the logs are
+adopted and their state recovered — from the `.rc` file if it is there, from
+the pid if it is not.
 
-The node carries Apptainer as well as SLURM, so a job there executes the same
-`sae.sif` a cluster node would — otherwise the local setup would test
-scheduling and never execution. The repo is mounted at its own absolute path,
-so a path that resolves on the host resolves identically inside a job.
+| SLURM used to | Now |
+|---|---|
+| `squeue` says live | no `.rc` yet **and** the pid answers |
+| `sacct` gives State/ExitCode | `.rc` holds the exit code |
+| no accounting plugin → finished, code unknown | no `.rc`, pid gone → the same |
 
-Verified end to end: the server submits, SLURM schedules, the job runs
-Apptainer against `sae.sif`, and `s05` writes its output back to the host's
-`work/`. One caveat — the toy cluster has no accounting storage, so `sacct`
-returns nothing and a finished job reports `returncode: null` rather than 0.
-Real clusters have it.
+That last row is a real gap, not a tidy one: a job whose server died *and*
+which never wrote its code is reported finished with `returncode: null`. It is
+the same imprecision the SLURM backend accepted on sites without accounting
+storage, and it is preferable to the alternative of calling a job failed
+because nobody was watching when it ended.
+
+A job the shell reaped is recorded as `128+N` when it dies by signal; one the
+server reaped is recorded as `-N`, which is more precise. Both decode to the
+same hint. The ambiguity only bites a job that exits 137 on purpose, which no
+stage does.
+
+### One execution path, still
+
+The server used to submit every run with `sbatch`, and before that it forked
+them as its own children. Forking was wrong on a cluster twice over: the run
+died with the server, and it was confined to the *UI's* allocation, so a
+dashboard sized for browsing could never start real work.
+
+The deployment is one server now. The allocation half of that argument has no
+target — there is no allocation — but the first half stood, and is what the
+detaching and the `.rc` file are for.
+
+What has not changed is that there is exactly **one** backend. A local fork
+once existed as a *fallback* beside `sbatch`, and that was the actual mistake:
+two paths meant the deployment changed shape depending on where it ran, and the
+default quietly chose the weaker one. Replacing the backend keeps that
+property; adding a second one would not.
+
+### Sizing
+
+`--job-cpus` is exported to each job as `OMP_NUM_THREADS` — without a scheduler
+nothing enforces a core count, so the flag sets the one knob that actually
+reaches the work. `--job-time` is enforced by the server: over it, the job is
+terminated.
+
+There is no `--job-mem`. Memory cannot be capped without cgroups, and a flag
+that reports a limit nothing applies is worse than no flag — an OOM kill would
+look like the limit working.
+
+By default a job runs `container/run.sh`, and any path in its arguments is
+rewritten to the path the image sees — `/data`, `/work`, `/atlas`, mirroring
+run.sh's bind table. `--job-runner python` runs this server's interpreter
+instead.
 
 ## Host vs container
 
@@ -231,5 +265,6 @@ bound to localhost, and should not be exposed. Beyond that:
 | `GET /api/artifacts?run=` | files in each stage directory, with shape and size |
 | `GET /api/preview?run=&stage=&file=&limit=` | one artifact as text, table or json |
 | `GET /api/log?id=` | tail of a job's log |
+| `GET /api/script?id=` | the script the job was run as |
 | `POST /api/upload?name=` | raw body is the file; no multipart, so no `cgi` |
 | `POST /api/run` | JSON `{sample, input_kind, input_path, input_path2?, options}` |

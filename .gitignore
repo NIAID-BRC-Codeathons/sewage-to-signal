@@ -54,3 +54,6 @@ __pycache__/
 *.swp
 .idea/
 .vscode/
+
+# run_batch.sh writes one log per sample here (SAE_LOGS)
+logs/

@@ -16,6 +16,7 @@
 # macOS laptop), the same .sif runs under Apptainer *inside* a Docker
 # container. Nothing runs as a plain Docker image, so the deployed runtime is
 # the only runtime ever exercised. SAE_RUNTIME forces apptainer|singularity|nested.
+# SAE_NV=1|0 forces the GPU passthrough on or off; unset probes for a driver.
 #
 # Paths inside the container:
 #   /data  <- $SAE_DATA   (default: <repo>/data)
@@ -71,9 +72,28 @@ cmd="${1:-help}"; shift || true
 
 # --nv passes the host NVIDIA driver through. Harmless to omit on CPU nodes,
 # but it fails loudly if requested without a driver, so probe first.
+#
+# The probe was nvidia-smi alone, and that tool ships in a package separate
+# from the driver itself. A host with working GPUs but no nvidia-smi on PATH
+# therefore ran every stage on CPU and said nothing about it — the worst shape
+# a failure can take, since the only symptom is being slow. /dev/nvidia0 is the
+# driver, so ask it directly as well.
 NV=""
-if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-  NV="--nv"
+case "${SAE_NV:-auto}" in
+  1|yes|true|on)  NV="--nv" ;;
+  0|no|false|off) NV="" ;;
+  *)
+    if (command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1) \
+       || [ -e /dev/nvidia0 ] || [ -e /dev/nvidiactl ]; then
+      NV="--nv"
+    fi ;;
+esac
+# Say so when a GPU looks present but is not being passed through, rather than
+# leaving a silent 30x slowdown to be discovered in the timings.
+if [ -z "$NV" ] && [ "${SAE_NV:-auto}" = auto ] \
+   && ls /dev/nvidia[0-9]* >/dev/null 2>&1; then
+  echo "  note: NVIDIA devices present but no driver probe succeeded — running" >&2
+  echo "        on CPU. Force it with SAE_NV=1 if that is wrong." >&2
 fi
 
 BINDS=(-B "$DATA:/data" -B "$HF:/hf" -B "$WORK:/work" -B "$ATLAS:/atlas")
@@ -108,8 +128,8 @@ if [ "$RUNNER" = nested ]; then
       # localhost there would be unreachable through -p. Bind all interfaces
       # inside and publish to the host's loopback only.
       echo "  http://127.0.0.1:$PORT" >&2
-      echo "  note: browse-only — no sbatch in the image, so this UI cannot" >&2
-      echo "        launch. Run the server on the host to submit jobs." >&2
+      echo "  note: runs launched here execute inside the image, against the" >&2
+      echo "        /work and /data binds. Uncommitted code needs SAE_CODE." >&2
       exec docker run "${D[@]}" -p "127.0.0.1:$PORT:8765" "$AP_IMAGE" \
         run "${B[@]}" --app web "$IMG" --host 0.0.0.0 --port 8765 --published "$@" ;;
     setup)    exec docker run "${D[@]}" "$AP_IMAGE" \
@@ -129,9 +149,8 @@ case "$cmd" in
   pipeline) exec $RUNNER run $NV "${BINDS[@]}" --app pipeline "$SIF" --work /work "$@" ;;
   query)    exec $RUNNER run $NV "${BINDS[@]}" --app query    "$SIF" "$@" ;;
   web)
-    echo "  note: the UI inside the image can browse but not launch — there is" >&2
-    echo "        no sbatch in it. For launching, run the server on the login" >&2
-    echo "        node: ./sae/.venv/bin/python sae/web/server.py" >&2
+    echo "  note: runs launched here execute inside the image, against the" >&2
+    echo "        /work and /data binds. Uncommitted code needs SAE_CODE." >&2
     exec $RUNNER run     "${BINDS[@]}" --app web      "$SIF" --port "$PORT" "$@" ;;
   setup)    exec $RUNNER exec    "${BINDS[@]}" "$SIF" "$APP_SETUP" "$@" ;;
   manifest) exec $RUNNER run     "${BINDS[@]}" --app manifest "$SIF" ;;

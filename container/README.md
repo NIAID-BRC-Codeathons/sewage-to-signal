@@ -9,6 +9,7 @@ have no pip equivalent, and installing them locally needed an interactive
 sae.def               the only recipe
 build.sh              build via apptainer / nested / remote builder
 run.sh                runtime wrapper that sets the bind mounts
+run_batch.sh          many samples, fanned out across the GPUs of one host
 slurm_example.sbatch  example job submission
 ```
 
@@ -141,17 +142,20 @@ against the node's hostname — which does require a wider bind, so pair it with
 The job picks a free high port rather than assuming 8765, since several people
 may do this on one node.
 
-**Sizing is the decision to make.** The server launches pipeline runs as child
-processes *inside its own allocation*, so a small allocation means a small
-pipeline. Two sensible shapes:
+**Sizing is the decision to make**, and only here. The server runs each job
+itself, one at a time, so inside an allocation a run is a child of that
+allocation — a UI sized for browsing can only start a browsing-sized pipeline.
+Two sensible shapes:
 
 * *Watching* — a modest allocation, `--read-only`, and real work submitted
   separately with `slurm_example.sbatch`. Best for a shared dashboard.
 * *Working* — a real allocation (`--gres=gpu:1` for `s06_embed`) and launch
   from the UI. Bounded by the job's wall time.
 
-Submitting a SLURM job per pipeline run from the UI would be the better model
-and is not implemented; the server shells out with `subprocess` directly.
+This is the cost of running the UI inside an allocation, not of the UI. On a
+plain server there is no allocation to be bounded by and the question does not
+arise, which is why that is the supported shape — see
+[sae/web/README.md](../sae/web/README.md).
 
 ### Batch scripts
 
