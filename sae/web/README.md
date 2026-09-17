@@ -167,6 +167,80 @@ the same picture instead of reshuffling.
 A run has to have reached `s06_embed` to appear in the picker, and a run cannot
 be compared with itself.
 
+### Colour and filter by anything a stage wrote
+
+The gene level is the join of every stage's column fragments, so a gene already
+carries coordinates and length from s03, cluster membership from s04, the
+homology triage from s05 and embedding status from s06. That is the metadata,
+and the map colours and filters by any of it:
+
+```
+GET /api/projection?run=<id>&color=<column>&filter=<json terms>
+```
+
+**The page has no list of columns.** The response carries the columns the run
+actually has, with their types, value counts and ranges, and the controls are
+built from that — so a stage added tomorrow that annotates genes with, say, a
+taxon call becomes another thing to colour by with no change to the server or
+to `index.html`. It is the same property the artifact browser has, applied to
+the map.
+
+A column is offered for **colouring** only if it discriminates: an identifier
+gives every protein its own colour and a constant gives them all one, so
+`gene_id`, `seq_sha1` and `rep_id` are filterable but not colourable.
+
+#### Three colours, and what happens past three
+
+A scatter puts every pair of series on screen at once, and only **three** hues
+clear the colour-blind separation floors under that condition — a fourth cannot
+(`scripts/validate_palette.js --pairs all`). So a categorical column shows its
+three commonest values and folds the rest into one neutral, which the legend
+names as `other (n)` rather than implying the plot shows them all. Colouring
+1474 proteins by `family` — 195 distinct values — is still useful; it just
+answers "where are the three big families" and says so.
+
+Two things a colour cannot express are drawn rather than left out. A **missing
+value** is a hollow ring, at reduced strength so that absence recedes instead
+of outdrawing the findings; 71% of these proteins have no `family`, and at full
+strength the rings were the loudest thing on the plot. A **numeric** column
+gets a five-step single-hue ramp, log-scaled when the values span three orders
+of magnitude or more — an E-value runs from 1e-158 to 1e-5 here, and on a
+linear ramp every point lands in the first bin.
+
+The value → colour mapping is computed over the **unfiltered** column and held
+fixed, so narrowing the plot never repaints the points that survive. The legend
+counts, by contrast, are counted over the points actually drawn: the gene level
+holds every gene but the plot holds only the embedded ones, which is why
+`category` legends read `known (0)` — s06 does not embed a protein a family
+already explains.
+
+#### Filtering
+
+Filter controls are built from the same descriptors: a value picker for a
+categorical column, a min/max pair for a numeric one, one term per column,
+ANDed. **No predicate text crosses the wire.** The browser sends structured
+terms — column, operator, values — and the SQL is composed server-side against
+the column list the sample actually has, with every literal typed by its own
+column, so there is nothing to escape at the boundary; the result still goes
+through `entities.guard_predicate`. The same selection written by hand is what
+`run.py --where` takes, and it means the same thing.
+
+Filtering is a display operation, not a re-projection: everything is projected
+and then filtered, so the layout does not move when the filter changes. That
+matters most in the fallback modes, where filtering first would refit the
+layout around whatever survived.
+
+When two runs are overlaid, the colour and filter columns are the ones **both**
+have — a scale shown over two samples has to mean the same thing on both — and
+the domains are unioned so the scale covers everything on screen. Colour still
+defaults to sample there; choose a column instead and run B keeps a dark ring,
+which reads at a 2.6px mark where a different shape does not.
+
+A work directory written before the column fragments existed has no gene level.
+It falls back to whatever s05 wrote beside its output, which yields `category`
+and nothing else — enough to keep the map coloured as it always was, rather
+than going blank on a run nobody has re-run.
+
 ### Reading it
 
 Rows are L2-normalised before fitting: otherwise a protein's activation
@@ -334,6 +408,7 @@ bound to localhost, and should not be exposed. Beyond that:
 | `GET /api/query?run=&level=&where=&limit=` | how many rows a predicate selects, plus a look at them |
 | `GET /api/inputs` | files eligible to start a run |
 | `GET /api/artifacts?run=` | files in each stage directory, with shape and size |
+| `GET /api/projection?run=&mode=&b=&color=&filter=` | the feature map: layout, colour domain, filterable columns |
 | `GET /api/preview?run=&stage=&file=&limit=` | one artifact as text, table or json |
 | `GET /api/log?id=` | tail of a job's log |
 | `GET /api/script?id=` | the script the job was run as |

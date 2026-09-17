@@ -46,7 +46,11 @@ COLOR_SLOTS = 3
 # Distinct values offered in a filter dropdown. Far more than can be coloured,
 # because picking one value out of 195 families is a perfectly good filter.
 MAX_FILTER_VALUES = 300
-NUMERIC_BINS = 8
+# Ramp steps. Five, because an eight-step blue ramp fails the ordinal
+# gate in both themes - adjacent lightness gaps come out at 0.047 against
+# a 0.06 floor, and on the light surface the lightest step drops to
+# 1.85:1 and sinks into the background. Five clears both.
+NUMERIC_BINS = 5
 # A column with one value per row is an identifier, not metadata: colouring by
 # it gives every point its own colour and filtering by it selects one protein.
 IDENTITY_FRAC = 0.98
@@ -311,13 +315,19 @@ def build_where(terms: Sequence[dict], descs: Sequence[dict]) -> str:
             vals = t.get("values") or []
             if not vals:
                 continue                       # an empty pick is no constraint
-            lits = ", ".join(_literal(v, desc) for v in vals)
-            # A null is not "in" anything in SQL, so an explicit null pick has
-            # to be ORed in rather than listed.
-            null_wanted = any(v is None for v in vals)
-            clause = f"{col} IN ({lits})" if not null_wanted else \
-                f"({col} IN ({lits}) OR {col} IS NULL)"
-            parts.append(clause)
+            # A null is not "in" anything in SQL, so an explicit null pick is
+            # ORed on rather than listed - and it must be kept out of the IN
+            # list, or it would be rendered as the literal string 'None' and
+            # match nothing while looking like it worked.
+            want_null = any(v is None for v in vals)
+            present = [v for v in vals if v is not None]
+            clauses = []
+            if present:
+                clauses.append(f"{col} IN ({', '.join(_literal(v, desc) for v in present)})")
+            if want_null:
+                clauses.append(f"{col} IS NULL")
+            parts.append(clauses[0] if len(clauses) == 1
+                         else "(" + " OR ".join(clauses) + ")")
         elif op == "range":
             lo, hi = t.get("min"), t.get("max")
             if lo is None and hi is None:

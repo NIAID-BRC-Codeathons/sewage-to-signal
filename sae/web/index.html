@@ -14,9 +14,26 @@
        the "known" class, where it both collided with the corpus cloud and
        left known-vs-partial at a normal-vision deltaE of 10.7 — a pair
        full-colour readers cannot separate. These three validate on all pairs
-       in both modes, which is what a scatter needs. */
+       in both modes, which is what a scatter needs.
+
+       They started as the triage-class colours and are now the categorical
+       slots for *any* column, which is the same thing: the triage class is one
+       categorical column. `category` still lands on exactly these three
+       because the server pins its domain order to known → partial → dark, so
+       nothing here special-cases it. Three and no more — a scatter puts every
+       pair on screen at once, and a fourth hue cannot clear the all-pairs
+       floors, so the tail of a wider column folds into --cat-other. */
     --map-surface:#f0f0f0; --map-context:#4b4b44;
-    --map-known:#2a78d6; --map-partial:#eb6834; --map-dark:#1baf7a;
+    --cat-1:#2a78d6; --cat-2:#eb6834; --cat-3:#1baf7a;
+    /* The folded tail. Grey, like every "other", but a different grey from
+       the corpus backdrop (deltaE 25.6 apart) because both are on screen
+       together and they mean different things. */
+    --cat-other:#8a8a82;
+    /* Magnitude: one hue, light → dark, five steps. Eight failed the ordinal
+       gate — adjacent lightness gaps of 0.047 against a 0.06 floor, and a
+       lightest step at 1.85:1 that disappeared into the surface. */
+    --ramp-1:#6da7ec; --ramp-2:#3987e5; --ramp-3:#256abf;
+    --ramp-4:#184f95; --ramp-5:#0d366b;
     /* Overlay of two samples. A separate pair, not a reuse of the class
        colours: an overlay colours by *sample*, so borrowing "known" blue for
        sample A would have the same swatch mean two things across two modes of
@@ -31,8 +48,15 @@
     --bg:#16161a; --panel:#1e1e23; --line:#32323a; --ink:#e8e8e4; --dim:#9a9a92;
     --accent:#6dbd8f; --warn:#d9a05b; --bad:#e08472; --run:#79aede;
     --map-surface:#151518; --map-context:#9a9a92;
-    --map-known:#3987e5; --map-partial:#d95926; --map-dark:#199e70;
-    --map-a:#9b7ae8; --map-b:#d9a93a;
+    --cat-1:#3987e5; --cat-2:#d95926; --cat-3:#199e70;
+    --cat-other:#6f6f68;
+    /* Dark steps are chosen for the dark band, not flipped from the light
+       ramp. */
+    --ramp-1:#cde2fb; --ramp-2:#9ec5f4; --ramp-3:#6da7ec;
+    --ramp-4:#3987e5; --ramp-5:#256abf;
+    /* Was #d9a93a, which failed the dark lightness band at L 0.76 against a
+       0.48–0.67 window — the amber glared next to the violet. */
+    --map-a:#9b7ae8; --map-b:#c98500;
   }}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--ink);
@@ -46,9 +70,16 @@
           padding:14px;margin-bottom:14px}
   h2{margin:0 0 10px;font-size:13px;font-weight:600;text-transform:uppercase;
      letter-spacing:.06em;color:var(--dim)}
-  .run{border-top:1px solid var(--line);padding:10px 0;cursor:pointer}
+  .run{border-top:1px solid var(--line);padding:10px 0}
   .run:first-of-type{border-top:0}
+  /* The toggle is the header and the stage strip, never the whole block. When
+     the block was the toggle, every click inside what it opened - a filter
+     dropdown, a point, a preview - closed it, and each control had to opt out
+     by hand. Anything that forgot to was a trapdoor. */
+  .run-head,.strip{cursor:pointer}
+  .run-head:hover .name{text-decoration:underline}
   .run-head{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+  .detail,.map,.preview{cursor:auto}
   .name{font-family:var(--mono);font-weight:600}
   .sub{color:var(--dim);font-size:12px;font-family:var(--mono)}
   .strip{display:flex;gap:3px;margin-top:8px;flex-wrap:wrap}
@@ -118,6 +149,23 @@
            border-radius:5px;background:var(--map-surface)}
   .map circle{cursor:pointer}
   .map-bar select{width:auto;padding:3px 6px;font:11px var(--mono)}
+  .map-ctl{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+           font:11px var(--mono);color:var(--dim);margin-bottom:6px}
+  .map-ctl select,.map-ctl input{width:auto;padding:2px 5px;font:11px var(--mono)}
+  .map-ctl input[type=number]{width:72px}
+  .term{display:inline-flex;gap:5px;align-items:center;padding:2px 5px;
+        border:1px solid var(--line);border-radius:4px;background:var(--bg)}
+  .term>b{font-weight:600;color:var(--ink)}
+  .val{cursor:pointer;border:1px solid var(--line);border-radius:3px;
+       padding:0 4px;background:var(--panel);color:var(--ink)}
+  .val:hover{border-color:var(--bad);color:var(--bad)}
+  .drop{cursor:pointer;color:var(--dim);padding:0 2px}
+  .drop:hover{color:var(--bad)}
+  .ramp{display:inline-flex;align-items:center;gap:0}
+  .ramp i{width:14px;height:9px;display:inline-block}
+  .ramp i:first-child{border-radius:2px 0 0 2px}
+  .ramp i:last-child{border-radius:0 2px 2px 0}
+  .key i.hollow{background:transparent;border:1.5px solid var(--dim)}
   .key{display:inline-flex;gap:4px;align-items:center}
   .key i{width:9px;height:9px;border-radius:50%;display:inline-block}
   .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
@@ -227,14 +275,41 @@ let jobScript = {}, jobPane = "output";
 let mapRun = null, mapMode = "reference", mapData = null, mapErr = null, mapHover = null;
 // The second run drawn in the same layout, or null for one run on its own.
 let mapB = null;
+// Which column the plot is coloured by ("" lets the server choose its default,
+// "sample" is the overlay's own encoding), and the filter as one term per
+// column — one per column because two terms on the same column would be ANDed
+// into a contradiction, where picking two values plainly means either.
+let mapColor = "", mapFilter = {};
+// Every request's identity, so a colour or filter change refetches while the
+// 2s poll does not.
+let mapKey = null;
 // Every run in the last /api/state, so the compare picker can offer the other
 // ones. renderMap is reached through renderDetail and is not passed the list.
 let allRuns = [];
-// Fixed slot order, read as the known -> partial -> dark gradient the
-// pipeline reports; never cycled or reassigned by how many groups a run has.
-const GROUP_COLOR = {known: "var(--map-known)", partial: "var(--map-partial)",
-                     dark: "var(--map-dark)"};
+// Fixed slot order. The server hands back the value -> slot mapping computed
+// over the *unfiltered* column, so narrowing the plot never repaints the
+// points that survive — a colour that changes meaning when you filter is
+// worse than no colour. Slots are never cycled to fit a column's width: the
+// tail folds into one neutral instead.
+const CAT_COLOR = ["var(--cat-1)", "var(--cat-2)", "var(--cat-3)"];
+const CAT_OTHER = "var(--cat-other)";
+const RAMP = ["var(--ramp-1)", "var(--ramp-2)", "var(--ramp-3)",
+              "var(--ramp-4)", "var(--ramp-5)"];
 const SIDE_COLOR = {a: "var(--map-a)", b: "var(--map-b)"};
+
+// A point's colour from the slot the server resolved: null is a missing value
+// and -1 the folded tail, and both are neutrals rather than a borrowed hue.
+function slotColor(p, domain) {
+  if (!domain) return "var(--map-context)";
+  if (p.s == null) return null;                  // null => draw it hollow
+  if (domain.kind === "numeric") return RAMP[p.s] || RAMP[0];
+  return p.s < 0 ? CAT_OTHER : (CAT_COLOR[p.s] || CAT_OTHER);
+}
+
+const fmtNum = v => v == null ? "—"
+  : (Math.abs(v) >= 1e4 || (v !== 0 && Math.abs(v) < 1e-3))
+    ? Number(v).toExponential(1)
+    : (Number.isInteger(v) ? String(v) : Number(v).toFixed(3).replace(/0+$/, ""));
 
 const esc = v => String(v == null ? "" : v)
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -347,7 +422,7 @@ function interleave(points) {
   return out;
 }
 
-function mapScatter(d, fill, label, opacity) {
+function mapScatter(d, fill, label, opacity, ringSide) {
   const W = 760, H = 420, pad = 26;
   const all = d.points.concat(d.context || []);
   const xs = all.map(p => p.x), ys = all.map(p => p.y);
@@ -363,13 +438,130 @@ function mapScatter(d, fill, label, opacity) {
   const ctx = (d.context || []).map(p =>
     `<circle cx="${sx(p.x).toFixed(1)}" cy="${sy(p.y).toFixed(1)}" r="1.6"
       fill="var(--map-context)" fill-opacity="0.4"/>`).join("");
-  const dots = interleave(d.points).map(p =>
-    `<circle cx="${sx(p.x).toFixed(1)}" cy="${sy(p.y).toFixed(1)}" r="2.6"
-      fill="${fill(p)}" fill-opacity="${opacity}"
-      stroke="var(--map-surface)" stroke-width="1"
-      data-dot="${esc(label(p))}"><title>${esc(label(p))}</title></circle>`).join("");
+  // Two encodings share one mark. Colour carries the value; when an overlay is
+  // coloured by a column rather than by sample, the second run keeps a dark
+  // ring so the sides stay separable without spending a hue on them. A ring
+  // reads at 2.6px where a different shape does not. `null` from fill() means
+  // the value is missing, drawn hollow - absence is not a colour.
+  const dots = interleave(d.points).map(p => {
+    const c = fill(p), ring = ringSide && p.side === ringSide;
+    const stroke = ring ? "var(--ink)" : (c === null ? "var(--dim)"
+                                                     : "var(--map-surface)");
+    // A hollow ring at full strength outdraws the filled marks, which puts the
+    // emphasis on the proteins the column says nothing about. Absent is not a
+    // finding, so it recedes.
+    return `<circle cx="${sx(p.x).toFixed(1)}" cy="${sy(p.y).toFixed(1)}"
+      r="2.6" fill="${c === null ? "none" : c}"
+      fill-opacity="${c === null ? 1 : opacity}"
+      stroke="${stroke}" stroke-width="${ring ? 1.3 : 1}"
+      ${c === null ? 'stroke-opacity="0.45"' : ""}
+      data-dot="${esc(label(p))}"><title>${esc(label(p))}</title></circle>`;
+  }).join("");
   return `<svg viewBox="0 0 ${W} ${H}" role="img"
       aria-label="2D UMAP of SAE feature vectors">${ctx}${dots}</svg>`;
+}
+
+// The sentinel for "no value" in a control's value attribute, since an
+// <option value=""> already means "pick nothing". A column value that happens
+// to equal this string would be indistinguishable from a null pick, which is
+// why it is bracketed rather than a bare word.
+const NULLV = "\u2205null\u2205";
+
+// The colour legend. Identity is never colour alone: every slot is named, and
+// the two cases a colour cannot express - a value outside the three slots, and
+// no value at all - are named too rather than left to be guessed at.
+function renderLegend(d) {
+  const dom = d.domain;
+  if (!dom) return "";
+  // Counted over the points actually drawn, not over the column. The two
+  // differ: the gene level holds every gene, the plot only the ones that were
+  // embedded, and a filter narrows it further. Counting the column would have
+  // the legend advertise a slot with nothing on screen under it - `known` is
+  // exactly that, since s06 does not embed genes a family already explains.
+  const tally = {};
+  let missing = 0;
+  for (const p of d.points) {
+    if (p.s == null) missing++;
+    else tally[p.s] = (tally[p.s] || 0) + 1;
+  }
+  const none = missing ? `<span class="key"><i class="hollow"></i>no value `
+    + `(${missing})</span>` : "";
+  if (dom.kind === "numeric") {
+    return `<span class="key">${fmtNum(dom.min)}</span>`
+      + `<span class="ramp">${RAMP.map((c, i) =>
+          `<i style="background:${c}" title="${tally[i] || 0} proteins"></i>`
+        ).join("")}</span>`
+      + `<span class="key">${fmtNum(dom.max)}</span>`
+      + (dom.log ? `<span class="key">log scale</span>` : "") + none;
+  }
+  // A slot with nothing drawn under it still appears, so the colours keep
+  // meaning the same thing as the plot is filtered.
+  return dom.slots.map((v, i) => `<span class="key"><i style="background:` +
+      `${CAT_COLOR[i]}"></i>${esc(v)} (${tally[i] || 0})</span>`).join("")
+    + (dom.folded ? `<span class="key" title="${dom.folded} further distinct `
+        + `values share this colour"><i style="background:${CAT_OTHER}"></i>`
+        + `other (${tally[-1] || 0})</span>` : "") + none;
+}
+
+// Colour and filter controls, built from the columns the run reports rather
+// than from any list kept here - a stage added tomorrow that annotates genes
+// becomes another thing to colour by with no change to this file.
+function renderControls(run, d, comparing) {
+  const cols = d.columns || [];
+  const opts = [
+    ...(comparing ? [["sample", "sample"]] : []),
+    // Only a column worth colouring by: one colour per protein says nothing,
+    // and a column with a single value says nothing either.
+    ...cols.filter(c => c.usable).map(c => [c.name, c.name]),
+  ];
+  const current = comparing && !d.color ? "sample" : (d.color || "");
+  const colourSel = `<span>colour by</span>
+    <select data-colour="${esc(run.id)}">${opts.map(([v, t]) =>
+      `<option value="${esc(v)}"${v === current ? " selected" : ""}>${esc(t)}`
+      + `</option>`).join("")}</select>`;
+
+  const terms = Object.entries(mapFilter).map(([name, t]) => {
+    const c = cols.find(x => x.name === name);
+    if (!c) return "";
+    const drop = `<span class="drop" data-drop="${esc(name)}"
+      title="remove this filter">&times;</span>`;
+    if (t.op === "range") {
+      return `<span class="term"><b>${esc(name)}</b>
+        <input type="number" step="any" data-min="${esc(name)}"
+          value="${t.min == null ? "" : t.min}" placeholder="${fmtNum(c.min)}">
+        <span>to</span>
+        <input type="number" step="any" data-max="${esc(name)}"
+          value="${t.max == null ? "" : t.max}" placeholder="${fmtNum(c.max)}">
+        ${drop}</span>`;
+    }
+    const chosen = t.values || [];
+    const unchosen = (c.values || []).filter(v => !chosen.includes(v.value));
+    const canAddNull = c.n_null && !chosen.includes(null);
+    return `<span class="term"><b>${esc(name)}</b>${
+      chosen.map(v => `<span class="val" data-unpick="${esc(name)}"
+        data-value="${v === null ? NULLV : esc(v)}"
+        title="remove this value">${v === null ? "no value" : esc(v)}</span>`
+      ).join("")}${
+      unchosen.length || canAddNull
+        ? `<select data-pick="${esc(name)}"><option value="">+</option>${
+            (canAddNull
+              ? `<option value="${NULLV}">no value (${c.n_null})</option>` : "")
+            + unchosen.map(v =>
+              `<option value="${esc(v.value)}">${esc(v.value)} (${v.n})</option>`
+            ).join("")}</select>`
+        : ""}${drop}</span>`;
+  }).join("");
+
+  const free = cols.filter(c => c.kind !== "empty" && !(c.name in mapFilter));
+  const addSel = free.length ? `<select data-addfilter="${esc(run.id)}">
+      <option value="">filter by&hellip;</option>${free.map(c =>
+        `<option value="${esc(c.name)}">${esc(c.name)}</option>`).join("")}
+    </select>` : "";
+
+  return `<div class="map-ctl">${colourSel}${addSel}${terms}
+    ${d.n !== d.total ? `<span><b style="color:var(--ink)">${d.n}</b> of `
+      + `${d.total} shown</span>` : ""}
+    ${renderLegend(d)}</div>`;
 }
 
 function renderMap(run) {
@@ -381,6 +573,11 @@ function renderMap(run) {
   const by = open && mapData && mapData.samples
     ? Object.fromEntries(mapData.samples.map(s => [s.side, s])) : null;
   const thinned = by && mapData.samples.some(s => s.subsampled);
+  // Colour by sample unless a column was chosen: which run a protein came from
+  // is the question an overlay was opened to answer. When a column *is*
+  // chosen, colour carries it on both sides and run B takes a dark ring, so
+  // the two stay tellable apart without spending a second hue on them.
+  const bySample = !!by && !(mapData && mapData.color);
 
   const bar = `<div class="map-bar">
       <span class="seg">${[["reference", "shared map"],
@@ -390,54 +587,53 @@ function renderMap(run) {
           class="${open && mapMode === m ? "on" : ""}">${label}</button>`).join("")}</span>
       ${others.length ? `<select data-cmp="${esc(run.id)}"
           title="draw a second run's proteins in the same layout">
-          <option value="">compare with…</option>
+          <option value="">compare with&hellip;</option>
           ${others.map(r => `<option value="${esc(r.id)}"` +
             `${r.id === cmp ? " selected" : ""}>${esc(r.sample)}</option>`).join("")}
         </select>` : ""}
-      ${open && mapData ? `<span>${mapData.n} proteins · ${mapData.shared_features}`
+      ${open && mapData ? `<span>${mapData.shared_features}`
         + `/${mapData.distinct_features} features shared `
         + `(${Math.round(mapData.shared_frac * 100)}%)</span>` : ""}
       ${open && mapData && mapData.reference
         ? `<span class="key"><i style="background:var(--line)"></i>`
           + `${mapData.reference.n} reference</span>` : ""}
       ${open && mapData && mapData.mode === "run"
-        ? `<span class="msg err">fitted on this run alone — not comparable `
+        ? `<span class="msg err">fitted on this run alone &mdash; not comparable `
           + `with other runs</span>` : ""}
       ${open && mapData && mapData.mode === "pair"
-        ? `<span class="msg err">fitted on these two alone — comparable with `
+        ? `<span class="msg err">fitted on these two alone &mdash; comparable with `
           + `each other, with nothing else</span>` : ""}
       ${open && mapData && mapData.reference && mapData.reference.version_drift
         ? `<span class="msg err">reference built with different library `
           + `versions</span>` : ""}
-      ${thinned ? `<span class="msg err">thinned to fit the plot — not every `
+      ${thinned ? `<span class="msg err">thinned to fit the plot &mdash; not every `
         + `protein is drawn</span>` : ""}
       ${open && mapData && by
-        ? ["a", "b"].map(s => `<span class="key"><i style="background:` +
-            `${SIDE_COLOR[s]}"></i>${esc(by[s].sample)} (${by[s].n})</span>`).join("")
-        : open && mapData ? Object.keys(GROUP_COLOR)
-            .filter(g => mapData.groups.includes(g))
-            .map(g => `<span class="key"><i style="background:${GROUP_COLOR[g]}"></i>${g}</span>`)
-            .join("") : ""}
+        ? ["a", "b"].map(s => `<span class="key"><i style="${bySample
+            ? `background:${SIDE_COLOR[s]}`
+            : `background:transparent;border:1.5px solid var(--ink);` +
+              `opacity:${s === "b" ? 1 : 0.25}`}"></i>` +
+            `${esc(by[s].sample)} (${by[s].shown == null
+              ? by[s].n : by[s].shown})</span>`).join("")
+        : ""}
       ${mapHover ? `<span class="name">${esc(mapHover)}</span>` : ""}
     </div>`;
   if (!open) return `<div class="map">${bar}<p class="empty">Plot this run's
     SAE features on the shared UMAP layout${others.length
       ? `, on their own or against another run` : ""}.</p></div>`;
   if (mapErr) return `<div class="map">${bar}<p class="msg err">${esc(mapErr)}</p></div>`;
-  if (!mapData) return `<div class="map">${bar}<p class="empty">projecting…</p></div>`;
+  if (!mapData) return `<div class="map">${bar}<p class="empty">projecting&hellip;</p></div>`;
 
-  // Colour by sample when two are drawn: six series (two samples x three
-  // classes) is more than a scatter can carry, and which sample a protein came
-  // from is the question the overlay exists to answer. The class stays in the
-  // hover text, so nothing is lost, only demoted.
-  const fill = by ? p => SIDE_COLOR[p.side] || "var(--map-context)"
-                  : p => GROUP_COLOR[p.group] || "var(--map-context)";
-  const label = by
-    ? p => `${p.id} · ${(by[p.side] || {}).sample || p.side}` +
-           (p.group ? ` · ${p.group}` : "")
-    : p => p.id + (p.group ? ` · ${p.group}` : "");
-  return `<div class="map">${bar}${mapScatter(mapData, fill, label,
-    by ? 0.7 : 0.85)}</div>`;
+  const dom = mapData.domain;
+  const fill = bySample ? p => SIDE_COLOR[p.side] || "var(--map-context)"
+                        : p => slotColor(p, dom);
+  const label = p => [p.id, by ? (by[p.side] || {}).sample : null,
+                      mapData.color ? `${mapData.color}=${p.v == null ? "-"
+                        : (typeof p.v === "number" ? fmtNum(p.v) : p.v)}` : null]
+    .filter(Boolean).join(" · ");
+  return `<div class="map">${bar}${renderControls(run, mapData, !!by)}${
+    mapScatter(mapData, fill, label, by ? 0.7 : 0.85,
+               bySample ? null : (by ? "b" : null))}</div>`;
 }
 
 function renderDetail(run) {
@@ -482,17 +678,42 @@ async function loadArtifacts(runId) {
   delete pendingArtifacts[runId];
 }
 
+// The filter as the server takes it: one term per column, ANDed, and a term
+// that constrains nothing is left out rather than sent as an empty clause.
+function filterTerms() {
+  return Object.entries(mapFilter).flatMap(([col, t]) => {
+    if (t.op === "range") {
+      return (t.min == null && t.max == null) ? []
+        : [{col, op: "range", min: t.min ?? null, max: t.max ?? null}];
+    }
+    return (t.values || []).length ? [{col, op: "in", values: t.values}] : [];
+  });
+}
+
 async function loadMap(runId, mode, b) {
   b = b || null;
-  if (mapRun === runId && mapMode === mode && mapB === b && (mapData || mapErr)) return;
-  mapRun = runId; mapMode = mode; mapB = b; mapData = null; mapErr = null; refresh();
+  const terms = filterTerms();
+  // Colour and filter are part of a request's identity, so changing either
+  // refetches while the 2s poll, which changes neither, does not.
+  const key = [runId, mode, b || "", mapColor, JSON.stringify(terms)].join("|");
+  if (mapKey === key && (mapData || mapErr)) return;
+  mapKey = key;
+  mapRun = runId; mapMode = mode; mapB = b; mapData = null; mapErr = null;
+  refresh();
   try {
     mapData = await api(`/api/projection?run=${encodeURIComponent(runId)}` +
                         `&mode=${encodeURIComponent(mode)}` +
-                        (b ? `&b=${encodeURIComponent(b)}` : ""));
+                        (b ? `&b=${encodeURIComponent(b)}` : "") +
+                        (mapColor ? `&color=${encodeURIComponent(mapColor)}` : "") +
+                        (terms.length
+                          ? `&filter=${encodeURIComponent(JSON.stringify(terms))}`
+                          : ""));
   } catch (e) { mapErr = e.message; }
   refresh();
 }
+
+// Re-request the map after a control changed, keeping run and mode.
+const remap = () => loadMap(mapRun, mapMode, mapB);
 
 async function selectFile(run, stage, file) {
   if (sel && sel.run === run && sel.stage === stage && sel.file === file) {
@@ -527,32 +748,69 @@ function renderRuns(runs, jobs) {
     </div>`;
   }).join("");
   if (!paint(el, html)) { if (openRun) loadArtifacts(openRun); return; }
-  el.querySelectorAll(".run").forEach(n => n.onclick = () => {
-    openRun = openRun === n.dataset.id ? null : n.dataset.id;
-    if (!openRun) {
-      sel = null; selData = null; mapRun = null; mapB = null; mapData = null;
-    }
+  el.querySelectorAll(".run").forEach(n => {
+    const toggle = () => {
+      openRun = openRun === n.dataset.id ? null : n.dataset.id;
+      if (!openRun) {
+        sel = null; selData = null; mapRun = null; mapB = null; mapData = null;
+        mapColor = ""; mapFilter = {}; mapKey = null;
+      }
+      refresh();
+    };
+    n.querySelectorAll(":scope > .run-head, :scope > .strip")
+      .forEach(h => h.onclick = toggle);
+  });
+  el.querySelectorAll("[data-map]").forEach(n => n.onclick = () =>
+    loadMap(n.dataset.map, n.dataset.mode,
+            mapRun === n.dataset.map ? mapB : null));
+  el.querySelectorAll("[data-cmp]").forEach(n => n.onchange = () =>
+    loadMap(n.dataset.cmp, mapRun === n.dataset.cmp ? mapMode : "reference",
+            n.value || null));
+  // Colour and filter controls. Every one of them only mutates state and
+  // re-requests; what the controls *are* came from the response, so nothing
+  // here knows a column name.
+  el.querySelectorAll("[data-colour]").forEach(n => n.onchange = () => {
+    mapColor = n.value; remap();
+  });
+  el.querySelectorAll("[data-addfilter]").forEach(n => n.onchange = () => {
+    const name = n.value;
+    if (!name) return;
+    const c = (mapData.columns || []).find(x => x.name === name);
+    if (!c) return;
+    // A new term starts unconstrained, so adding one never hides anything
+    // before it has been said what to keep.
+    mapFilter[name] = c.kind === "numeric"
+      ? {op: "range", min: null, max: null} : {op: "in", values: []};
     refresh();
   });
-  el.querySelectorAll("[data-map]").forEach(n => n.onclick = ev => {
-    ev.stopPropagation();
-    loadMap(n.dataset.map, n.dataset.mode,
-            mapRun === n.dataset.map ? mapB : null);
+  el.querySelectorAll("[data-drop]").forEach(n => n.onclick = () => {
+    delete mapFilter[n.dataset.drop]; remap();
   });
-  el.querySelectorAll("[data-cmp]").forEach(n => {
-    n.onclick = ev => ev.stopPropagation();     // do not collapse the run
-    n.onchange = ev => {
-      ev.stopPropagation();
-      loadMap(n.dataset.cmp, mapRun === n.dataset.cmp ? mapMode : "reference",
-              n.value || null);
-    };
+  el.querySelectorAll("[data-pick]").forEach(n => n.onchange = () => {
+    const t = mapFilter[n.dataset.pick];
+    if (!t || !n.value) return;
+    t.values.push(n.value === NULLV ? null : n.value);
+    remap();
   });
-  el.querySelectorAll("circle[data-dot]").forEach(n => {
-    n.onmouseenter = () => { mapHover = n.dataset.dot; refresh(); };
-    n.onclick = ev => ev.stopPropagation();
+  el.querySelectorAll("[data-unpick]").forEach(n => n.onclick = () => {
+    const t = mapFilter[n.dataset.unpick];
+    if (!t) return;
+    const v = n.dataset.value === NULLV ? null : n.dataset.value;
+    t.values = t.values.filter(x => x !== v);
+    remap();
   });
-  el.querySelectorAll(".chip").forEach(n => n.onclick = ev => {
-    ev.stopPropagation();                       // do not collapse the run
+  // On change, not input: applying mid-keystroke would refetch on every digit
+  // and the repaint would take the caret with it.
+  ["min", "max"].forEach(k =>
+    el.querySelectorAll(`[data-${k}]`).forEach(n => n.onchange = () => {
+      const t = mapFilter[n.dataset[k]];
+      if (!t) return;
+      t[k] = n.value === "" ? null : Number(n.value);
+      remap();
+    }));
+  el.querySelectorAll("circle[data-dot]").forEach(n =>
+    n.onmouseenter = () => { mapHover = n.dataset.dot; refresh(); });
+  el.querySelectorAll(".chip").forEach(n => n.onclick = () => {
     if (n.classList.contains("binary")) return;
     selectFile(n.dataset.run, n.dataset.stage, n.dataset.file);
   });
@@ -574,11 +832,11 @@ function renderJobs(jobs) {
       ${openJob === j.id ? jobPanes(j) : ""}
     </div>`).join("");
   paint(el, html);
-  el.querySelectorAll(".run").forEach(n => n.onclick = () => {
-    openJob = openJob === n.dataset.job ? null : n.dataset.job; refresh();
-  });
-  el.querySelectorAll("[data-pane]").forEach(n => n.onclick = ev => {
-    ev.stopPropagation();                       // do not collapse the job
+  el.querySelectorAll(".run").forEach(n =>
+    n.querySelectorAll(":scope > .run-head").forEach(h => h.onclick = () => {
+      openJob = openJob === n.dataset.job ? null : n.dataset.job; refresh();
+    }));
+  el.querySelectorAll("[data-pane]").forEach(n => n.onclick = () => {
     jobPane = n.dataset.pane; refresh();
   });
   // Stash the text and let the next poll render it. Patching the node after

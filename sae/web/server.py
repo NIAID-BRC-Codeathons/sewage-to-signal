@@ -882,7 +882,10 @@ class Handler(BaseHTTPRequestHandler):
         A request naming a column this run does not have falls back rather
         than failing - switching runs should not 400.
         """
-        by_name = {d["name"]: d for d in usable}
+        # Only a column worth colouring by. `columns` in the response is the
+        # whole list, because filtering on an identifier is useful even where
+        # colouring by it is not - one colour per protein says nothing.
+        by_name = {d["name"]: d for d in usable if d.get("usable")}
         if comparing and requested in ("", "sample"):
             return None, None, None
         want = requested or ("category" if "category" in by_name else "")
@@ -990,16 +993,12 @@ class Handler(BaseHTTPRequestHandler):
 
         points = _points(ids, xy, rows_a, column, domain, keep_a,
                          "a" if other is not None else None)
+        shown_a = len(points)
         if other is not None:
             points += _points(b_ids, b_xy, rows_b, column, domain, keep_b, "b")
+        shown_b = len(points) - shown_a
         if not points:
             return self._err(422, "the filter matched nothing in this run")
-        # The page's legend still reads `group`, from when the map could only
-        # colour by triage class. Carry it while that is the chosen column, so
-        # a page older than this server keeps rendering.
-        if column == "category":
-            for p in points:
-                p["group"] = p.get("v")
 
         # With top-K over a 16,384-wide codebook two proteins may share no
         # features at all, and then the layout is noise. Say so rather than let
@@ -1011,7 +1010,9 @@ class Handler(BaseHTTPRequestHandler):
         shared = int((counts > 1).sum())
         body = {
             "run": run_id, "mode": used, "n": len(points), "points": points,
-            "groups": sorted({p["group"] for p in points if p.get("group")}),
+            # `n` is what is drawn and `total` what was projected: a filter is
+            # unreadable without both.
+            "total": len(ids) + (len(b_ids) if other is not None else 0),
             "context": context,
             # What the plot is coloured by, the columns it could be coloured or
             # filtered by instead, and the filter actually applied.
@@ -1023,9 +1024,9 @@ class Handler(BaseHTTPRequestHandler):
         if other is not None:
             body["samples"] = [
                 {"side": "a", "run": run_id, "sample": run_dir.name,
-                 "n": len(ids), "subsampled": cut_a},
+                 "n": len(ids), "shown": shown_a, "subsampled": cut_a},
                 {"side": "b", "run": b_id, "sample": b_dir.name,
-                 "n": len(b_ids), "subsampled": cut_b},
+                 "n": len(b_ids), "shown": shown_b, "subsampled": cut_b},
             ]
         elif cut_a:
             body["subsampled"] = True
