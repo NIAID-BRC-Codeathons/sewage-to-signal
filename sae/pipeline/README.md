@@ -219,6 +219,12 @@ store across compute, and why `run_batch.sh`'s parallel slots still work
 off Lustre/NFS. A Postgres catalog removes both the filesystem constraint and
 the reader/writer exclusion.
 
+`SAE_DUCKDB_EXTENSIONS` says where DuckDB's extensions live. Unset means
+DuckDB's own `~/.duckdb`, which is right on a workstation; the container bakes
+them into `/opt/duckdb` at build time and points this there, because a compute
+node usually has neither a writable HOME nor a route to the extension
+repository. Loading is tried before installing for the same reason.
+
 Existing work directories load with `backfill.py`, which reads both the
 fragment-parquet layout and the older FASTA/TSV runs.
 

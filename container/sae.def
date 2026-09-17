@@ -63,6 +63,26 @@ From: ubuntu:24.04
     uv pip install --python /opt/venv/bin/python -r /opt/build/requirements.txt
     rm -rf /root/.cache/uv
 
+    # --- DuckDB extensions, baked in -----------------------------------------
+    # Here rather than at runtime: a compute node usually has neither a route
+    # to the extension repository nor a writable HOME, and the image itself is
+    # read-only. Installing into a fixed directory that %environment points at
+    # makes the runtime a pure LOAD. The attach-and-write check lives here too,
+    # because this is the last point at which the filesystem is writable.
+    mkdir -p /opt/duckdb
+    /opt/venv/bin/python -c "
+import duckdb, tempfile
+con = duckdb.connect(':memory:')
+con.execute(\"SET extension_directory = '/opt/duckdb'\")
+con.execute('INSTALL ducklake'); con.execute('LOAD ducklake')
+d = tempfile.mkdtemp()
+con.execute(f\"ATTACH 'ducklake:{d}/m.ducklake' AS lake (DATA_PATH '{d}/files/')\")
+con.execute('CREATE TABLE lake.t (sample VARCHAR, n INTEGER)')
+con.execute(\"INSERT INTO lake.t VALUES ('x', 1)\")
+assert con.execute('SELECT count(*) FROM lake.t').fetchone()[0] == 1
+print('ducklake installed to /opt/duckdb; attach + write ok')"
+    chmod -R a+rX /opt/duckdb
+
     # --- record exactly what is in here ------------------------------------
     # The image is the lockfile; this makes its contents auditable after the
     # fact without rebuilding.
@@ -79,12 +99,17 @@ From: ubuntu:24.04
       uv pip freeze --python /opt/venv/bin/python
     } > /opt/image-manifest.txt
 
-    chmod -R a+rX /opt/sae /opt/venv /opt/conda
+    chmod -R a+rX /opt/sae /opt/venv /opt/conda /opt/duckdb
     mkdir -p /work /data /hf
     chmod 777 /work /data /hf
 
 %environment
     export PATH=/opt/venv/bin:/opt/conda/bin:/usr/local/bin:$PATH
+    # DuckDB extensions are baked in at build time and the image is read-only,
+    # so point DuckDB at them rather than letting it look in ~/.duckdb - a
+    # compute node usually has no writable HOME and no route to the extension
+    # repository, and the failure there reads as "cannot create /root/.duckdb".
+    export SAE_DUCKDB_EXTENSIONS=/opt/duckdb
     export PYTHONNOUSERSITE=1
     export PYTHONDONTWRITEBYTECODE=1
     # HF_HOME must land on a bind mount: the image is read-only and the model
@@ -133,21 +158,21 @@ print('pyrodigal', pyrodigal.__version__); print('duckdb', duckdb.__version__)"
       "import run; from stage import registry; r = registry(); \
 assert len(r) >= 7, f'only {len(r)} stages discovered: {r.names}'; \
 print('stages discovered:', ', '.join(r.names))"
-    echo "--- ducklake ---"
-    # Installed at build time on purpose: a compute node usually has no route to
-    # the extension repository, and a runtime INSTALL would fail there rather
-    # than here. Attaching a throwaway lake proves the whole path, not just the
-    # download.
-    /opt/venv/bin/python -c "
-import duckdb, tempfile, os
-d = tempfile.mkdtemp()
+    echo "--- ducklake loads from the baked directory ---"
+    # LOAD, never INSTALL. %test runs against the finished image, which is
+    # read-only, so an install would try to create ~/.duckdb and fail - which
+    # is what it did. The attach-and-write check belongs in %post, where the
+    # filesystem is still writable, and it runs there.
+    test -d /opt/duckdb || { echo "MISSING /opt/duckdb (extensions not baked in)"; exit 1; }
+    SAE_DUCKDB_EXTENSIONS=/opt/duckdb /opt/venv/bin/python -c "
+import duckdb
 con = duckdb.connect(':memory:')
-con.execute('INSTALL ducklake'); con.execute('LOAD ducklake')
-con.execute(f\"ATTACH 'ducklake:{d}/m.ducklake' AS lake (DATA_PATH '{d}/files/')\")
-con.execute('CREATE TABLE lake.t (sample VARCHAR, n INTEGER)')
-con.execute(\"INSERT INTO lake.t VALUES ('x', 1)\")
-assert con.execute('SELECT count(*) FROM lake.t').fetchone()[0] == 1
-print('ducklake attach + write: ok')"
+con.execute(\"SET extension_directory = '/opt/duckdb'\")
+con.execute('LOAD ducklake')
+loaded = con.execute(\"SELECT loaded FROM duckdb_extensions() \"
+                     \"WHERE extension_name = 'ducklake'\").fetchone()[0]
+assert loaded, 'ducklake did not load from /opt/duckdb'
+print('ducklake loads from the image, no install needed')"
 
 %labels
     Name        wastewater-sae

@@ -72,6 +72,13 @@ from typing import Iterator
 ATTACH_BUDGET = float(os.environ.get("SAE_LAKE_ATTACH_BUDGET", "60"))
 EXTENSION = "ducklake"
 
+# Where DuckDB keeps its extensions. Unset means DuckDB's own default,
+# ~/.duckdb, which is right on a workstation and wrong everywhere else: the
+# container image is read-only and a compute node usually has neither a
+# writable HOME nor a route to the extension repository. The image bakes its
+# extensions in at build time and points this at them.
+EXTENSION_DIR = os.environ.get("SAE_DUCKDB_EXTENSIONS")
+
 # DuckLake separates the *catalog* (metadata: which files hold which snapshot of
 # which table) from the *data path* (the parquet itself). Both can be remote,
 # and they are chosen independently:
@@ -143,10 +150,35 @@ def _base(target: str, files: str):
     import duckdb
 
     con = duckdb.connect(":memory:")
+    if EXTENSION_DIR:
+        con.execute(f"SET extension_directory = {_sql_str(EXTENSION_DIR)}")
     for ext in _needed_extensions(target, files):
-        con.execute(f"INSTALL {ext}")
-        con.execute(f"LOAD {ext}")
+        _ensure_extension(con, ext)
     return con
+
+
+def _ensure_extension(con, name: str) -> None:
+    """Load an extension, installing it only if it is not already present.
+
+    An unconditional INSTALL writes to the extension directory and reaches the
+    network, and fails on both counts inside a read-only image or on an offline
+    node - with an error about creating ~/.duckdb that says nothing about
+    either. So try the load first; install only where installing can work.
+    """
+    try:
+        con.execute(f"LOAD {name}")
+        return
+    except Exception as exc:
+        first = exc
+    try:
+        con.execute(f"INSTALL {name}")
+        con.execute(f"LOAD {name}")
+    except Exception as exc:
+        raise RuntimeError(
+            f"the {name!r} DuckDB extension is neither installed nor "
+            f"installable here"
+            + (f" (looked in {EXTENSION_DIR})" if EXTENSION_DIR else "")
+            + f". Load said: {first}. Install said: {exc}") from exc
 
 
 def _needed_extensions(target: str, files: str) -> list[str]:
