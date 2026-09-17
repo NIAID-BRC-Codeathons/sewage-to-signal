@@ -195,6 +195,13 @@
                                    border-color:var(--ink)}
   .samples .s b{font-weight:600}
   .samples .s .n{opacity:.65;margin-left:5px}
+  /* One line, always, whatever it says. The height is reserved so the plot
+     never moves between "hover a sample" and a long sample's description, and
+     a name too long to fit truncates rather than wrapping. */
+  .whatrow{height:18px;line-height:18px;margin:0 0 6px;overflow:hidden}
+  .whatrow #atlas-what{display:block;font:11px/18px var(--mono);
+                       color:var(--dim);white-space:nowrap;overflow:hidden;
+                       text-overflow:ellipsis}
   /* Generated launch form. Every control below is built from /api/pipeline,
      so these rules style shapes — a fieldset per stage, a hint under a
      control — and never a particular stage or parameter. */
@@ -1137,6 +1144,7 @@ async function loadPipeline() {
 let atlasData = null, atlasErr = null, atlasColor = "", atlasHi = null,
     atlasPending = false, atlasStale = false;
 const ATLAS_W = 900, ATLAS_H = 460, ATLAS_PAD = 22;
+const ATLAS_IDLE = "hover a sample to light it up";
 
 function atlasScale(d) {
   const xs = d.points.map(p => p.x), ys = d.points.map(p => p.y);
@@ -1187,8 +1195,13 @@ function renderAtlas() {
   paint(el, `<div class="atlas" id="atlas-plot">
       <div class="map-bar">${picker}${note}
         <span>${d.mode === "reference" ? "shared layout" : "fitted on the cohort"}</span>
-        <span id="atlas-what">hover a sample to light it up</span>${stale}</div>
+        ${stale}</div>
       <div class="samples">${chips}</div>
+      <!-- Its own row, and a fixed height. This text changes on every hover
+           and a sample name can be long; sharing a flex row with the controls
+           meant a long name rewrapped the row and pushed the plot down, so the
+           thing you were pointing at moved as you pointed at it. -->
+      <div class="whatrow"><span id="atlas-what">${ATLAS_IDLE}</span></div>
       <svg viewBox="0 0 ${ATLAS_W} ${ATLAS_H}" role="img"
            aria-label="Every SAE embedding in the store, one sample highlighted">
         <g class="bg">${bg}</g><g id="atlas-hi"></g></svg>
@@ -1209,7 +1222,7 @@ function lightSample(i) {
   if (i == null) {
     layer.innerHTML = "";
     plot.classList.remove("hot");
-    $("atlas-what").textContent = "hover a sample to light it up";
+    $("atlas-what").textContent = ATLAS_IDLE;
     return;
   }
   const {sx, sy} = atlasScale(d);
