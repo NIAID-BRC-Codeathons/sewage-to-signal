@@ -203,15 +203,15 @@ def columns_of(con, level: str) -> list[dict]:
     owner = {}
     for st in registry():
         for c in st.columns_for(level):
-            owner.setdefault(c.name, (st.name, c.help))
+            owner.setdefault(c.name, (st.name, c.help, c.identifier))
     rows = con.execute(
         "SELECT column_name, data_type FROM information_schema.columns "
         "WHERE table_name = ? ORDER BY ordinal_position", [level]).fetchall()
     out = []
     for name, typ in rows:
-        stage_name, help_text = owner.get(name, ("", ""))
+        stage_name, help_text, ident = owner.get(name, ("", "", False))
         out.append({"name": name, "type": typ, "stage": stage_name,
-                    "help": help_text})
+                    "help": help_text, "identifier": ident})
     return out
 
 
@@ -321,7 +321,9 @@ def gene_columns():
     """
     from stage import Column
 
-    return tuple(Column(f.name, str(f.type), GENE_COLUMN_HELP.get(f.name, ""))
+    ids = {"gene_id", "seq_sha1", "seq"}
+    return tuple(Column(f.name, str(f.type), GENE_COLUMN_HELP.get(f.name, ""),
+                        identifier=f.name in ids)
                  for f in gene_schema())
 
 

@@ -102,9 +102,16 @@ class Column:
     name: str
     type: str = "string"
     help: str = ""
+    # Names a thing rather than describing it. Colouring a plot by an
+    # identifier gives every point its own colour and filtering by one selects
+    # a single row, so a UI offers neither. Declared rather than measured: an
+    # id is unique *within a sample*, so across a cohort it looks merely
+    # high-cardinality and a count-based rule lets it through.
+    identifier: bool = False
 
     def to_json(self) -> dict:
-        return {"name": self.name, "type": self.type, "help": self.help}
+        return {"name": self.name, "type": self.type, "help": self.help,
+                "identifier": self.identifier}
 
 
 @dataclass(frozen=True)

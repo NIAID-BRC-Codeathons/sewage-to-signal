@@ -93,6 +93,39 @@ Parquet needs `pyarrow`, which is a *pipeline* dependency, not a web one. It is
 imported only when a parquet is actually requested, so the server still runs
 where it is absent; you get a message in place of the table.
 
+## The atlas
+
+Every embedding in the store in one layout, drawn colourless, with one sample
+lit at a time. It answers a question the per-run map cannot: where a sample sits
+in *everything that has been embedded*, rather than where its own proteins sit
+relative to each other.
+
+`GET /api/atlas?color=<column>&limit=` returns the whole cohort once — each
+point carrying its sample index, its value for the chosen column, and the colour
+slot the server resolved. **Hovering is done in the browser**: the backdrop is
+drawn once and a hover rewrites only the highlight layer, so lighting a sample
+costs no request and the layout cannot shift under the cursor.
+
+The expensive half — reading every activation and running UMAP over it — is
+cached on the store's snapshot id, so changing the colour column is ~100 ms
+against ~10 s for the first build. When the snapshot moves the view says it is
+stale and offers a rebuild rather than taking one: an automatic rebuild would
+fire on every stage a running batch finishes, and throw away the highlight you
+were reading.
+
+Thinning is per sample, not over the cohort, so a nine-gene sample still appears
+next to a twenty-thousand-gene one. Points are picked at even spacing rather
+than by a stride, because a stride can only halve: asking for 93% of a sample
+would otherwise hand back 50%.
+
+A sample with embeddings but no gene rows — anything backfilled from a work
+directory that only ran s06 — draws hollow, because absence is not a colour.
+
+**Concurrency note.** UMAP runs on numba, whose default threading layer is not
+threadsafe: two projections at once terminate the process rather than merely
+contending. This is a `ThreadingHTTPServer`, so two tabs are enough. Every
+layout goes through one lock.
+
 ## The feature map
 
 `s06` writes long-format `(gene_id, feature_id, activation)` with top-K per

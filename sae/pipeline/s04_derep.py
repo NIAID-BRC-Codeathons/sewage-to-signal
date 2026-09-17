@@ -134,7 +134,7 @@ STAGE = Stage(
     selectable=True,
     roles=("dereplication",),
     adds=(
-        Column("rep_id", "string", COLUMN_HELP["rep_id"]),
+        Column("rep_id", "string", COLUMN_HELP["rep_id"], identifier=True),
         Column("is_representative", "bool", COLUMN_HELP["is_representative"]),
         Column("cluster_size", "int32", COLUMN_HELP["cluster_size"]),
     ),

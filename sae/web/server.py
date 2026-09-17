@@ -121,6 +121,10 @@ PREVIEW_BYTES = 2 * 1024**2
 # existing layout at all, and a linear projection was never good enough.
 MAX_CONTEXT_POINTS = 8000
 MAX_PROJECTION_POINTS = 20000
+# The cohort view draws every sample at once. The ceiling is the browser's,
+# not the store's: these are plain SVG circles with no handlers, and past
+# roughly this many the first paint starts to drag.
+MAX_ATLAS_POINTS = 30000
 
 # UMAP is numba, and numba's default `workqueue` threading layer is not
 # threadsafe: called from two Python threads at once it does not raise, it
@@ -249,6 +253,14 @@ from reference_map import normalise, sparse_from_table                      # no
 import metadata                                           # noqa: E402
 
 
+# UMAP runs on numba, whose default workqueue threading layer is **not**
+# threadsafe: two projections at once do not merely contend, they terminate the
+# process ("Concurrent access has been detected"). This is a ThreadingHTTPServer,
+# so two browser tabs - or one tab and one curl - are enough. Every layout goes
+# through this lock.
+_LAYOUT_LOCK = threading.Lock()
+
+
 def _fit_layout(m):
     """The fallback fit, for when there is no reference map to borrow.
 
@@ -257,9 +269,47 @@ def _fit_layout(m):
     nothing else.
     """
     import umap
-    return umap.UMAP(n_components=2, metric="cosine", random_state=0,
-                     n_neighbors=max(2, min(15, m.shape[0] - 1)),
-                     min_dist=0.1).fit_transform(m)
+
+    with _LAYOUT_LOCK:
+        return umap.UMAP(n_components=2, metric="cosine", random_state=0,
+                         n_neighbors=max(2, min(15, m.shape[0] - 1)),
+                         min_dist=0.1).fit_transform(m)
+
+
+def _transform(ref, m):
+    """Place rows in the reference layout. Same lock, same reason."""
+    with _LAYOUT_LOCK:
+        return ref["reducer"].transform(m)
+
+
+def _cap_per_sample(ids, m, limit):
+    """Thin to `limit` rows while keeping every sample represented.
+
+    A flat stride over the cohort would thin each sample in proportion to its
+    size, which is fine until the smallest sample rounds to nothing. Here the
+    budget is shared out proportionally with a floor, so a nine-gene sample
+    still appears.
+    """
+    import numpy as np
+
+    if len(ids) <= limit:
+        return ids, m, False
+    groups: dict[str, list[int]] = {}
+    for i, key in enumerate(ids):
+        groups.setdefault(key.split("\x1f", 1)[0], []).append(i)
+    floor = min(200, limit // max(1, len(groups)))
+    keep: list[int] = []
+    for members in groups.values():
+        share = min(len(members), max(floor, round(limit * len(members) / len(ids))))
+        if share >= len(members):
+            keep.extend(members)
+            continue
+        # Evenly spaced picks rather than a stride: a stride can only halve,
+        # so asking for 93% of a sample would hand back 50%.
+        pick = np.unique(np.linspace(0, len(members) - 1, share).round().astype(int))
+        keep.extend(members[i] for i in pick)
+    keep.sort()
+    return [ids[i] for i in keep], m[np.asarray(keep)], True
 
 
 def _cap(ids, m, limit):
@@ -670,6 +720,9 @@ class Handler(BaseHTTPRequestHandler):
                 "stages": stage_names(),
                 "roots": [str(r) for r in self.cfg["roots"]],
                 "lake": str(self.cfg["lake"]),
+                # Moves exactly when something is written, so a client can tell
+                # a cached view is stale without polling the view itself.
+                "snapshot": self._snapshot(),
                 "read_only": self.cfg["read_only"],
                 "uploads": str(self.cfg["uploads"]),
                 "data_files": self._candidate_data(),
@@ -730,6 +783,13 @@ class Handler(BaseHTTPRequestHandler):
                                     (q.get("b") or [""])[0],
                                     (q.get("color") or [""])[0],
                                     (q.get("filter") or [""])[0])
+        if u.path == "/api/atlas":
+            try:
+                limit = int((q.get("limit") or ["0"])[0]) or MAX_ATLAS_POINTS
+            except ValueError:
+                limit = MAX_ATLAS_POINTS
+            return self._atlas((q.get("color") or [""])[0],
+                               max(500, min(limit, MAX_ATLAS_POINTS)))
         if u.path == "/api/preview":
             try:
                 limit = int((q.get("limit") or ["0"])[0]) or PREVIEW_ROWS
@@ -1043,8 +1103,8 @@ class Handler(BaseHTTPRequestHandler):
             if ref is not None:
                 # Fixed layout: place these proteins in the corpus's space, so
                 # coordinates mean the same thing across runs and re-runs.
-                xy = ref["reducer"].transform(m)
-                b_xy = ref["reducer"].transform(b_m) if comparing else None
+                xy = _transform(ref, m)
+                b_xy = _transform(ref, b_m) if comparing else None
                 used = "reference"
                 step = max(1, len(ref["ids"]) // MAX_CONTEXT_POINTS)
                 context = [{"x": round(float(x), 3), "y": round(float(y), 3)}
@@ -1072,6 +1132,116 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             return (422, f"projection failed: {exc}")
         return xy, b_xy, used, context, ref
+
+    def _snapshot(self):
+        """The store's latest snapshot id, or None if it cannot be read."""
+        if lake is None:
+            return None
+        try:
+            with lake.read(self.cfg["lake"], budget=3) as con:
+                return lake.snapshot_id(con)
+        except Exception:
+            return None
+
+    def _atlas_layout(self, limit: int):
+        """Every embedding in the store, in one 2D layout. Cached per snapshot.
+
+        The expensive half - reading half a million activations and running
+        UMAP over them - depends only on what is in the store, so it is keyed
+        on the snapshot id and survives every colour change and every hover.
+        Colour is applied per request from the cached coordinates.
+        """
+        cache = self.cfg.setdefault("atlas_cache", {})
+        with lake.read(self.cfg["lake"], budget=10) as con:
+            stamp = lake.snapshot_id(con)
+            hit = cache.get(limit)
+            if hit and hit[0] == stamp:
+                return hit[1]
+            # gene_id is unique only within a sample, so the matrix is keyed on
+            # both - otherwise two samples' genes would collapse into one row.
+            t = entities.select(
+                con, "feature_hit",
+                columns=["sample", "gene_id", "feature_id", "activation"])
+            descs, rows = metadata.load_cohort(con)
+
+        if t.num_rows == 0:
+            raise ValueError("no embeddings in the store yet")
+
+        import pyarrow as pa
+
+        keyed = t.append_column("key", pa.array(
+            [metadata.cohort_key(s_, g) for s_, g in
+             zip(t.column("sample").to_pylist(), t.column("gene_id").to_pylist())]))
+        ids, m = sparse_from_table(
+            keyed.select(["key", "feature_id", "activation"])
+                 .rename_columns(["gene_id", "feature_id", "activation"]))
+        m = normalise(m)
+
+        # Thin per sample rather than over the whole cohort, so a small sample
+        # is not rounded away by a large one - the point of the view is that
+        # every sample is on it.
+        ids, m, thinned = _cap_per_sample(ids, m, limit)
+
+        ref = self._reference()
+        try:
+            if ref is not None:
+                xy, mode = _transform(ref, m), "reference"
+            else:
+                xy, mode = _fit_layout(m), "cohort"
+        except Exception:
+            xy, mode = _fit_layout(m), "cohort"
+
+        built = {"ids": ids, "xy": xy, "mode": mode, "descs": descs,
+                 "rows": rows, "thinned": thinned, "total": len(ids),
+                 "stamp": stamp}
+        cache.clear()                       # one layout at a time is plenty
+        cache[limit] = (stamp, built)
+        return built
+
+    def _atlas(self, color: str, limit: int):
+        """The cohort as a backdrop, with per-sample membership carried along.
+
+        Everything is sent once and hovering is done in the browser: the
+        highlight is a restyle, not a request, so it is instant and the layout
+        never moves under the cursor.
+        """
+        if entities is None:
+            return self._err(503, "the pipeline registry is unavailable")
+        try:
+            built = self._atlas_layout(limit)
+        except ValueError as exc:
+            return self._err(404, str(exc))
+        except ImportError as exc:
+            return self._err(501, f"the atlas needs scipy and umap-learn: {exc}")
+        except Exception as exc:
+            return self._err(422, f"cannot build the atlas: {exc}")
+
+        usable = built["descs"]
+        column, domain, _ = self._color_choice(color, usable, False)
+        order: dict[str, int] = {}
+        points = []
+        for i, key in enumerate(built["ids"]):
+            sample, _, gene = key.partition(metadata.KEY_SEP)
+            si = order.setdefault(sample, len(order))
+            p = {"x": round(float(built["xy"][i][0]), 2),
+                 "y": round(float(built["xy"][i][1]), 2), "i": si}
+            if column:
+                v = (built["rows"].get(key) or {}).get(column)
+                p["v"] = v
+                p["s"] = metadata.slot_of(v, domain) if domain else None
+            points.append(p)
+
+        samples = [s for s, _ in sorted(order.items(), key=lambda kv: kv[1])]
+        counts = [0] * len(samples)
+        for p in points:
+            counts[p["i"]] += 1
+        return self._json({
+            "snapshot": built["stamp"],
+            "mode": built["mode"], "n": len(points), "points": points,
+            "samples": samples, "counts": counts,
+            "color": column, "domain": domain, "columns": usable,
+            "thinned": built["thinned"],
+        })
 
     def _projection(self, run_id: str, mode: str, b_id: str = "",
                     color: str = "", filt: str = ""):

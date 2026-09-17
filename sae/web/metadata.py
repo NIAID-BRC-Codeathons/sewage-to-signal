@@ -52,6 +52,9 @@ MAX_FILTER_VALUES = 300
 NUMERIC_BINS = 5
 # A column with one value per row is an identifier, not metadata: colouring by
 # it gives every point its own colour and filtering by it selects one protein.
+# This is the backstop. The primary signal is the stage's own `identifier`
+# declaration, because a gene id is unique only *within* a sample - pooled
+# across a cohort it looks merely high-cardinality and slips under any ratio.
 IDENTITY_FRAC = 0.98
 
 # Columns that are never useful to colour or filter by, whatever they contain.
@@ -119,6 +122,44 @@ def load(con, sample: str) -> tuple[list[dict], dict[str, dict]]:
 # --------------------------------------------------------------------------
 # describing
 # --------------------------------------------------------------------------
+# A gene is unique per (sample, gene_id), so anything holding the whole cohort
+# in one dict needs both. Unit separator: it cannot occur in a sample name
+# (SAFE_NAME) or in a FASTA header id.
+KEY_SEP = "\x1f"
+
+
+def cohort_key(sample: str, gene_id: str) -> str:
+    return f"{sample}{KEY_SEP}{gene_id}"
+
+
+def load_cohort(con) -> tuple[list[dict], dict[str, dict]]:
+    """(column descriptors, (sample, gene_id) -> row) for every sample.
+
+    The per-sample `load` describes one run; this describes the store. The
+    descriptors are computed over the whole cohort on purpose, so a colour
+    means the same thing whichever sample you are looking at - which is the
+    point of drawing them in one layout.
+    """
+    E = _entities()
+    if E is None:
+        return [], {}
+    try:
+        cols = [c for c in E.columns_of(con, "gene") if c["name"] not in HIDDEN]
+        names = [c["name"] for c in cols]
+        t = E.select(con, "gene", columns=["sample", *names])
+    except Exception:
+        return [], {}
+    if t.num_rows == 0:
+        return [], {}
+    rows = {}
+    for r in t.to_pylist():
+        rows[cohort_key(r["sample"], r["gene_id"])] = r
+    # Describe without `sample`, which is constant per run and already carried
+    # by the point itself.
+    return _describe(t.drop_columns(["sample"]),
+                     {c["name"]: c for c in cols}), rows
+
+
 def _describe(table, help_by: dict) -> list[dict]:
     from collections import Counter
 
@@ -153,7 +194,8 @@ def _describe(table, help_by: dict) -> list[dict]:
             log = bool(lo > 0 and hi > 0 and hi / lo >= 1e3)
             d.update(kind="numeric", n_distinct=len(set(present)),
                      min=lo, max=hi, log=log,
-                     usable=lo != hi, bins=NUMERIC_BINS)
+                     usable=lo != hi and not meta.get("identifier"),
+                     bins=NUMERIC_BINS)
             out.append(d)
             continue
 
@@ -174,7 +216,8 @@ def _describe(table, help_by: dict) -> list[dict]:
             # More distinct values than slots means the tail is one colour; the
             # legend has to say so rather than imply the plot shows them all.
             folded=max(0, len(counts) - COLOR_SLOTS),
-            usable=len(counts) >= 2 and len(counts) < n * IDENTITY_FRAC,
+            usable=(len(counts) >= 2 and len(counts) < n * IDENTITY_FRAC
+                    and not meta.get("identifier")),
             slots=COLOR_SLOTS,
         )
         out.append(d)
