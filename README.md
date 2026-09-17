@@ -98,7 +98,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh    # or: brew install uv
 | `fastp` | `s01_qc`, ~30× faster than the Python path | optional |
 | `aws` | faster, resumable atlas download (else `curl`) | optional |
 
-`./setup.sh preflight` verifies the required set; `./setup.sh status` checks
+`./src/setup.sh preflight` verifies the required set; `./src/setup.sh status` checks
 those plus data and the optional binaries. Python packages are pinned in
 `requirements.txt`.
 
@@ -117,19 +117,19 @@ assembly runs without them.
 ```bash
 git clone https://github.com/NIAID-BRC-Codeathons/sewage-to-signal.git
 cd sewage-to-signal
-./setup.sh                 # status: what is present, what to run next
-./setup.sh quickstart      # ~2 GB — venv, deps, feature table, ESMC-300M, reads
-./setup.sh pfam            # 400 MB — without it s05 is a pass-through
+./src/setup.sh                 # status: what is present, what to run next
+./src/setup.sh quickstart      # ~2 GB — venv, deps, feature table, ESMC-300M, reads
+./src/setup.sh pfam            # 400 MB — without it s05 is a pass-through
 ```
 
-`./setup.sh` on its own only reports; it never downloads. Every target is
+`./src/setup.sh` on its own only reports; it never downloads. Every target is
 idempotent and named, so nothing pulls 25 GB unless you ask for it.
 See **[DATA.md](DATA.md)** for the size and source of every data item.
 
 ```bash
-./setup.sh model-6b        # +25 GB, needed for feature *descriptions*
-./setup.sh reads           # SARS-CoV-2 amplicon FASTQ
-./setup.sh atlas           # ESM Atlas tables, 28.6 GB from the public S3 bucket
+./src/setup.sh model-6b        # +25 GB, needed for feature *descriptions*
+./src/setup.sh reads           # SARS-CoV-2 amplicon FASTQ
+./src/setup.sh atlas           # ESM Atlas tables, 28.6 GB from the public S3 bucket
 ```
 
 ## Run it
@@ -209,7 +209,10 @@ emulated. Assemble in the container, embed outside it.
 ## Layout
 
 ```
-setup.sh                      one entry point for env + data
+src/
+  setup.sh                    one entry point for env + data
+  setup_subtraction.sh        host-read subtraction provisioning
+  README_subtraction.md       what the subtraction step does
 requirements.txt              pinned Python deps
 DATA.md                       provenance and sizes
 data/

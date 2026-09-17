@@ -263,7 +263,7 @@ container/run.sh setup pfam            # 400 MB — else s05 is a pass-through
 container/run.sh web
 ```
 
-`setup.sh` detects the container (via `APPTAINER_CONTAINER`,
+`src/setup.sh` detects the container (via `APPTAINER_CONTAINER`,
 `SINGULARITY_CONTAINER` or `/.dockerenv`) and skips venv creation, reporting the
 baked-in environment instead. It also resolves data to the binds rather than to
 `/opt/sae/data`, which is read-only inside the image — pointing at the latter

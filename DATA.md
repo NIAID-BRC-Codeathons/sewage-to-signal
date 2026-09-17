@@ -1,6 +1,6 @@
 # Data inventory
 
-Nothing in this table is committed — together it is ~30 GB. `./setup.sh status`
+Nothing in this table is committed — together it is ~30 GB. `./src/setup.sh status`
 tells you what is present; each row names the target that fetches it.
 
 | Item | Size | Target | Source |
@@ -23,7 +23,7 @@ as dark and goes to the GPU stage, which is the expensive path the funnel exists
 to avoid. So this is not an optional extra for any real run:
 
 ```bash
-./setup.sh pfam
+./src/setup.sh pfam
 python run.py ... --hmm data/pfam/Pfam-A.hmm --bit-cutoffs gathering
 ```
 
@@ -40,7 +40,7 @@ alongside to record which release was taken.
 ## Minimum to be useful
 
 ```bash
-./setup.sh quickstart      # ~2 GB: venv, deps, feature table, ESMC-300M, CASPER subsample
+./src/setup.sh quickstart      # ~2 GB: venv, deps, feature table, ESMC-300M, CASPER subsample
 ```
 
 That runs the whole pipeline end to end. Add `model-6b` when you need
@@ -56,7 +56,7 @@ use the *same* SAE, and is 20x cheaper.
 rows) come from the public ESM Atlas bucket:
 
 ```bash
-./setup.sh atlas
+./src/setup.sh atlas
 ```
 
 Equivalent to, and verified against, the upstream commands:
@@ -68,7 +68,7 @@ aws s3 cp --no-sign-request \
   s3://esm-protein-atlas/v1/clusters/data/representative_proteins.parquet ./
 ```
 
-`setup.sh atlas` adds three things over the raw commands:
+`./src/setup.sh atlas` adds three things over the raw commands:
 
 * **Exact size verification.** Every object's byte size is pinned in
   `data/atlas_manifest.tsv`, so a truncated transfer is detected rather than

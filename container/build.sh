@@ -39,7 +39,7 @@ stage_context() {
     || { echo "error: $REPO is not a git repo" >&2; exit 1; }
   SHA="$(git rev-parse --short HEAD)"
   DIRTY=""
-  git diff --quiet HEAD -- sae requirements.txt setup.sh data container 2>/dev/null || DIRTY=" (dirty)"
+  git diff --quiet HEAD -- sae requirements.txt src/setup.sh data container 2>/dev/null || DIRTY=" (dirty)"
   STAGE="$(mktemp -d)"
   # HEAD, not the working tree: the image should match a commit.
   git archive HEAD | tar -x -C "$STAGE"

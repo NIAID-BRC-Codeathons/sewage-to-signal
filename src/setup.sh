@@ -1,28 +1,30 @@
 #!/usr/bin/env bash
 # One entry point for a fresh checkout.
 #
-#   ./setup.sh              # status report — tells you what is missing and what to run
-#   ./setup.sh preflight    # verify required host commands only
-#   ./setup.sh env          # create sae/.venv and install pinned deps
-#   ./setup.sh features     # SAE feature descriptions        (~50 MB)
-#   ./setup.sh model-small  # ESMC-300M + SAE                 (~1.7 GB)
-#   ./setup.sh model-6b     # ESMC-6B + SAE                   (~25 GB)
-#   ./setup.sh reads        # SARS-CoV-2 amplicon FASTQ       (~2.4 GB)
-#   ./setup.sh rnaseq       # CASPER metagenome subsample     (~100 MB)
-#   ./setup.sh pfam         # Pfam-A HMMs for the s05 triage  (~400 MB)
-#   ./setup.sh atlas        # ESM Atlas cluster tables        (~27 GB)
-#   ./setup.sh quickstart   # env + features + model-small + rnaseq  (~2 GB)
-#   ./setup.sh all          # everything except atlas
+#   ./src/setup.sh              # status report — tells you what is missing and what to run
+#   ./src/setup.sh preflight    # verify required host commands only
+#   ./src/setup.sh env          # create sae/.venv and install pinned deps
+#   ./src/setup.sh features     # SAE feature descriptions        (~50 MB)
+#   ./src/setup.sh model-small  # ESMC-300M + SAE                 (~1.7 GB)
+#   ./src/setup.sh model-6b     # ESMC-6B + SAE                   (~25 GB)
+#   ./src/setup.sh reads        # SARS-CoV-2 amplicon FASTQ       (~2.4 GB)
+#   ./src/setup.sh rnaseq       # CASPER metagenome subsample     (~100 MB)
+#   ./src/setup.sh pfam         # Pfam-A HMMs for the s05 triage  (~400 MB)
+#   ./src/setup.sh atlas        # ESM Atlas cluster tables        (~27 GB)
+#   ./src/setup.sh quickstart   # env + features + model-small + rnaseq  (~2 GB)
+#   ./src/setup.sh all          # everything except atlas
 #
 # Every target is idempotent: it checks for a complete result and skips.
 # Nothing here downloads 25 GB unless you name it.
 #
 # Requires: uv, curl, awk, gzip + gzcat/zcat, md5 or md5sum.
-# `./setup.sh status` verifies all of them. There is deliberately no pip
+# `./src/setup.sh status` verifies all of them. There is deliberately no pip
 # fallback — see require_uv() below.
 
 set -uo pipefail
-ROOT="$(cd "$(dirname "$0")" && pwd)"
+# One level up: this script lives in src/, but the venv, data/ and
+# requirements.txt it manages are at the repo root beside it.
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PYVER="3.12"   # the interpreter this project is pinned to; uv provisions it
 
 # Inside the Apptainer image the environment is baked in at /opt/venv and the
@@ -62,7 +64,7 @@ human() { awk -v b="$1" 'BEGIN{
 
 # --- venv -------------------------------------------------------------------
 need_venv() {
-  [ -x "$PY" ] || { bad "no venv — run: ./setup.sh env"; exit 1; }
+  [ -x "$PY" ] || { bad "no venv — run: ./src/setup.sh env"; exit 1; }
 }
 
 # uv is required, with no pip fallback. uv provisions Python 3.12 itself, so
@@ -81,7 +83,7 @@ error: uv not found on PATH, and it is required.
       pipx install uv
 
   then re-run:
-      ./setup.sh env
+      ./src/setup.sh env
 
   There is no pip fallback by design: uv pins the interpreter (Python 3.12)
   this project is validated against. Falling back to the host python3 would
@@ -105,7 +107,7 @@ t_env() {
     v="$("$PY" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo "?")"
     if [ "$v" != "$PYVER" ]; then
       bad "venv is Python $v, expected $PYVER"
-      say "        remove it and re-run:  rm -rf $VENV && ./setup.sh env"
+      say "        remove it and re-run:  rm -rf $VENV && ./src/setup.sh env"
       exit 1
     fi
     ok "venv present (Python $v)"
@@ -282,7 +284,7 @@ t_atlas() {
   done
 
   if [ -z "$(atlas_pending)" ]; then ok "all $total files present and byte-exact"
-  else bad "some files still incomplete — re-run ./setup.sh atlas"; return 1; fi
+  else bad "some files still incomplete — re-run ./src/setup.sh atlas"; return 1; fi
 }
 
 # --- status -----------------------------------------------------------------
@@ -326,33 +328,33 @@ t_status() {
   elif [ -x "$PY" ]; then
     ok "venv                $("$PY" -V 2>&1)"
   else
-    miss "venv                ./setup.sh env"
+    miss "venv                ./src/setup.sh env"
   fi
 
   if [ -x "$PY" ]; then
     hf_present biohub/ESMC-SAE-Features dataset \
-      && ok "feature table       cached" || miss "feature table       ./setup.sh features"
+      && ok "feature table       cached" || miss "feature table       ./src/setup.sh features"
     hf_present biohub/ESMC-300M \
-      && ok "ESMC-300M           cached" || miss "ESMC-300M           ./setup.sh model-small"
+      && ok "ESMC-300M           cached" || miss "ESMC-300M           ./src/setup.sh model-small"
     hf_present biohub/ESMC-6B \
-      && ok "ESMC-6B             cached" || miss "ESMC-6B             ./setup.sh model-6b"
+      && ok "ESMC-6B             cached" || miss "ESMC-6B             ./src/setup.sh model-6b"
   fi
 
   local n; n=$(ls "$DATA"/fastq/*.fastq.gz 2>/dev/null | wc -l | tr -d ' ')
-  [ "$n" -gt 0 ] && ok "amplicon FASTQ      $n run(s)" || miss "amplicon FASTQ      ./setup.sh reads"
+  [ "$n" -gt 0 ] && ok "amplicon FASTQ      $n run(s)" || miss "amplicon FASTQ      ./src/setup.sh reads"
 
   big_enough "$DATA/fastq_rnaseq/SRR38294894_1.fastq.gz" 10000000 \
-    && ok "CASPER subsample    present" || miss "CASPER subsample    ./setup.sh rnaseq"
+    && ok "CASPER subsample    present" || miss "CASPER subsample    ./src/setup.sh rnaseq"
 
   big_enough "$DATA/pfam/Pfam-A.hmm" 100000000 \
-    && ok "Pfam-A HMMs         present" || miss "Pfam-A HMMs         ./setup.sh pfam  (else s05 is a pass-through)"
+    && ok "Pfam-A HMMs         present" || miss "Pfam-A HMMs         ./src/setup.sh pfam  (else s05 is a pass-through)"
 
   if [ -f "$MANIFEST" ]; then
     local atotal apend
     atotal=$(awk -F'\t' 'NR>1 && $1!=""' "$MANIFEST" | wc -l | tr -d ' ')
     apend=$(atlas_pending | wc -l | tr -d ' ')
     if [ "$apend" = 0 ]; then ok "atlas tables        $atotal/$atotal byte-exact"
-    else miss "atlas tables        $((atotal - apend))/$atotal — ./setup.sh atlas"; fi
+    else miss "atlas tables        $((atotal - apend))/$atotal — ./src/setup.sh atlas"; fi
   fi
 
   head2 "External binaries (not installable from pip)"
@@ -368,7 +370,7 @@ t_status() {
     say "  ${D}or skip all of it: container/build.sh  (see container/README.md)${N}"
   fi
   head2 "Next"
-  say "  ./setup.sh quickstart     # ~2 GB, enough to run the pipeline end to end"
+  say "  ./src/setup.sh quickstart     # ~2 GB, enough to run the pipeline end to end"
   say "  cat DATA.md               # provenance and sizes for every item"
 }
 

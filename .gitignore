@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# Data. Everything here is fetched by ./setup.sh, never committed (~30 GB).
+# Data. Everything here is fetched by ./src/setup.sh, never committed (~30 GB).
 # See DATA.md for the source of each item.
 # ---------------------------------------------------------------------------
 
@@ -16,7 +16,7 @@ data/fastq_rnaseq/.n1
 data/fastq_rnaseq/.n2
 data/fastq_rnaseq/.both
 
-# Pfam-A — ~400 MB compressed, larger on disk; fetch with ./setup.sh pfam
+# Pfam-A — ~400 MB compressed, larger on disk; fetch with ./src/setup.sh pfam
 data/pfam/
 
 # Fitted reference layout. Derived, and a pickle whose validity depends on

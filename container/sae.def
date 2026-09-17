@@ -18,7 +18,7 @@ From: ubuntu:24.04
 %files
     requirements.txt /opt/build/requirements.txt
     sae              /opt/sae/sae
-    setup.sh         /opt/sae/setup.sh
+    src/setup.sh     /opt/sae/src/setup.sh
     data/fetch_fastq.sh      /opt/sae/data/fetch_fastq.sh
     data/subsample_rnaseq.sh /opt/sae/data/subsample_rnaseq.sh
     data/atlas_manifest.tsv  /opt/sae/data/atlas_manifest.tsv

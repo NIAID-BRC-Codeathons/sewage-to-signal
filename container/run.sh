@@ -40,7 +40,7 @@ AP_IMAGE="${SAE_APPTAINER_IMAGE:-quay.io/singularity/singularity:v4.1.0}"
 # Provisioning runs inside the image but writes to the binds: the image is
 # read-only, so models land in /hf and data in /data. Not a %apprun, because
 # it takes setup.sh's own subcommands.
-APP_SETUP="/opt/sae/setup.sh"
+APP_SETUP="/opt/sae/src/setup.sh"
 
 RUNNER="${SAE_RUNTIME:-}"
 if [ -z "$RUNNER" ]; then

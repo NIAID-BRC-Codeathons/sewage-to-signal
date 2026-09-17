@@ -1,10 +1,10 @@
 # Pinned to the versions this pipeline was developed and validated against.
 #
-# Python 3.12 — provisioned by `uv venv --python 3.12`, which ./setup.sh env
+# Python 3.12 — provisioned by `uv venv --python 3.12`, which ./src/setup.sh env
 # does for you. uv is required; there is no pip fallback, because it would
 # build against the host interpreter instead of this pinned one.
 #
-#   ./setup.sh env        # preferred
+#   ./src/setup.sh env        # preferred
 #   uv pip install -r requirements.txt --python sae/.venv/bin/python
 
 # Protein language model + SAE
