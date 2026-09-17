@@ -75,6 +75,48 @@ global atlas.
 With Pfam-A prefer `--bit-cutoffs gathering`; the curated per-family thresholds
 beat any flat E-value.
 
+### The fast road: no assembly
+
+`s02_assemble` is the only stage needing a binary `requirements.txt` cannot
+install, and the slowest step on a small sample. `--fast` routes around it:
+
+```bash
+python run.py --fastq reads.fastq.gz --sample S1 --to feature_hit --fast
+python run.py --fastq reads.fastq.gz --sample S1 --skip s02_assemble   # same
+```
+
+| | route |
+|---|---|
+| default | `s01_qc → s02_assemble → s03_genes → s04_derep → s05_prefilter → s06_embed` |
+| `--fast` | `s01_qc → s02_translate → s00_ingest → s04_derep → s05_prefilter → s06_embed` |
+
+`--fast` names the **assembly role**, not a stage, and `--skip` now re-plans
+*around* what it removes rather than deleting it from a finished plan — which
+used to strand `s03_genes` with no contigs. Nothing else changes: QC, dedup,
+triage and the GPU stage are woven in exactly as before, and the default route
+is untouched (`s02_translate` sits above `s02_assemble` in `order`, so the
+planner keeps choosing assembly when both reach the gene level in the same
+number of steps).
+
+**What you give up, measured.** Every peptide is at most `read_length / 3`
+residues — 50 aa for a 151 bp read — so none of them can contain a complete
+domain. On 2000 read pairs of SRR38294894:
+
+| | assembled (CHI-C-2) | `--fast` (FAST1) |
+|---|---|---|
+| dark | 73% | **98%** |
+| mean aa | 188.8 | 46.5 |
+| s06 throughput | 13.6 seq/s | 68.7 seq/s |
+
+That 98% is the whole caveat in one number: the fragments look novel because
+they are fragments, not because they are novel. Use it to see roughly what a
+sample is made of; assemble before claiming anything about a protein.
+
+Translation itself is never the cost — ~36,000 reads/s, single-threaded, no
+binary. The GPU is. At the default `min_aa=40` a read yields ~1.5 peptides, so
+a million reads is ~1.5 M forward passes; cap the input
+(`--set s01_qc.max_reads=`) rather than finding out on the GPU.
+
 ## Usage
 
 ```bash
@@ -149,6 +191,7 @@ existed only to hand the next stage a subset somebody had chosen in advance.
 |---|---|---|
 | s01_qc | pyfastx, or fastp if present | paired via `--fastq2` |
 | s02_assemble | MEGAHIT / metaSPAdes | **external binary required** |
+| s02_translate | pure Python | the `--fast` route: six-frame, no binary, read-length fragments |
 | s00_ingest | — | import a protein FASTA as the gene level |
 | s03_genes | pyrodigal | pure wheel; emits the gene level |
 | s04_derep | exact hash, MMseqs2 if present | exact-only without MMseqs2; labels, does not filter |

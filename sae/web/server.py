@@ -65,7 +65,7 @@ IN_CONTAINER = IN_DOCKER or IN_APPTAINER
 sys.path.insert(0, str(PIPELINE))
 try:
     import entities                          # type: ignore
-    from stage import registry               # type: ignore
+    from stage import Registry, registry     # type: ignore
 
     REGISTRY = registry()
 except Exception as exc:                     # pragma: no cover - defensive
@@ -120,6 +120,15 @@ PREVIEW_BYTES = 2 * 1024**2
 # existing layout at all, and a linear projection was never good enough.
 MAX_CONTEXT_POINTS = 8000
 MAX_PROJECTION_POINTS = 20000
+
+# UMAP is numba, and numba's default `workqueue` threading layer is not
+# threadsafe: called from two Python threads at once it does not raise, it
+# aborts the process. This is a ThreadingHTTPServer, so two overlapping
+# projections - trivially reachable now that a run can be drawn against a
+# second one - took the whole dashboard down. Serialising them costs nothing
+# real, because a projection is CPU-bound and gains nothing from running
+# beside another; the worst case is that the second request waits.
+_PROJECT_LOCK = threading.Lock()
 
 # What a launch request may contain is derived from the registry rather than
 # listed here: a parameter exists if some stage declares it, and it is valid if
@@ -605,6 +614,10 @@ class Handler(BaseHTTPRequestHandler):
             })
         if u.path == "/api/pipeline":
             return self._pipeline()
+        if u.path == "/api/plan":
+            return self._plan((q.get("have") or [""])[0],
+                              (q.get("want") or [""])[0],
+                              q.get("skip") or [])
         if u.path == "/api/columns":
             return self._columns((q.get("run") or [""])[0],
                                  (q.get("level") or [""])[0])
@@ -732,6 +745,31 @@ class Handler(BaseHTTPRequestHandler):
             return self._err(503, "the pipeline registry is unavailable")
         body = REGISTRY.to_json()
         body["roles"] = sorted({r for s in REGISTRY for r in s.roles})
+        return self._json(body)
+
+    def _plan(self, have: str, want: str, skip: list[str]):
+        """The stages that would run, resolved by the driver's own planner.
+
+        The page used to work this out itself, walking ports greedily. That
+        held only while one stage consumed each port: as soon as two did -
+        assemble and translate both take reads - the greedy walk returned the
+        union of both routes and could not tell that skipping the assembler
+        leaves no route to contigs at all. So the preview asks the planner
+        instead of imitating it, and what it shows is what will run.
+        """
+        if REGISTRY is None:
+            return self._err(503, "the pipeline registry is unavailable")
+        names = [n for n in skip if n in REGISTRY]
+        reg = (Registry([s for s in REGISTRY if s.name not in names])
+               if names else REGISTRY)
+        body = {"have": have, "want": want, "skip": names}
+        try:
+            body["stages"] = [s.name for s in reg.plan(have, want)]
+        except Exception as exc:
+            # No route is an answer, not a failure: it is what tells the page
+            # an option is not on offer.
+            body["stages"] = []
+            body["unreachable"] = str(exc)
         return self._json(body)
 
     def _columns(self, run_id: str, level: str):
@@ -894,6 +932,51 @@ class Handler(BaseHTTPRequestHandler):
             return None, None, None
         return d["name"], metadata.color_domain(d), d
 
+    def _layout(self, mode, ids, m, b_ids, b_m, comparing):
+        """Place one or two samples in 2D. Called under _PROJECT_LOCK.
+
+        Returns (xy, b_xy, mode_used, context, ref), or a (status, message)
+        pair for the caller to report - the lock is released either way, and a
+        2-tuple is the one shape the success return can never be mistaken for.
+        """
+        from scipy.sparse import vstack
+
+        ref = self._reference() if mode == "reference" else None
+        context: list = []
+        try:
+            if ref is not None:
+                # Fixed layout: place these proteins in the corpus's space, so
+                # coordinates mean the same thing across runs and re-runs.
+                xy = ref["reducer"].transform(m)
+                b_xy = ref["reducer"].transform(b_m) if comparing else None
+                used = "reference"
+                step = max(1, len(ref["ids"]) // MAX_CONTEXT_POINTS)
+                context = [{"x": round(float(x), 3), "y": round(float(y), 3)}
+                           for x, y in ref["xy"][::step]]
+            elif comparing:
+                # No shared layout to borrow, so fit one over exactly these two
+                # samples. That is internally comparable - the two sit in one
+                # space - and comparable with nothing else.
+                if len(ids) + len(b_ids) < 4:
+                    return (422, "need at least 4 proteins across the two runs "
+                                 "to fit a layout")
+                both = _fit_layout(vstack([m, b_m]))
+                xy, b_xy = both[:len(ids)], both[len(ids):]
+                used = "pair"
+            else:
+                if len(ids) < 4:
+                    return (422, "need at least 4 proteins to fit a layout; "
+                                 "build a reference map instead")
+                xy, b_xy = _fit_layout(m), None
+                used = "run"
+        except ImportError:
+            return (501, "umap-learn is not installed in this environment; "
+                         "rebuild the image or "
+                         "`uv pip install -r requirements.txt`")
+        except Exception as exc:
+            return (422, f"projection failed: {exc}")
+        return xy, b_xy, used, context, ref
+
     def _projection(self, run_id: str, mode: str, b_id: str = "",
                     color: str = "", filt: str = ""):
         """One run's proteins in 2D, or two runs drawn in the same 2D.
@@ -930,40 +1013,16 @@ class Handler(BaseHTTPRequestHandler):
 
         from scipy.sparse import vstack
 
-        ref = self._reference() if mode == "reference" else None
-        context: list = []
-        try:
-            if ref is not None:
-                # Fixed layout: place these proteins in the corpus's space, so
-                # coordinates mean the same thing across runs and re-runs.
-                xy = ref["reducer"].transform(m)
-                b_xy = ref["reducer"].transform(b_m) if other is not None else None
-                used = "reference"
-                step = max(1, len(ref["ids"]) // MAX_CONTEXT_POINTS)
-                context = [{"x": round(float(x), 3), "y": round(float(y), 3)}
-                           for x, y in ref["xy"][::step]]
-            elif other is not None:
-                # No shared layout to borrow, so fit one over exactly these two
-                # samples. That is internally comparable - the two sit in one
-                # space - and comparable with nothing else.
-                if len(ids) + len(b_ids) < 4:
-                    return self._err(422, "need at least 4 proteins across the "
-                                          "two runs to fit a layout")
-                both = _fit_layout(vstack([m, b_m]))
-                xy, b_xy = both[:len(ids)], both[len(ids):]
-                used = "pair"
-            else:
-                if len(ids) < 4:
-                    return self._err(422, "need at least 4 proteins to fit a "
-                                          "layout; build a reference map instead")
-                xy, b_xy = _fit_layout(m), None
-                used = "run"
-        except ImportError:
-            return self._err(501, "umap-learn is not installed in this "
-                                  "environment; rebuild the image or "
-                                  "`uv pip install -r requirements.txt`")
-        except Exception as exc:
-            return self._err(422, f"projection failed: {exc}")
+        # Serialised: numba aborts the process if two threads call into it at
+        # once, and this server hands every request its own thread.
+        with _PROJECT_LOCK:
+            laid = self._layout(mode, ids, m,
+                                b_ids if other is not None else None,
+                                b_m if other is not None else None,
+                                other is not None)
+        if len(laid) == 2:                            # (status, message)
+            return self._err(*laid)
+        xy, b_xy, used, context, ref = laid
 
         # Colour and filter by any column the gene level carries. Which columns
         # exist is read from the run, so a stage added later is another thing

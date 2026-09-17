@@ -110,6 +110,9 @@
          font-weight:600;width:auto;padding:7px 14px}
   button:disabled{opacity:.45;cursor:not-allowed}
   .row{display:flex;gap:10px;flex-wrap:wrap}
+  label.inline{display:flex;gap:6px;align-items:center;margin:0;
+               font:13px var(--mono);color:var(--ink)}
+  label.inline input{width:auto}
   .row>div{flex:1 1 180px}
   pre{background:var(--bg);border:1px solid var(--line);border-radius:5px;
       padding:10px;overflow:auto;max-height:280px;font:11.5px/1.45 var(--mono);
@@ -230,6 +233,12 @@
     </div>
     <div class="row">
       <div><label for="target">Produce</label><select id="target"></select></div>
+      <div id="fast-wrap" style="display:none">
+        <label for="fast">Speed</label>
+        <label class="inline"><input type="checkbox" id="fast"> skip assembly
+          — translate reads directly</label>
+        <div class="hint" id="fast-hint"></div>
+      </div>
     </div>
     <!-- Everything below is generated from /api/pipeline. There is no stage
          name, parameter name or predicate in this file. -->
@@ -928,10 +937,27 @@ function paramControl(stage, p) {
          (p.help ? `<div class="hint">${esc(p.help)}</div>` : "") + `</div>`;
 }
 
-function renderOptions() {
+async function renderOptions() {
   if (!PIPELINE) return;
   const target = $("target").value;
-  const plan = planFor(target);
+  // Offered only when an assembler is actually in the way *and* the planner
+  // finds a route without it. Asking for both plans is how we know; guessing
+  // would put the box on screen promising a route that does not exist.
+  const asm = PIPELINE.stages.filter(s => (s.roles || []).includes("assembly"))
+                             .map(s => s.name);
+  const [withAsm, without] = await Promise.all(
+    [planFor(target, []), planFor(target, asm)]);
+  const uses = p => p.some(s => asm.includes(s.name));
+  const offerable = asm.length && uses(withAsm) && without.length
+                    && !uses(without);
+  $("fast-wrap").style.display = offerable ? "" : "none";
+  if (!offerable) $("fast").checked = false;
+  $("fast-hint").textContent = offerable
+    ? "every peptide is a read-length fragment, so it cannot carry a complete "
+      + "domain — a triage picture, not evidence about a protein"
+    : "";
+
+  const plan = $("fast").checked ? without : withAsm;
   $("plan").innerHTML = plan.length
     ? `<span class="sub">plan:</span> ` + plan.map(s =>
         `<span class="cell done" title="${esc(s.summary)}">${esc(s.title)}</span>`).join("")
@@ -972,28 +998,34 @@ function renderOptions() {
   });
 }
 
-// The stages that would run, resolved the same way the driver resolves them:
-// walk ports from what the chosen input provides to what the target is, and
-// fold in every stage that annotates a port already live. Kept in step with
-// Registry.plan by construction — both read the same consumes/produces.
-function planFor(target) {
-  if (!PIPELINE) return [];
-  const kind = $("kind").value;
-  const stages = PIPELINE.stages;
-  let live = [kind], out = [], guard = 0;
-  const sameFirst = port => stages.filter(s =>
-    s.consumes === port && s.produces === port && !out.includes(s));
-  while (guard++ < 50) {
-    if (live.includes(target)) break;
-    const next = stages.find(s =>
-      live.includes(s.consumes) && s.produces !== s.consumes && !out.includes(s));
-    if (!next) break;
-    out.push(...sameFirst(next.consumes));
-    out.push(next);
-    live.push(next.produces, ...next.also_produces);
+// Stages filling a capability the run has switched off. A role, not a stage
+// name: any assembler fills "assembly", so this file still names no stage.
+function skipped() {
+  if (!PIPELINE || !$("fast").checked) return [];
+  return PIPELINE.stages.filter(s => (s.roles || []).includes("assembly"))
+                        .map(s => s.name);
+}
+
+// What would run, from the driver's planner rather than a copy of it here.
+// The page used to walk the ports itself. That held only while one stage
+// consumed each port: the moment two did - assemble and translate both take
+// reads - the greedy walk returned the union of both routes, and it could not
+// tell that switching off the assembler leaves no route to contigs at all. So
+// the preview asks, and what it shows is what will run. Answers are cached
+// per (input, target, skip) because they only change when the registry does.
+const planCache = new Map();
+async function planFor(target, off) {
+  if (!PIPELINE || !target) return [];
+  const qs = new URLSearchParams({have: $("kind").value, want: target});
+  (off || []).forEach(n => qs.append("skip", n));
+  const key = qs.toString();
+  if (!planCache.has(key)) {
+    planCache.set(key, api("/api/plan?" + key)
+      .then(d => (d.stages || []).map(n =>
+        PIPELINE.stages.find(s => s.name === n)).filter(Boolean))
+      .catch(() => []));
   }
-  out.push(...sameFirst(target));
-  return out;
+  return planCache.get(key);
 }
 
 // A path parameter offers whatever the server found under data/ with one of
@@ -1050,6 +1082,7 @@ async function runCount(node) {
 
 async function loadPipeline() {
   PIPELINE = await api("/api/pipeline");
+  $("fast").onchange = renderOptions;
   // Targets are ports something can produce — levels and file kinds alike, so
   // "assemble only" and "all the way to features" are the same kind of choice.
   const ports = [...new Set(PIPELINE.stages.flatMap(s =>
@@ -1119,7 +1152,7 @@ $("go").onclick = async () => {
   const body = {
     sample: $("sample").value.trim(), input_kind: $("kind").value,
     input_path: $("input").value, input_path2: $("input2").value || null,
-    target: $("target").value, params, where,
+    target: $("target").value, params, where, skip: skipped(),
   };
   $("go").disabled = true; $("msg").className = "msg"; $("msg").textContent = "starting…";
   try {

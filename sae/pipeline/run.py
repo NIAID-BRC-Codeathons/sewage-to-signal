@@ -37,7 +37,7 @@ from pathlib import Path
 import entities
 from common import MissingTool, workdir
 from entities import LEVELS, is_level
-from stage import Request, Stage, registry
+from stage import Registry, Request, Stage, registry
 
 DEFAULT_TARGET = "feature"
 
@@ -184,6 +184,10 @@ def main():
                    help="port you already have, if not implied by the input")
     p.add_argument("--only", action="append",
                    help="run just this stage; repeatable")
+    p.add_argument("--fast", action="store_true",
+                   help="route around assembly: translate reads directly into "
+                        "peptides. Fast and needs no assembler, but every "
+                        "peptide is a read-length fragment")
     p.add_argument("--skip", action="append", default=[],
                    help="drop this stage from the plan; repeatable")
     p.add_argument("--where", action="append", metavar="STAGE=EXPR",
@@ -276,17 +280,31 @@ def main():
             p.error("give an input (--fastq/--contigs/--proteins) or --from")
     have = a.start or have
 
+    # --fast names a capability, not a stage: anything that fills the assembly
+    # role is taken out and the planner finds whatever other route exists.
+    skip = set(a.skip) | ({s.name for s in reg.by_role("assembly")}
+                          if a.fast else set())
+    unknown = [n for n in skip if n not in reg]
+    if unknown:
+        sys.exit(f"--skip: no stage named {', '.join(sorted(unknown))}")
+
     if a.only:
         unknown = [n for n in a.only if n not in reg]
         if unknown:
             sys.exit(f"--only: no stage named {', '.join(unknown)}")
         plan = [reg[n] for n in a.only]
     else:
+        # Routing happens on a registry without the skipped stages, so a skip
+        # re-plans around the gap instead of leaving a hole. Dropping
+        # s02_assemble from a finished plan used to strand s03_genes with no
+        # contigs; now it finds the translation route on its own.
+        routable = Registry([s for s in reg if s.name not in skip]) if skip else reg
         try:
-            plan = reg.plan(have, a.target)
+            plan = routable.plan(have, a.target)
         except ValueError as exc:
-            sys.exit(str(exc))
-        plan = [s for s in plan if s.name not in a.skip]
+            sys.exit(str(exc) + (
+                f"\n(skipping {', '.join(sorted(skip))} removed the only route)"
+                if skip else ""))
 
     if a.plan:
         print(f"{have} -> {a.target}:")

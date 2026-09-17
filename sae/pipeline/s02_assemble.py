@@ -106,6 +106,7 @@ STAGE = Stage(
     consumes="reads",
     produces="contigs",
     order=20,
+    roles=("assembly",),
     input_arg="fastq",
     params=(
         Param("min_contig", int, 500, group="assembly",

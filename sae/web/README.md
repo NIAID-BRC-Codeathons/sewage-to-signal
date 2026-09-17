@@ -254,6 +254,24 @@ features, 476 shared, fitted in 5.2 s, 0.2 MB on disk. The classes separate in
 the shared layout — 10-nearest-neighbour same-class rate 0.612 against 0.461
 expected by chance — along a known → partial → dark gradient.
 
+### Two things the map had to learn
+
+**Projections are serialised.** UMAP is numba, and numba's default
+`workqueue` threading layer is not threadsafe — called from two Python threads
+at once it does not raise, it aborts the process. This is a
+`ThreadingHTTPServer`, so two overlapping projection requests took the whole
+dashboard down, which became easy to hit once a run could be drawn against a
+second one. They now run under one lock. That costs nothing real: a projection
+is CPU-bound and gains nothing from running beside another, and the worst case
+is a request that waits instead of a server that dies.
+
+**The plan preview asks rather than imitates.** The page used to resolve the
+stage list itself by walking ports. That held only while one stage consumed
+each port; the moment two did — `s02_assemble` and `s02_translate` both take
+reads — the greedy walk returned the *union* of both routes and could not tell
+that skipping the assembler leaves no route to contigs at all. `/api/plan` runs
+the driver's planner, so the preview is what will run.
+
 ## Where runs execute
 
 The server runs the pipeline here, on this machine, **one run at a time**. Each
@@ -407,6 +425,7 @@ bound to localhost, and should not be exposed. Beyond that:
 | `GET /api/columns?run=&level=` | a level's columns, with which stage wrote each |
 | `GET /api/query?run=&level=&where=&limit=` | how many rows a predicate selects, plus a look at them |
 | `GET /api/inputs` | files eligible to start a run |
+| `GET /api/plan?have=&want=&skip=` | the stages that would run, from the driver's own planner |
 | `GET /api/artifacts?run=` | files in each stage directory, with shape and size |
 | `GET /api/projection?run=&mode=&b=&color=&filter=` | the feature map: layout, colour domain, filterable columns |
 | `GET /api/preview?run=&stage=&file=&limit=` | one artifact as text, table or json |
