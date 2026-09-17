@@ -35,12 +35,22 @@ FORMAT_VERSION = 1
 
 
 def sparse_features(path: Path):
-    """Long-format parquet -> (gene_ids, CSR matrix over the codebook)."""
-    import numpy as np
+    """Long-format parquet -> (gene_ids, CSR matrix over the codebook).
+
+    For corpus files handed to `build` on the command line. A run's own hits
+    come from the store, through `sparse_from_table`.
+    """
     import pyarrow.parquet as pq
+
+    return sparse_from_table(
+        pq.read_table(path, columns=["gene_id", "feature_id", "activation"]))
+
+
+def sparse_from_table(t):
+    """(gene_id, feature_id, activation) rows -> (gene_ids, CSR matrix)."""
+    import numpy as np
     from scipy.sparse import csr_matrix
 
-    t = pq.read_table(path, columns=["gene_id", "feature_id", "activation"])
     genes = t.column("gene_id").to_pylist()
     feats = np.asarray(t.column("feature_id").to_pylist(), dtype=np.int32)
     vals = np.asarray(t.column("activation").to_pylist(), dtype=np.float32)

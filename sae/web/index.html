@@ -1105,9 +1105,10 @@ async function refresh() {
     const s = await api("/api/state");
     STAGES = s.stages; readOnly = s.read_only;
     DATA_FILES = s.data_files || [];
+    // The lake is the data now; work/ is scratch for the file-shaped stages.
     $("env").textContent =
-      `${s.container ? s.container + " container" : "host"} · work: ${s.roots.join("  ")}` +
-      (readOnly ? " · read-only" : "");
+      `${s.container ? s.container + " container" : "host"} · lake: ${s.lake || "—"}` +
+      ` · work: ${s.roots.join("  ")}` + (readOnly ? " · read-only" : "");
     if (readOnly) { $("new-run").style.display = "none"; }
     else if (PIPELINE) fillPathOptions();
     renderJobs(s.jobs);

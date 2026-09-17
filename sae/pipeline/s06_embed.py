@@ -24,8 +24,9 @@ import os
 import time
 from pathlib import Path
 
-from common import StageResult, is_current, workdir, write_fragment, write_manifest
-from entities import fasta_records, table_from_fasta
+import lake
+from common import StageResult, workdir
+from entities import fasta_records, table_from_fasta, write_rows
 from stage import Column, Param, Stage
 
 # Backbone, SAE repo and layer have to agree; picking them separately is an
@@ -134,6 +135,7 @@ def run(
     rows,
     out_dir: Path,
     sample: str,
+    con=None,
     source: Path | None = None,
     where: str | None = None,
     model: str = DEFAULT_MODEL,
@@ -157,17 +159,14 @@ def run(
     layer = m_layer if layer is None else layer
 
     out_dir = Path(out_dir)
-    out = out_dir / f"{sample}.sae_features.parquet"
-    feat_out = out_dir / f"{sample}.features.parquet"
-    gene_out = out_dir / f"{sample}.embedded.parquet"
     params = {
         "model": model,
         "backbone": backbone, "sae_repo": sae_repo, "layer": layer,
         "top_k": top_k, "max_len": max_len, "limit": limit, "where": where,
     }
-    deps = [Path(source)] if source else []
-    if not force and is_current(out, deps, params):
-        return StageResult("s06_embed", out, {}, skipped=True,
+    deps = [lake.fingerprint(source)] if source else []
+    if not force and lake.is_current(con, sample, "s06_embed", params, deps):
+        return StageResult("s06_embed", out_dir, {}, skipped=True,
                            produced={"feature_hit": None, "feature": None,
                                      "gene": None})
 
@@ -237,8 +236,7 @@ def run(
         "activation": pa.array(acts, pa.float32()),
         "raw_activation": pa.array(raws, pa.float32()),
     })
-    frags = [write_fragment(out, table, "feature_hit", role="base",
-                            where=where, help=HIT_HELP)]
+    write_rows(con, "feature_hit", sample, table, STAGE)
 
     # The codebook feature is its own entity: s07 annotates a feature once,
     # not once per gene that activated it. Emitting the level here keeps that
@@ -249,25 +247,25 @@ def run(
         per_feat.setdefault(f, []).append(a)
         per_gene[g].append((f, a))
     fids = sorted(per_feat)
-    frags.append(write_fragment(feat_out, pa.table({
+    write_rows(con, "feature", sample, pa.table({
         "feature_id": pa.array(fids, pa.int32()),
         "n_genes": pa.array([len(per_feat[f]) for f in fids], pa.int32()),
         "max_activation": pa.array([max(per_feat[f]) for f in fids], pa.float32()),
         "mean_activation": pa.array(
             [sum(per_feat[f]) / len(per_feat[f]) for f in fids], pa.float32()),
-    }), "feature", role="base", where=where, help=FEATURE_HELP))
+    }), STAGE)
 
     # ...and the genes get told what happened to them, so a later predicate can
     # ask for what has not been embedded yet without reading the hit table.
     gids = sorted(per_gene)
     tops = [max(per_gene[g], key=lambda t: t[1], default=(None, None)) for g in gids]
-    frags.append(write_fragment(gene_out, pa.table({
+    write_rows(con, "gene", sample, pa.table({
         "gene_id": pa.array(gids),
         "embedded": pa.array([True] * len(gids), pa.bool_()),
         "n_features": pa.array([len(per_gene[g]) for g in gids], pa.int32()),
         "top_feature": pa.array([t[0] for t in tops], pa.int32()),
         "top_activation": pa.array([t[1] for t in tops], pa.float32()),
-    }), "gene", where=where, help=GENE_HELP))
+    }), STAGE)
 
     el = time.time() - t1
     stats = {
@@ -277,9 +275,9 @@ def run(
         "load_s": round(load_s, 1), "device": str(dev), "dtype": str(dt),
         "idf_source": "feature_table" if stats_tensors else "sae_buffers",
     }
-    write_manifest(out, deps, params, stats, seconds=el + load_s, tables=frags,
-                   stage="s06_embed")
-    return StageResult("s06_embed", out, stats, seconds=el,
+    lake.record_run(con, sample, "s06_embed", params, deps, where, stats,
+                    seconds=el + load_s, rows=table.num_rows)
+    return StageResult("s06_embed", out_dir, stats, seconds=el,
                        produced={"feature_hit": None, "feature": None,
                                  "gene": None})
 
@@ -305,6 +303,20 @@ STAGE = Stage(
         Column("feature_id", "int32", HIT_HELP["feature_id"]),
         Column("activation", "float", HIT_HELP["activation"]),
         Column("raw_activation", "float", HIT_HELP["raw_activation"]),
+    ),
+    # Different columns go to each level this stage fills.
+    also_adds=(
+        ("feature", (
+            Column("n_genes", "int32", FEATURE_HELP["n_genes"]),
+            Column("max_activation", "float", FEATURE_HELP["max_activation"]),
+            Column("mean_activation", "float", FEATURE_HELP["mean_activation"]),
+        )),
+        ("gene", (
+            Column("embedded", "bool", GENE_HELP["embedded"]),
+            Column("n_features", "int32", GENE_HELP["n_features"]),
+            Column("top_feature", "int32", GENE_HELP["top_feature"]),
+            Column("top_activation", "float", GENE_HELP["top_activation"]),
+        )),
     ),
     params=(
         Param("model", str, "6b", choices=("6b", "300m"), group="model",

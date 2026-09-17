@@ -21,24 +21,25 @@ import argparse
 import time
 from pathlib import Path
 
-from common import (StageResult, is_current, read_fasta, workdir,
-                    write_fragment, write_manifest)
-from entities import GENE_COLUMN_HELP, gene_row, gene_schema
-from stage import Column, Param, Stage
+import lake
+from common import StageResult, read_fasta, workdir
+from entities import gene_columns, gene_row, gene_schema, write_rows
+from stage import Param, Stage
 
 
 def run(
     proteins: Path,
     out_dir: Path,
     sample: str,
+    con=None,
     min_aa: int = 0,
     force: bool = False,
 ) -> StageResult:
     proteins = Path(proteins)
-    out = Path(out_dir) / f"{sample}.genes.parquet"
     params = {"min_aa": min_aa, "source": "imported"}
-    if not force and is_current(out, [proteins], params):
-        return StageResult("s00_ingest", out, {}, skipped=True,
+    deps = [lake.fingerprint(proteins)]
+    if not force and lake.is_current(con, sample, "s00_ingest", params, deps):
+        return StageResult("s00_ingest", proteins, {}, skipped=True,
                            produced={"gene": None})
 
     import pyarrow as pa
@@ -66,13 +67,13 @@ def run(
         raise SystemExit(f"no sequences kept from {proteins}")
 
     table = pa.Table.from_pylist(rows, schema=gene_schema())
-    frag = write_fragment(out, table, "gene", role="base", help=GENE_COLUMN_HELP)
+    n = write_rows(con, "gene", sample, table, STAGE)
 
     stats = {"proteins_in": n_in, "genes": len(rows), "too_short": n_short}
     el = time.time() - t0
-    write_manifest(out, [proteins], params, stats, seconds=el, tables=[frag],
-                   stage="s00_ingest")
-    return StageResult("s00_ingest", out, stats, seconds=el,
+    lake.record_run(con, sample, "s00_ingest", params, deps, None, stats,
+                    seconds=el, rows=n)
+    return StageResult("s00_ingest", proteins, stats, seconds=el,
                        produced={"gene": None})
 
 
@@ -86,7 +87,7 @@ STAGE = Stage(
     produces="gene",
     order=0,
     roles=("gene_source",),
-    adds=tuple(Column(n, "string", h) for n, h in GENE_COLUMN_HELP.items()),
+    adds=gene_columns(),
     params=(
         Param("min_aa", int, 0, group="genes",
               help="drop imported sequences shorter than this (0 keeps all)"),

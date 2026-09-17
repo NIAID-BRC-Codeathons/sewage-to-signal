@@ -24,6 +24,14 @@ data/pfam/
 # deliberately rather than by committing one built from a laptop's scratch.
 data/reference_map.joblib
 
+# The store. Derived from inputs that are themselves fetched, and it grows with
+# every run, so it is rebuilt rather than committed: `backfill.py` loads an
+# existing work/ into it, and re-running a sample refills it.
+data/sae.ducklake
+data/sae.ducklake.files/
+*.ducklake
+*.ducklake.files/
+
 # Pipeline outputs — all derived, regenerate with pipeline/run.py
 work/
 

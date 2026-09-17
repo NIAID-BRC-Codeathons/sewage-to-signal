@@ -1,8 +1,7 @@
 """Gene-level metadata for the map: what can be coloured by, and filtered on.
 
-``entities.py`` assembles each sample's gene level out of per-stage parquet
-fragments, so a gene already carries every column any stage has written about
-it - coordinates and length from s03, cluster membership from s04, the homology
+The store holds one ``gene`` table, so a gene already carries every column any
+stage has written about it - coordinates and length from s03, cluster membership from s04, the homology
 triage from s05, embedding status from s06. That is the metadata. Nothing here
 adds a column; it reads what the pipeline already recorded and describes it
 well enough for a UI to build its own controls.
@@ -56,7 +55,7 @@ NUMERIC_BINS = 5
 IDENTITY_FRAC = 0.98
 
 # Columns that are never useful to colour or filter by, whatever they contain.
-HIDDEN = {"seq"}
+HIDDEN = {"seq", "sample"}
 
 # Where a level's values have a meaning-order, it wins over frequency. The
 # triage classes are the case that matters: known/partial/dark is a documented
@@ -90,71 +89,31 @@ def _entities():
         return None
 
 
-def _legacy_categories(run_dir: Path) -> dict[str, str]:
-    """`category` per gene from a pre-fragment s05 output.
-
-    Reads the TSV it used to write and the parquet it writes now, because a
-    work root can hold both and the map should colour either.
-    """
-    out: dict[str, str] = {}
-    sd = run_dir / "s05_prefilter"
-    for p in sorted(sd.glob("*.classification.tsv")):
-        try:
-            with open(p) as fh:
-                for row in csv.DictReader(fh, delimiter="\t"):
-                    if row.get("gene_id"):
-                        out[row["gene_id"]] = row.get("category") or ""
-        except OSError:
-            continue
-    if out:
-        return out
-    for p in sorted(sd.glob("*.classification.parquet")):
-        try:
-            import pyarrow.parquet as pq
-            t = pq.read_table(p, columns=["gene_id", "category"])
-            out.update(dict(zip(t.column("gene_id").to_pylist(),
-                                t.column("category").to_pylist())))
-        except Exception:
-            continue
-    return out
-
-
-def load(run_dir: Path) -> tuple[list[dict], dict[str, dict]]:
+def load(con, sample: str) -> tuple[list[dict], dict[str, dict]]:
     """(column descriptors, gene_id -> row) for one sample.
 
     One query for the whole level rather than a round trip per column: the
     descriptors need counts over every value anyway, and a gene table is small
     next to the feature hits it explains.
-    """
-    run_dir = Path(run_dir)
-    E = _entities()
-    if E is not None:
-        try:
-            a = E.assemble(run_dir, "gene")
-        except Exception:
-            a = None
-        if a is not None:
-            help_by = {c["name"]: c for c in a.columns}
-            cols = [c["name"] for c in a.columns if c["name"] not in HIDDEN]
-            # roots=() on purpose: cross-sample predicates are a CLI facility,
-            # and registering every sibling sample would cost a manifest scan
-            # on each request for something these controls cannot express.
-            t = E.select(run_dir, "gene", columns=cols)
-            rows = {}
-            data = t.to_pylist()
-            for r in data:
-                rows[r["gene_id"]] = r
-            descs = _describe(t, help_by)
-            return descs, rows
 
-    cats = _legacy_categories(run_dir)
-    if not cats:
+    The caller owns the connection, because the store is held briefly and
+    deliberately - see ``lake.py``.
+    """
+    E = _entities()
+    if E is None:
         return [], {}
-    rows = {g: {"gene_id": g, "category": c} for g, c in cats.items()}
-    import pyarrow as pa
-    t = pa.table({"gene_id": list(cats), "category": list(cats.values())})
-    return _describe(t, {"category": {"help": "known | partial | dark",
-                                      "stage": "s05_prefilter"}}), rows
+    try:
+        cols = [c for c in E.columns_of(con, "gene")
+                if c["name"] not in HIDDEN]
+        t = E.select(con, "gene", columns=[c["name"] for c in cols],
+                     sample=sample)
+    except Exception:
+        return [], {}
+    if t.num_rows == 0:
+        return [], {}
+    help_by = {c["name"]: c for c in cols}
+    rows = {r["gene_id"]: r for r in t.to_pylist()}
+    return _describe(t, help_by), rows
 
 
 # --------------------------------------------------------------------------
@@ -345,12 +304,12 @@ def build_where(terms: Sequence[dict], descs: Sequence[dict]) -> str:
     return " AND ".join(parts)
 
 
-def matching(run_dir: Path, where: str) -> set[str] | None:
-    """gene_ids passing a predicate, or None when the sample has no level.
+def matching(target, sample: str, where: str) -> set[str] | None:
+    """gene_ids passing a predicate, or None when it cannot be evaluated.
 
     None and the empty set mean different things - "cannot filter here" versus
-    "nothing matched" - so the caller can tell a legacy work directory from a
-    selection that excluded everything.
+    "nothing matched" - so the caller can tell a sample with no gene rows from
+    a selection that excluded everything.
     """
     if not where:
         return None
@@ -358,8 +317,12 @@ def matching(run_dir: Path, where: str) -> set[str] | None:
     if E is None:
         return None
     try:
+        import lake
+
         safe = E.guard_predicate(where)          # belt and braces; we built it
-        t = E.select(Path(run_dir), "gene", where=safe, columns=["gene_id"])
+        with lake.read(target, budget=5) as con:
+            t = E.select(con, "gene", where=safe, columns=["gene_id"],
+                         sample=sample)
     except Exception:
         return None
     return set(t.column("gene_id").to_pylist())

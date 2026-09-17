@@ -15,6 +15,15 @@ container/run.sh web                # container -> http://127.0.0.1:8765
 python sae/web/server.py --read-only
 ```
 
+## Where the data is
+
+`data/sae.ducklake`. Progress, columns, predicates and the feature map are all
+queries against it, so the server holds no stage list and reads no manifests.
+It attaches **read-only and briefly** for each request: a local DuckLake catalog
+is a DuckDB file, so a held connection would lock out a running job. Work
+directories still exist for the file-shaped stages (FASTQ, contigs, logs) and
+the artifact browser still lists them.
+
 ## Where progress comes from
 
 Nothing was added to the pipeline to support this. Every stage already writes
@@ -420,10 +429,10 @@ bound to localhost, and should not be exposed. Beyond that:
 
 | | |
 |---|---|
-| `GET /api/state` | runs, jobs, stage list, roots, environment; `data_files` lists files matching any path parameter's declared suffixes |
+| `GET /api/state` | runs, jobs, stage list, roots, the lake, environment; `data_files` lists files matching any path parameter's declared suffixes |
 | `GET /api/pipeline` | the whole pipeline: stages, parameters, levels, roles, tool availability |
 | `GET /api/columns?run=&level=` | a level's columns, with which stage wrote each |
-| `GET /api/query?run=&level=&where=&limit=` | how many rows a predicate selects, plus a look at them |
+| `GET /api/query?run=&level=&where=&limit=&scope=` | how many rows a predicate selects, plus a look at them; `scope=cohort` drops the sample filter |
 | `GET /api/inputs` | files eligible to start a run |
 | `GET /api/plan?have=&want=&skip=` | the stages that would run, from the driver's own planner |
 | `GET /api/artifacts?run=` | files in each stage directory, with shape and size |

@@ -16,6 +16,31 @@ tells you what is present; each row names the target that fetches it.
 Model weights go to `~/.cache/huggingface`, which is shared between checkouts,
 so a second clone of this repo re-downloads nothing.
 
+## `data/sae.ducklake` — the store
+
+Every sample's rows: `gene` (with amino acid sequences), `feature_hit`,
+`feature`, `cluster_hit`, plus `stage_run` recording what produced each. Not
+committed — it is derived, and `sae/pipeline/backfill.py` rebuilds it from a
+work directory.
+
+Sized from a real sample (META1, 1474 genes) against the 381-run Chicago
+cohort: ~78 MB of genes including sequences, ~96 MB of feature hits, ~7 MB of
+classifications. A few hundred MB for the whole cohort.
+
+Point anything at it:
+
+```bash
+duckdb -c "INSTALL ducklake; LOAD ducklake;
+           ATTACH 'ducklake:data/sae.ducklake' AS lake
+             (DATA_PATH 'data/sae.ducklake.files/', READ_ONLY);
+           SELECT sample, count(*) FROM lake.gene GROUP BY 1"
+```
+
+`SAE_LAKE` and `SAE_LAKE_DATA` move the catalog and the parquet independently —
+a Postgres catalog and an S3 data path make it a shared lake without changing
+any stage.
+
+
 ## Pfam-A
 
 `s05_prefilter` is a **pass-through without an HMM set** — every protein counts

@@ -26,9 +26,9 @@ import subprocess
 import time
 from pathlib import Path
 
-from common import (StageResult, is_current, which, workdir, write_fasta,
-                    write_fragment, write_manifest)
-from entities import fasta_records, table_from_fasta
+import lake
+from common import StageResult, which, workdir, write_fasta
+from entities import fasta_records, table_from_fasta, write_rows
 from stage import Column, Param, Stage, Tool
 
 COLUMN_HELP = {
@@ -42,6 +42,7 @@ def run(
     rows,
     out_dir: Path,
     sample: str,
+    con=None,
     source: Path | None = None,
     where: str | None = None,
     identity: float = 0.95,
@@ -51,13 +52,12 @@ def run(
     force: bool = False,
 ) -> StageResult:
     out_dir = Path(out_dir)
-    out = out_dir / f"{sample}.derep.parquet"
     engine = "mmseqs" if (use_mmseqs and which("mmseqs")) else "exact"
     params = {"identity": identity, "coverage": coverage, "engine": engine,
               "where": where}
-    deps = [Path(source)] if source else []
-    if not force and is_current(out, deps, params):
-        return StageResult("s04_derep", out, {"engine": engine}, skipped=True,
+    deps = [lake.fingerprint(source)] if source else []
+    if not force and lake.is_current(con, sample, "s04_derep", params, deps):
+        return StageResult("s04_derep", out_dir, {"engine": engine}, skipped=True,
                            produced={"gene": None})
 
     import pyarrow as pa
@@ -108,16 +108,16 @@ def run(
         ("gene_id", pa.string()), ("rep_id", pa.string()),
         ("is_representative", pa.bool_()), ("cluster_size", pa.int32()),
     ]))
-    frag = write_fragment(out, table, "gene", where=where, help=COLUMN_HELP)
+    write_rows(con, "gene", sample, table, STAGE)
 
     n_reps = sum(1 for r in out_rows if r["is_representative"])
     stats["representatives"] = n_reps
     stats["reduction"] = round(1 - n_reps / n_in, 4) if n_in else 0.0
     stats["engine"] = engine
     el = time.time() - t0
-    write_manifest(out, deps, params, stats, seconds=el, tables=[frag],
-                   stage="s04_derep")
-    return StageResult("s04_derep", out, stats, seconds=el,
+    lake.record_run(con, sample, "s04_derep", params, deps, where, stats,
+                    seconds=el, rows=len(out_rows))
+    return StageResult("s04_derep", out_dir, stats, seconds=el,
                        produced={"gene": None})
 
 

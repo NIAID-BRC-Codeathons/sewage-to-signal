@@ -13,13 +13,12 @@ import time
 from pathlib import Path
 
 from stage import Param, Stage, Tool
+import lake
 from common import (
     StageResult,
-    is_current,
     open_maybe_gzip,
     which,
     workdir,
-    write_manifest,
 )
 
 
@@ -48,6 +47,7 @@ def run(
     fastq: Path,
     out_dir: Path,
     sample: str,
+    con=None,
     fastq2: Path | None = None,
     min_q: int = 20,
     window: int = 4,
@@ -73,8 +73,8 @@ def run(
         "max_n_frac": max_n_frac, "max_reads": max_reads,
         "engine": engine, "paired": paired,
     }
-    deps = [fastq] + ([fastq2] if paired else [])
-    if not force and is_current(out, deps, params):
+    deps = [lake.fingerprint(f) for f in [fastq] + ([fastq2] if paired else [])]
+    if not force and lake.is_current(con, sample, "s01_qc", params, deps):
         r = StageResult("s01_qc", out, {"engine": engine, "paired": paired}, skipped=True)
         r.mate = out2
         return r
@@ -137,7 +137,8 @@ def run(
         }
 
     el = time.time() - t0
-    write_manifest(out, deps, params, stats, seconds=el)
+    lake.record_run(con, sample, "s01_qc", params, deps, None, stats,
+                    seconds=el)
     r = StageResult("s01_qc", out, stats, seconds=el)
     r.mate = out2
     return r

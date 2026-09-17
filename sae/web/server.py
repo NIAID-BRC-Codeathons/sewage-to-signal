@@ -65,12 +65,13 @@ IN_CONTAINER = IN_DOCKER or IN_APPTAINER
 sys.path.insert(0, str(PIPELINE))
 try:
     import entities                          # type: ignore
+    import lake                              # type: ignore
     from stage import Registry, registry     # type: ignore
 
     REGISTRY = registry()
 except Exception as exc:                     # pragma: no cover - defensive
     print(f"  warning: cannot load the pipeline registry: {exc}", file=sys.stderr)
-    entities, REGISTRY = None, None
+    entities = lake = REGISTRY = None
 
 
 def stage_names() -> list[str]:
@@ -243,8 +244,8 @@ def preview(p: Path, limit: int) -> dict:
 # reference-map builder so a run is projected exactly as the corpus was fitted.
 from launcher import (Job, failure_hint,  # noqa: E402
                       load_jobs, make_launcher, save_job, script_text)
-from reference_map import load as load_reference          # noqa: E402
-from reference_map import normalise, sparse_features      # noqa: E402
+from reference_map import load as load_reference                            # noqa: E402
+from reference_map import normalise, sparse_from_table                      # noqa: E402
 import metadata                                           # noqa: E402
 
 
@@ -317,6 +318,92 @@ def _summarise(mf: Path) -> dict | None:
                                 if c.get("name") not in (t.get("key") or [])]}
                    for t in (d.get("tables") or [])],
     }
+
+
+def _contributed(stage_name: str, where: str | None) -> list[dict]:
+    """The columns a stage writes, per level, for the run detail view."""
+    if REGISTRY is None or stage_name not in REGISTRY:
+        return [{"level": "", "role": "", "where": where, "columns": []}] \
+            if where else []
+    st = REGISTRY[stage_name]
+    out = []
+    for level in st.outputs:
+        cols = [c.name for c in st.columns_for(level)]
+        if not cols:
+            continue
+        key = entities.LEVELS[level].key if level in entities.LEVELS else ()
+        out.append({
+            "level": level,
+            "role": "annotation" if level == st.consumes else "base",
+            "where": where,
+            "columns": [c for c in cols if c not in key],
+        })
+    return out
+
+
+def scan_lake(target) -> list[dict]:
+    """Every sample in the store, with what has run against it.
+
+    This replaced a walk that re-read every manifest under every sample on a
+    two-second poll - roughly 5,300 JSON parses per tick at cohort scale. It is
+    now two queries, and the read attach is brief so it does not hold the store
+    against a running job.
+    """
+    if lake is None:
+        return []
+    try:
+        with lake.read(target, budget=3) as con:
+            runs = lake.runs(con)
+            levels: dict[str, list[str]] = {}
+            for lvl in entities.LEVELS:
+                try:
+                    for (smp,) in con.execute(
+                            f"SELECT DISTINCT sample FROM {lvl}").fetchall():
+                        levels.setdefault(smp, []).append(lvl)
+                except Exception:
+                    continue
+    except Exception:
+        return []
+
+    by_sample: dict[str, dict] = {}
+    for r in runs:
+        d = by_sample.setdefault(r["sample"], {"stages": {}, "order": [],
+                                               "updated": None})
+        d["stages"][r["stage"]] = {
+            "state": "done", "stats": r["stats"], "params": r["params"],
+            "seconds": r["seconds"], "written": r["written"],
+            "output": f"{r['rows'] or 0} rows" if r["rows"] else "",
+            "bytes": None, "inputs": [Path(i.get("path", "")).name
+                                      for i in (r["inputs"] or []) if isinstance(i, dict)],
+            # Which columns this stage contributed, and to which level. Taken
+            # from the registry rather than from the run record: the stage
+            # declares them, the store's DDL is generated from that same
+            # declaration, so it is the truth rather than a copy of it.
+            "tables": _contributed(r["stage"], r["where"]),
+        }
+        if r["written"] and (d["updated"] is None or r["written"] > d["updated"]):
+            d["updated"] = r["written"]
+
+    # A sample can hold rows without a stage_run record - anything backfilled
+    # from a work directory whose manifest was missing. It still has data, so
+    # it still belongs in the list.
+    for sample in levels:
+        by_sample.setdefault(sample, {"stages": {}, "order": [], "updated": None})
+
+    known = REGISTRY.names if REGISTRY else []
+    out = []
+    for sample, d in by_sample.items():
+        have = list(d["stages"])
+        order = [n for n in known if n in have] + [n for n in have if n not in known]
+        out.append({
+            "id": f"0:{sample}", "sample": sample, "root": str(target),
+            "stages": d["stages"], "order": order,
+            "levels": levels.get(sample, []),
+            "updated": d["updated"],
+            "done": len(d["stages"]),
+        })
+    out.sort(key=lambda r: (r["updated"] or ""), reverse=True)
+    return out
 
 
 def scan(roots: list[Path]) -> list[dict]:
@@ -578,10 +665,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, page.read_bytes(), "text/html; charset=utf-8")
         if u.path == "/api/state":
             return self._json({
-                "runs": scan(self.cfg["roots"]),
+                "runs": scan_lake(self.cfg["lake"]),
                 "jobs": self.cfg["jobs"].all(),
                 "stages": stage_names(),
                 "roots": [str(r) for r in self.cfg["roots"]],
+                "lake": str(self.cfg["lake"]),
                 "read_only": self.cfg["read_only"],
                 "uploads": str(self.cfg["uploads"]),
                 "data_files": self._candidate_data(),
@@ -628,7 +716,8 @@ class Handler(BaseHTTPRequestHandler):
                 limit = 20
             return self._query((q.get("run") or [""])[0],
                                (q.get("level") or ["gene"])[0],
-                               (q.get("where") or [""])[0], limit)
+                               (q.get("where") or [""])[0], limit,
+                               (q.get("scope") or ["sample"])[0])
         if u.path == "/api/inputs":
             return self._json({"files": self._candidate_inputs()})
         if u.path == "/api/artifacts":
@@ -719,6 +808,14 @@ class Handler(BaseHTTPRequestHandler):
                 out.append({"path": sp, "name": p.name, "bytes": p.stat().st_size})
         return out
 
+    def _sample(self, run_id: str) -> str:
+        """`0:<sample>` -> sample. The index is vestigial: there is one store."""
+        _, _, sample = str(run_id).partition(":")
+        sample = sample or str(run_id)
+        if not SAFE_NAME.match(sample):
+            raise ValueError("bad run id")
+        return sample
+
     def _run_dir(self, run_id: str) -> Path:
         """Resolve '<root index>:<sample>' to a sample directory, or raise."""
         idx, _, sample = run_id.partition(":")
@@ -773,73 +870,75 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(body)
 
     def _columns(self, run_id: str, level: str):
-        """What can be predicated on for this run, and who wrote each column.
+        """What can be predicated on, and which stage wrote each column.
 
-        This is the vocabulary a person needs to write a selection, and it is
-        read from the run rather than declared - a column exists here because
-        some stage actually produced it.
+        Read from the store's own schema plus the registry, so a column is
+        offered because it exists and is explained because a stage declared it.
         """
         if entities is None:
             return self._err(503, "the pipeline registry is unavailable")
         try:
-            run_dir = self._run_dir(run_id)
+            sample = self._sample(run_id)
         except ValueError as exc:
             return self._err(404, str(exc))
-        levels = entities.levels_present(run_dir)
-        level = level or (levels[0] if levels else "")
-        if not level:
-            return self._json({"run": run_id, "levels": [], "level": None,
-                               "columns": []})
-        a = entities.assemble(run_dir, level)
-        if a is None:
-            return self._err(404, f"this run has no {level!r} level")
         try:
-            n = entities.count(run_dir, level, roots=self.cfg["roots"])
-        except Exception:
-            n = None
+            with lake.read(self.cfg["lake"], budget=5) as con:
+                levels = entities.levels_present(con, sample)
+                lvl = level or (levels[0] if levels else "")
+                if not lvl:
+                    return self._json({"run": run_id, "sample": sample,
+                                       "levels": [], "level": None, "columns": []})
+                if lvl not in entities.LEVELS:
+                    return self._err(404, f"no level named {lvl!r}")
+                cols = entities.columns_of(con, lvl)
+                n = entities.count(con, lvl, sample=sample)
+                cohort = entities.count(con, lvl)
+                everyone = entities.samples(con)
+        except Exception as exc:
+            return self._err(503, f"cannot read the store: {exc}")
         return self._json({
-            "run": run_id, "levels": levels, "level": level, "rows": n,
-            "key": list(entities.LEVELS[level].key) if level in entities.LEVELS else [],
-            "columns": a.columns, "collisions": a.collisions,
-            # Sibling samples are queryable as "<sample>".<level>, so the UI can
-            # offer them rather than making people guess the syntax.
-            "samples": sorted({p.name for root in self.cfg["roots"]
-                               if root.is_dir()
-                               for p in root.iterdir()
-                               if p.is_dir() and not p.name.startswith(".")
-                               and entities.levels_present(p)}),
+            "run": run_id, "sample": sample, "levels": levels, "level": lvl,
+            "rows": n, "cohort_rows": cohort,
+            "key": list(entities.LEVELS[lvl].key),
+            "columns": cols, "collisions": [],
+            # Every sample is queryable by name in a predicate, because
+            # `sample` is a column rather than a separate schema.
+            "samples": everyone,
         })
 
-    def _query(self, run_id: str, level: str, where: str, limit: int):
+    def _query(self, run_id: str, level: str, where: str, limit: int,
+               scope: str = "sample"):
         """How many rows a predicate selects, and a look at them.
 
-        The point of the endpoint is that you can see what a selection does
-        before spending a GPU on it. It is read-only: the predicate is guarded,
-        and it runs against a throwaway in-memory connection over parquet.
+        The point is to see what a selection takes before spending a GPU on it.
+        `scope=cohort` drops the sample filter, so the same box answers a
+        cohort question - which is the thing the old per-sample schemas could
+        not express at all.
         """
         if entities is None:
             return self._err(503, "the pipeline registry is unavailable")
         try:
-            run_dir = self._run_dir(run_id)
+            sample = self._sample(run_id)
         except ValueError as exc:
             return self._err(404, str(exc))
         try:
             expr = entities.guard_predicate(where) or None
         except ValueError as exc:
             return self._err(400, str(exc))
-        roots = self.cfg["roots"]
+        only = None if scope == "cohort" else sample
         try:
-            n = entities.count(run_dir, level, expr, roots=roots)
-            # `seq` is megabytes of amino acids nobody is reading in a preview.
-            a = entities.assemble(run_dir, level)
-            cols = [c["name"] for c in (a.columns if a else []) if c["name"] != "seq"]
-            rows = entities.select(run_dir, level, expr, columns=cols or None,
-                                   limit=max(1, min(limit, 500)), roots=roots)
+            with lake.read(self.cfg["lake"], budget=5) as con:
+                n = entities.count(con, level, expr, sample=only)
+                # `seq` is megabytes of amino acids nobody reads in a preview.
+                names = [c["name"] for c in entities.columns_of(con, level)
+                         if c["name"] != "seq"]
+                rows = entities.select(con, level, expr, columns=names or None,
+                                       limit=max(1, min(limit, 500)), sample=only)
         except Exception as exc:
             return self._err(422, f"{type(exc).__name__}: {exc}".strip()[:400])
-        return self._json({"run": run_id, "level": level, "where": expr,
-                           "matched": n, "columns": rows.column_names,
-                           "rows": rows.to_pylist()})
+        return self._json({"run": run_id, "sample": sample, "level": level,
+                           "where": expr, "scope": scope, "matched": n,
+                           "columns": rows.column_names, "rows": rows.to_pylist()})
 
     def _artifacts(self, run_id: str):
         try:
@@ -870,45 +969,42 @@ class Handler(BaseHTTPRequestHandler):
         return self.cfg["reference"]
 
     def _features(self, run_id: str):
-        """A run's feature hits as (dir, gene ids, L2-normalised sparse matrix).
+        """A sample's feature hits as (sample, gene ids, L2-normalised matrix).
 
-        The stage is found by the role it declares, not by name: any stage that
-        says it fills ``projection`` can be the source, so a pipeline that
-        embeds differently still draws a map. ValueError means "no such run, or
-        nothing to plot in it" and is the caller's 404; ImportError is let
-        through so a missing dependency is reported as one rather than as a bad
-        request.
+        Straight out of the store now - the hits are a table, so there is no
+        file to find and no stage name to know. ValueError means "nothing to
+        plot" and is the caller's 404; ImportError is let through so a missing
+        dependency is reported as one rather than as a bad request.
         """
-        run_dir = self._run_dir(run_id)
-        found = []
-        for st in (REGISTRY.by_role("projection") if REGISTRY else []):
-            found += sorted((run_dir / st.name).glob("*.sae_features.parquet"))
-        if not found:
-            raise ValueError(f"{run_dir.name} has nothing to project")
-        ids, m = sparse_features(found[0])
-        return run_dir, ids, normalise(m)
+        sample = self._sample(run_id)
+        with lake.read(self.cfg["lake"], budget=5) as con:
+            t = entities.select(con, "feature_hit",
+                                columns=["gene_id", "feature_id", "activation"],
+                                sample=sample)
+        if t.num_rows == 0:
+            raise ValueError(f"{sample} has nothing to project")
+        ids, m = sparse_from_table(t)
+        return sample, ids, normalise(m)
 
-    def _meta(self, run_dir: Path):
-        """(column descriptors, gene_id -> row) for a run, cached per process.
+    def _meta(self, sample: str):
+        """(column descriptors, gene_id -> row) for one sample, cached.
 
-        This replaces a lookup of `category` alone. Category was never special
-        - it is one column a stage happened to write - and the map colours and
-        filters by any of them, so the map reads the whole gene level and lets
-        the page choose. Re-read only when a manifest under the sample is newer
-        than the cache, so re-running a stage shows up without a restart.
+        Colouring and filtering the map read every gene column, so this is the
+        whole gene level for that sample. Invalidated on the store's latest
+        snapshot rather than on file mtimes: one number, and it moves exactly
+        when something was written.
         """
         cache = self.cfg.setdefault("meta_cache", {})
-        key = str(run_dir)
-        stamp = max((f.stat().st_mtime
-                     for f in run_dir.glob("*/*.manifest.json")), default=0.0)
-        hit = cache.get(key)
-        if hit and hit[0] == stamp:
-            return hit[1], hit[2]
         try:
-            descs, rows = metadata.load(run_dir)
+            with lake.read(self.cfg["lake"], budget=5) as con:
+                stamp = lake.snapshot_id(con)
+                hit = cache.get(sample)
+                if hit and hit[0] == stamp:
+                    return hit[1], hit[2]
+                descs, rows = metadata.load(con, sample)
         except Exception:
-            descs, rows = [], {}
-        cache[key] = (stamp, descs, rows)
+            return [], {}
+        cache[sample] = (stamp, descs, rows)
         return descs, rows
 
     def _color_choice(self, requested: str, usable: list, comparing: bool):
@@ -990,7 +1086,7 @@ class Handler(BaseHTTPRequestHandler):
         if b_id and b_id == run_id:
             return self._err(400, "cannot compare a run with itself")
         try:
-            run_dir, ids, m = self._features(run_id)
+            sample_a, ids, m = self._features(run_id)
             other = self._features(b_id) if b_id else None
         except ImportError as exc:
             return self._err(501, f"projection needs scipy and pyarrow: {exc}")
@@ -1008,7 +1104,7 @@ class Handler(BaseHTTPRequestHandler):
         ids, m, cut_a = _cap(ids, m, limit)
         cut_b = False
         if other is not None:
-            b_dir, b_ids, b_m = other
+            sample_b, b_ids, b_m = other
             b_ids, b_m, cut_b = _cap(b_ids, b_m, limit)
 
         from scipy.sparse import vstack
@@ -1027,8 +1123,8 @@ class Handler(BaseHTTPRequestHandler):
         # Colour and filter by any column the gene level carries. Which columns
         # exist is read from the run, so a stage added later is another thing
         # to colour by with no change here or in the page.
-        descs_a, rows_a = self._meta(run_dir)
-        descs_b, rows_b = self._meta(b_dir) if other is not None else ([], {})
+        descs_a, rows_a = self._meta(sample_a)
+        descs_b, rows_b = self._meta(sample_b) if other is not None else ([], {})
         # An overlay may only offer columns both sides have: a scale shown over
         # two runs has to mean the same thing on both.
         usable = metadata.merge(descs_a, descs_b) if other is not None else descs_a
@@ -1046,9 +1142,9 @@ class Handler(BaseHTTPRequestHandler):
             except metadata.BadFilter as exc:
                 return self._err(400, str(exc))
             if where:
-                keep_a = metadata.matching(run_dir, where)
+                keep_a = metadata.matching(self.cfg["lake"], sample_a, where)
                 if other is not None:
-                    keep_b = metadata.matching(b_dir, where)
+                    keep_b = metadata.matching(self.cfg["lake"], sample_b, where)
 
         points = _points(ids, xy, rows_a, column, domain, keep_a,
                          "a" if other is not None else None)
@@ -1082,9 +1178,9 @@ class Handler(BaseHTTPRequestHandler):
         }
         if other is not None:
             body["samples"] = [
-                {"side": "a", "run": run_id, "sample": run_dir.name,
+                {"side": "a", "run": run_id, "sample": sample_a,
                  "n": len(ids), "shown": shown_a, "subsampled": cut_a},
-                {"side": "b", "run": b_id, "sample": b_dir.name,
+                {"side": "b", "run": b_id, "sample": sample_b,
                  "n": len(b_ids), "shown": shown_b, "subsampled": cut_b},
             ]
         elif cut_a:
@@ -1254,6 +1350,10 @@ def main():
                    help=f"directory offered as run input. Default: "
                         f"{', '.join(str(x) for x in d['data'])}")
     p.add_argument("--uploads", type=Path, default=d["uploads"])
+    p.add_argument("--lake", default=None,
+                   help="the store every run writes to. A path, or "
+                        "postgres:/sqlite: for a shared catalog; SAE_LAKE_DATA "
+                        "points the parquet elsewhere, including s3://")
     p.add_argument("--reference", type=Path, default=d["reference"],
                    help="fixed UMAP layout from reference_map.py; without one, "
                         "each run is projected on its own and coordinates are "
@@ -1291,6 +1391,7 @@ def main():
     Handler.cfg = {
         "roots": roots, "data": data, "uploads": uploads, "python": a.python,
         "reference_path": a.reference,
+        "lake": a.lake or lake.default_target(REPO) if lake else None,
         "runner": runner,
         # Mirrors run.sh's bind table, so a host path can be rewritten to the
         # path a job sees inside the image.
@@ -1309,6 +1410,7 @@ def main():
     print(f"  work roots : {', '.join(str(r) for r in roots)}")
     print(f"  data       : {', '.join(str(r) for r in data)}")
     print(f"  uploads    : {uploads}")
+    print(f"  lake       : {Handler.cfg['lake']}")
     print(f"  interpreter: {a.python}")
     print(f"  job runner : {runner}"
           + ("" if runner == "container" else

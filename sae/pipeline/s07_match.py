@@ -23,7 +23,9 @@ import argparse
 import time
 from pathlib import Path
 
-from common import StageResult, is_current, workdir, write_fragment, write_manifest
+import lake
+from common import StageResult, workdir
+from entities import write_rows
 from stage import Column, Param, Stage
 
 FEATURE_HELP = {
@@ -63,6 +65,7 @@ def run(
     rows,
     out_dir: Path,
     sample: str,
+    con=None,
     source: Path | None = None,
     where: str | None = None,
     reps: Path | None = None,
@@ -73,13 +76,12 @@ def run(
     import pyarrow as pa
     import pyarrow.dataset as ds
 
-    out = Path(out_dir) / f"{sample}.feature_meta.parquet"
-    clusters_out = Path(out_dir) / f"{sample}.clusters.parquet"
+    out_dir = Path(out_dir)
     params = {"uniref_per_feature": uniref_per_feature,
               "skip_clusters": skip_clusters, "where": where}
-    deps = [Path(source)] if source else []
-    if not force and is_current(out, deps, params):
-        return StageResult("s07_match", out, {}, skipped=True,
+    deps = [lake.fingerprint(reps)] if reps and Path(reps).exists() else []
+    if not force and lake.is_current(con, sample, "s07_match", params, deps):
+        return StageResult("s07_match", out_dir, {}, skipped=True,
                            produced={"feature": None, "cluster_hit": None})
 
     t0 = time.time()
@@ -102,7 +104,7 @@ def run(
         "uniref90_frequency": pa.array(
             [(table.get(f) or {}).get("uniref90_frequency") for f in fids], pa.float64()),
     })
-    frags = [write_fragment(out, meta, "feature", help=FEATURE_HELP)]
+    write_rows(con, "feature", sample, meta, STAGE)
     stats = {"features": len(fids),
              "described": sum(1 for f in fids if f in table)}
 
@@ -143,16 +145,15 @@ def run(
                         "pfam": "; ".join(f"{a} ({b})" for a, b in (r["cluster_top_pfam_names"] or [])[:3]),
                     })
             if rows:
-                frags.append(write_fragment(
-                    clusters_out, pa.Table.from_pylist(rows), "cluster_hit",
-                    role="base", help=CLUSTER_HELP))
+                write_rows(con, "cluster_hit", sample,
+                           pa.Table.from_pylist(rows), STAGE)
             stats["cluster_rows"] = len(rows)
             stats["uniref_probed"] = len(wanted)
 
     el = time.time() - t0
-    write_manifest(out, deps, params, stats, seconds=el, tables=frags,
-                   stage="s07_match")
-    return StageResult("s07_match", out, stats, seconds=el,
+    lake.record_run(con, sample, "s07_match", params, deps, where, stats,
+                    seconds=el, rows=len(fids))
+    return StageResult("s07_match", out_dir, stats, seconds=el,
                        produced={"feature": None, "cluster_hit": None})
 
 
@@ -172,6 +173,17 @@ STAGE = Stage(
         Column("feature_category", "string", FEATURE_HELP["feature_category"]),
         Column("threshold", "double", FEATURE_HELP["threshold"]),
         Column("uniref90_frequency", "double", FEATURE_HELP["uniref90_frequency"]),
+    ),
+    also_adds=(
+        ("cluster_hit", (
+            Column("cluster_rep_protein_hash", "string",
+                   CLUSTER_HELP["cluster_rep_protein_hash"]),
+            Column("uniref_match_accession", "string",
+                   CLUSTER_HELP["uniref_match_accession"]),
+            Column("lca_taxonomy", "string", CLUSTER_HELP["lca_taxonomy"]),
+            Column("product_name", "string", CLUSTER_HELP["product_name"]),
+            Column("pfam", "string", CLUSTER_HELP["pfam"]),
+        )),
     ),
     params=(
         Param("reps", str, None, group="match", path=True,

@@ -21,7 +21,13 @@ whatever reproduces the linear pipeline:
 
     # only what another sample also found dark
     python run.py --proteins p.faa --sample S1 --where s06_embed=\\
-        "seq_sha1 IN (SELECT seq_sha1 FROM \\"CHI-A\\".gene WHERE category='dark')"
+        "seq_sha1 IN (SELECT seq_sha1 FROM gene
+                      WHERE sample='CHI-A' AND category='dark')"
+
+    # the question a cohort exists to ask
+    python run.py --proteins p.faa --sample S1 --where s06_embed=\\
+        "seq_sha1 IN (SELECT seq_sha1 FROM gene WHERE category='dark'
+                      GROUP BY seq_sha1 HAVING count(DISTINCT sample) >= 3)"
 
 ``--list`` prints the graph, ``--plan`` prints what would run and stops, and
 ``--next`` asks what could run against a sample as it stands - the question an
@@ -35,96 +41,119 @@ import sys
 from pathlib import Path
 
 import entities
+import lake
 from common import MissingTool, workdir
 from entities import LEVELS, is_level
 from stage import Registry, Request, Stage, registry
 
 DEFAULT_TARGET = "feature"
+REPO = Path(__file__).resolve().parent.parent.parent
+
+
+def _print_table(t) -> None:
+    """A query result, wide enough to read and narrow enough to fit."""
+    cols = t.column_names
+    rows = [[("" if v is None else str(v))[:40] for v in r.values()]
+            for r in t.to_pylist()]
+    width = [max(len(c), *(len(r[i]) for r in rows)) if rows else len(c)
+             for i, c in enumerate(cols)]
+    print("  ".join(c.ljust(w) for c, w in zip(cols, width)))
+    print("  ".join("-" * w for w in width))
+    for r in rows:
+        print("  ".join(v.ljust(w) for v, w in zip(r, width)))
+    print(f"\n{len(rows)} row{'' if len(rows) == 1 else 's'}")
 
 
 # --------------------------------------------------------------------------
 # running one stage
 # --------------------------------------------------------------------------
-def resolve_where(stage: Stage, sample_dir: Path, requested: str | None,
-                  roots: list[Path], quiet: bool = False) -> str | None:
-    """Pick the predicate for this stage and check it can actually run.
+def resolve_where(con, reg: Registry, stage: Stage, sample: str,
+                  requested: str | None, quiet: bool = False) -> str | None:
+    """Pick the predicate for this stage, and say so when a default cannot apply.
 
     A stage's ``default_where`` describes the pipeline's usual shape, not a
-    requirement - ``s06`` prefers representatives that homology could not
-    explain, but if nothing has written those columns the clause names nothing
-    and would be an error. So a default that does not bind is dropped with a
-    note, while a predicate somebody actually asked for is always an error if
-    it does not bind. Guessing on the user's behalf is how you silently embed
-    the wrong 40,000 proteins.
+    requirement: ``s06`` prefers representatives that homology could not
+    explain, but on a sample where ``s05`` never ran there is nothing to mean
+    by ``category``.
+
+    That used to be detected by letting the query fail to bind, which worked
+    only because each sample had its own columns. Now every sample shares one
+    table, so the column exists and is merely NULL - the predicate would bind,
+    match nothing, and the stage would exit claiming an empty selection. So ask
+    the question directly instead: a default applies only if every stage that
+    owns a column it names has actually run for this sample. The registry knows
+    the ownership and ``stage_run`` knows what ran.
+
+    A predicate somebody actually asked for is never softened - guessing on the
+    user's behalf is how you silently embed the wrong 40,000 proteins.
     """
     if requested is not None:
-        where = entities.guard_predicate(requested) or None
-        _check(sample_dir, stage.consumes, where, roots)
-        return where
+        return entities.guard_predicate(requested) or None
     where = stage.default_where
     if not where:
         return None
-    try:
-        _check(sample_dir, stage.consumes, where, roots)
-    except Exception as exc:
+    done = lake.completed_stages(con, sample)
+    needed = _owners(reg, stage.consumes, where)
+    absent = sorted(n for n in needed if n not in done)
+    if absent:
         if not quiet:
-            print(f"    note: default selection ({where}) does not apply here "
-                  f"- {_brief(exc)}; taking all rows", flush=True)
+            print(f"    note: default selection ({where}) needs "
+                  f"{', '.join(absent)}, which has not run for {sample}; "
+                  f"taking all rows", flush=True)
         return None
     return where
 
 
-def _brief(exc: Exception) -> str:
-    return str(exc).strip().splitlines()[0][:160]
+def _owners(reg: Registry, level: str, where: str) -> set[str]:
+    """Stages owning any column the predicate names."""
+    owner = {c.name: st.name for st in reg for c in st.columns_for(level)}
+    return {owner[c] for c in entities.columns_named(where, list(owner))}
 
 
-def _check(sample_dir: Path, level: str, where: str | None, roots: list[Path]):
-    con = entities.connect(sample_dir, roots)
-    try:
-        sql = f'SELECT 1 FROM "{level}"'
-        if where:
-            sql += f" WHERE ({where})"
-        con.execute(sql + " LIMIT 0")
-    finally:
-        con.close()
-
-
-def run_stage(stage: Stage, sample_dir: Path, sample: str, values: dict,
-              where: str | None, current: dict, roots: list[Path],
+def run_stage(reg: Registry, stage: Stage, target, work: Path, sample: str,
+              values: dict, where: str | None, current: dict,
               force: bool = False):
-    """Invoke one stage: resolve its input, bind its params, call it."""
-    out_dir = workdir(sample_dir.parent, sample, stage.name)
+    """Invoke one stage: resolve its input, bind its params, call it.
+
+    The lake is opened once for the whole stage and handed to it. That is a
+    compromise: a stage holds it across its own compute, which for s06 is a GPU
+    pass. It is the right trade anyway, because a stage that wrote a partial
+    result and then failed to re-attach would leave the store inconsistent -
+    one attach per stage means one transaction boundary per stage. Parallel
+    batches should pin one sample per process, which is what run_batch.sh does.
+    """
+    out_dir = workdir(work, sample, stage.name)
     inputs: dict = {}
-    selected = None
 
-    if is_level(stage.consumes):
-        where = resolve_where(stage, sample_dir, where, roots)
-        selected = entities.select(sample_dir, stage.consumes, where, roots=roots)
-        if selected.num_rows == 0:
-            raise SystemExit(
-                f"[{stage.name}] the selection over {stage.consumes} is empty"
-                + (f" (predicate: {where})" if where else "")
-                + ". Nothing to do.")
-        base = next((f for f in entities.fragments(sample_dir, stage.consumes)
-                     if f.role == "base"), None)
-        inputs = {"rows": selected, "source": base.path if base else None}
-        print(f"    selecting {selected.num_rows} {stage.consumes} rows"
-              + (f" where {where}" if where else " (all)"), flush=True)
-    else:
-        path = current.get(stage.consumes)
-        if path is None:
-            raise SystemExit(f"[{stage.name}] nothing produced {stage.consumes!r}")
-        inputs = {stage.input_arg or stage.consumes: path}
-        mate = current.get(stage.consumes + "2")
-        if mate and stage.mate_arg:
-            inputs[stage.mate_arg] = mate
+    with lake.open(target) as con:
+        lake.ensure_schema(con, reg, LEVELS)
+        if is_level(stage.consumes):
+            where = resolve_where(con, reg, stage, sample, where)
+            selected = entities.select(con, stage.consumes, where, sample=sample)
+            if selected.num_rows == 0:
+                raise SystemExit(
+                    f"[{stage.name}] the selection over {stage.consumes} is empty"
+                    + (f" (predicate: {where})" if where else "")
+                    + ". Nothing to do.")
+            inputs = {"rows": selected, "source": current.get(stage.consumes)}
+            print(f"    selecting {selected.num_rows} {stage.consumes} rows"
+                  + (f" where {where}" if where else " (all)"), flush=True)
+        else:
+            path = current.get(stage.consumes)
+            if path is None:
+                raise SystemExit(f"[{stage.name}] nothing produced {stage.consumes!r}")
+            inputs = {stage.input_arg or stage.consumes: path}
+            mate = current.get(stage.consumes + "2")
+            if mate and stage.mate_arg:
+                inputs[stage.mate_arg] = mate
 
-    req = Request(stage=stage, out_dir=out_dir, sample=sample, values=values,
-                  where=where, force=force, inputs=inputs)
-    result = stage.run(**req.kwargs())
+        inputs["con"] = con
+        req = Request(stage=stage, out_dir=out_dir, sample=sample, values=values,
+                      where=where, force=force, inputs=inputs)
+        result = stage.run(**req.kwargs())
 
-    # Carry forward what this stage filled. Levels live in the work directory
-    # rather than in a path, so they map to None and are found by reading it.
+    # Carry forward what this stage filled. Levels live in the store rather
+    # than in a path, so they map to None and are found by querying it.
     produced = {stage.produces: result.output if not is_level(stage.produces) else None}
     produced.update(result.produced or {})
     if result.mate:
@@ -176,7 +205,13 @@ def main():
     src.add_argument("--proteins", type=Path)
     p.add_argument("--fastq2", type=Path, help="second mate (with --fastq)")
     p.add_argument("--sample")
-    p.add_argument("--work", type=Path, default=Path("work"))
+    p.add_argument("--work", type=Path, default=Path("work"),
+                   help="scratch for the stages that still produce files "
+                        "(reads, contigs, logs). Tabular output goes to the lake")
+    p.add_argument("--lake", default=lake.default_target(REPO),
+                   help="the store: a path, or postgres:/sqlite: for a shared "
+                        "catalog. SAE_LAKE_DATA points the parquet elsewhere, "
+                        "including s3://")
     p.add_argument("--to", dest="target", default=DEFAULT_TARGET,
                    help=f"port to produce - a level or a file kind "
                         f"(default: {DEFAULT_TARGET})")
@@ -199,6 +234,8 @@ def main():
     p.add_argument("--list", action="store_true", help="print the stage graph")
     p.add_argument("--next", action="store_true", dest="next_",
                    help="print what could run against this sample right now")
+    p.add_argument("--sql", help="run one read-only query against the store "
+                                 "and print it - the cohort, not one sample")
     # Kept because they are the flags people have in their notes; each one is
     # just a --set against the stage that declares it.
     for legacy, target in (("--max-reads", "s01_qc.max_reads"),
@@ -225,20 +262,31 @@ def main():
     if a.list:
         print(describe_graph(reg))
         return
+    if a.sql:
+        # A whole query, not a predicate, and it asks about the cohort rather
+        # than a sample - so no --sample, and no guard: this is a local CLI and
+        # the attach is read-only. The web server's /api/query is the guarded
+        # path, because that one takes input over a socket.
+        with lake.read(a.lake) as con:
+            _print_table(con.execute(a.sql).arrow().read_all())
+        return
     if not a.sample:
         p.error("--sample is required")
 
-    sample_dir = Path(a.work).resolve() / a.sample
-    roots = [Path(a.work).resolve()]
+    work = Path(a.work).resolve()
 
     if a.next_:
-        present = entities.levels_present(sample_dir)
+        with lake.read(a.lake) as con:
+            present = entities.levels_present(con, a.sample)
+            done = sorted(lake.completed_stages(con, a.sample))
         if not present:
-            print(f"{a.sample}: no entity levels yet; start from a file input.")
+            print(f"{a.sample}: nothing in the store yet; start from a file input.")
             return
-        print(f"{a.sample} has: {', '.join(present)}\n")
+        print(f"{a.sample} has: {', '.join(present)}")
+        print(f"already run: {', '.join(done) or 'nothing'}\n")
         for s in reg.next_steps(present):
-            print(f"  {s.name:<16} reads {s.consumes:<12} {s.title}")
+            mark = "  (again)" if s.name in done else ""
+            print(f"  {s.name:<16} reads {s.consumes:<12} {s.title}{mark}")
         return
 
     # -- parameter overrides: --set wins over a legacy flag for the same param
@@ -275,7 +323,9 @@ def main():
         current["proteins"] = a.proteins.resolve()
         have = "proteins"
     else:
-        have = a.start or (entities.levels_present(sample_dir) or [None])[-1]
+        with lake.read(a.lake) as con:
+            present = entities.levels_present(con, a.sample)
+        have = a.start or (present or [None])[-1]
         if not have:
             p.error("give an input (--fastq/--contigs/--proteins) or --from")
     have = a.start or have
@@ -318,8 +368,8 @@ def main():
     for s in plan:
         try:
             r, produced = run_stage(
-                s, sample_dir, a.sample, settings.get(s.name, {}),
-                wheres.get(s.name), current, roots, force=a.force)
+                reg, s, a.lake, work, a.sample, settings.get(s.name, {}),
+                wheres.get(s.name), current, force=a.force)
         except MissingTool as exc:
             print(f"\n[{s.name}] BLOCKED: {exc}\n", file=sys.stderr)
             print("Completed stages:", file=sys.stderr)
@@ -332,8 +382,10 @@ def main():
         for port in produced:
             current.setdefault(port, None)
 
-    levels = entities.levels_present(sample_dir)
-    print(f"\nDone. {a.sample} has levels: {', '.join(levels) or 'none'}")
+    with lake.read(a.lake) as con:
+        levels = entities.levels_present(con, a.sample)
+    print(f"\nDone. {a.sample} holds: {', '.join(levels) or 'nothing'}")
+    print(f"      lake: {a.lake}")
 
 
 if __name__ == "__main__":

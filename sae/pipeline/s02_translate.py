@@ -46,8 +46,9 @@ import itertools
 import time
 from pathlib import Path
 
-from common import (StageResult, is_current, open_maybe_gzip, workdir,
-                    write_fasta, write_manifest)
+import lake
+from common import (StageResult, open_maybe_gzip, workdir,
+                    write_fasta)
 from stage import Param, Stage
 
 # The standard genetic code, laid out in TCAG order so the 64 codons fall out
@@ -95,6 +96,7 @@ def run(
     fastq: Path,
     out_dir: Path,
     sample: str,
+    con=None,
     fastq2: Path | None = None,
     min_aa: int = 40,
     max_reads: int | None = None,
@@ -105,8 +107,8 @@ def run(
     out = Path(out_dir) / f"{sample}.translated.faa"
     params = {"min_aa": min_aa, "max_reads": max_reads,
               "paired": fastq2 is not None}
-    deps = [fastq] + ([fastq2] if fastq2 else [])
-    if not force and is_current(out, deps, params):
+    deps = [lake.fingerprint(f) for f in [fastq] + ([fastq2] if fastq2 else [])]
+    if not force and lake.is_current(con, sample, "s02_translate", params, deps):
         return StageResult("s02_translate", out, {}, skipped=True,
                            produced={"proteins": out})
 
@@ -150,7 +152,8 @@ def run(
         "dropped_ambiguous": n_ambiguous, "longest_aa": longest,
         "reads_per_s": round(n_reads / el) if el else None,
     }
-    write_manifest(out, deps, params, stats, seconds=el, stage="s02_translate")
+    lake.record_run(con, sample, "s02_translate", params, deps, None,
+                    stats, seconds=el)
     return StageResult("s02_translate", out, stats, seconds=el,
                        produced={"proteins": out})
 

@@ -41,7 +41,7 @@ from entities import FILE_KINDS, LEVELS, is_level
 HERE = Path(__file__).resolve().parent
 
 # Modules that are infrastructure rather than stages.
-_NOT_STAGES = {"common", "entities", "stage", "run", "predicates"}
+_NOT_STAGES = {"common", "entities", "lake", "stage", "run", "backfill"}
 
 
 @dataclass(frozen=True)
@@ -136,7 +136,15 @@ class Stage:
     also_produces: tuple[str, ...] = ()
     title: str = ""
     summary: str = ""
+    # Columns this stage writes onto `produces`. Load-bearing: the store's DDL
+    # is generated from these, so a column that is written but not declared will
+    # not exist.
     adds: tuple[Column, ...] = ()
+    # Columns written onto a level in `also_produces`, as (level, columns).
+    # A stage that fills several levels writes different columns to each, so
+    # `adds` alone cannot describe it - s06 writes activations to feature_hit
+    # but tells genes they were embedded.
+    also_adds: tuple[tuple[str, tuple[Column, ...]], ...] = ()
     params: tuple[Param, ...] = ()
     requires: tuple[Tool, ...] = ()
     roles: tuple[str, ...] = ()        # what this stage's output is good for
@@ -166,6 +174,15 @@ class Stage:
         """The level this stage writes columns to, if any."""
         return self.produces if is_level(self.produces) else None
 
+    def columns_for(self, level: str) -> tuple[Column, ...]:
+        """The columns this stage writes onto one level, or () if it writes none."""
+        if level == self.produces:
+            return self.adds
+        for name, cols in self.also_adds:
+            if name == level:
+                return cols
+        return ()
+
     def param(self, name: str) -> Param | None:
         return next((p for p in self.params if p.name == name), None)
 
@@ -181,6 +198,8 @@ class Stage:
             "consumes_level": is_level(self.consumes),
             "produces_level": is_level(self.produces),
             "adds": [c.to_json() for c in self.adds],
+            "also_adds": {lvl: [c.to_json() for c in cols]
+                          for lvl, cols in self.also_adds},
             "params": [p.to_json() for p in self.params],
             "requires": [t.to_json() for t in self.requires],
             "roles": list(self.roles), "selectable": self.selectable,

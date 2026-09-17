@@ -2,10 +2,9 @@
 
 Every stage follows the same contract:
 
-* it reads declared input files and writes declared output files under
-  ``work/<sample>/``;
-* it writes a sidecar ``<output>.manifest.json`` recording inputs (with size +
-  mtime), parameters, counts, timing and tool versions;
+* it reads its declared inputs and writes its declared columns;
+* it records what it did in ``stage_run``, with inputs (size + mtime),
+  parameters, counts, timing and tool versions;
 * it is idempotent - re-running with unchanged inputs and parameters is a
   no-op unless ``force=True``.
 
@@ -14,21 +13,20 @@ point your data already reaches (reads, contigs, or proteins).
 
 Most stages also *annotate* rather than transform: they add columns to an
 entity level instead of writing a filtered copy of their input. Those columns
-go in a parquet fragment and are recorded in the manifest's ``tables`` list,
-which is how a reader discovers them without being told the stage list. See
-``entities.py``.
+go into the lake (``lake.py``), and what ran is recorded in ``stage_run`` -
+which is what the ``<output>.manifest.json`` sidecars used to carry.
+
+What is left here is the file-shaped plumbing: FASTA/FASTQ reading and writing
+for the stages that still deal in files, and the work directory those files
+live in.
 """
 
 from __future__ import annotations
 
 import gzip
-import json
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
-
-SCHEMA_VERSION = 2          # 2 added the `tables` fragment record
 
 
 def open_maybe_gzip(path: Path, mode: str = "rt"):
@@ -65,76 +63,6 @@ def write_fasta(path: Path, records, width: int = 60) -> int:
     return n
 
 
-def fingerprint(path: Path) -> dict:
-    p = Path(path)
-    if not p.exists():
-        return {"path": str(p), "exists": False}
-    st = p.stat()
-    return {
-        "path": str(p),
-        "exists": True,
-        "bytes": st.st_size,
-        "mtime": round(st.st_mtime, 3),
-    }
-
-
-def manifest_path(output: Path) -> Path:
-    return Path(str(output) + ".manifest.json")
-
-
-def is_current(output: Path, inputs: list[Path], params: dict) -> bool:
-    """True when `output` was built from exactly these inputs and params."""
-    mp = manifest_path(output)
-    if not Path(output).exists() or not mp.exists():
-        return False
-    try:
-        old = json.loads(mp.read_text())
-    except (json.JSONDecodeError, OSError):
-        return False
-    if old.get("schema_version") != SCHEMA_VERSION:
-        return False
-    if old.get("params") != params:
-        return False
-    return old.get("inputs") == [fingerprint(p) for p in inputs]
-
-
-def write_manifest(output: Path, inputs, params, stats, tools=None, seconds=None,
-                   tables=None, stage=None):
-    payload = {
-        "schema_version": SCHEMA_VERSION,
-        "stage": stage or Path(output).parent.name,
-        "output": fingerprint(output),
-        "inputs": [fingerprint(p) for p in inputs],
-        "params": params,
-        "stats": stats,
-        "tools": tools or {},
-        "tables": tables or [],
-        "seconds": None if seconds is None else round(seconds, 2),
-        "written": time.strftime("%Y-%m-%dT%H:%M:%S"),
-    }
-    manifest_path(output).write_text(json.dumps(payload, indent=2))
-    return payload
-
-
-def write_fragment(path: Path, table, level: str, role: str = "annotation",
-                   where: str | None = None, help: dict | None = None) -> dict:
-    """Write a stage's columns for one entity level, and describe them.
-
-    The return value goes straight into ``write_manifest(tables=[...])``; that
-    record is the only thing a reader needs in order to find these columns and
-    know what they mean, which is what keeps readers from having to know the
-    stage list.
-    """
-    import pyarrow.parquet as pq
-
-    from entities import describe_table
-
-    path = Path(path)
-    pq.write_table(table, path, compression="zstd")
-    return {"path": str(path),
-            **describe_table(table, level, role, where=where, help=help)}
-
-
 @dataclass
 class StageResult:
     name: str
@@ -144,8 +72,8 @@ class StageResult:
     seconds: float = 0.0
     mate: Path | None = None          # second mate, for paired stages
     # Ports this stage filled, for the driver to carry forward: a file kind
-    # maps to a path, a level maps to None because a level lives in the work
-    # directory rather than in any one file.
+    # maps to a path, a level maps to None because a level lives in the store
+    # rather than in any one file.
     produced: dict = field(default_factory=dict)
 
     def describe(self) -> str:
@@ -169,6 +97,11 @@ def which(tool: str) -> str | None:
 
 
 def workdir(root: Path, sample: str, stage: str) -> Path:
+    """Scratch for the stages that still produce files (reads, contigs, logs).
+
+    Tabular output no longer lands here - it goes to the lake - so this is a
+    working directory rather than the record of what happened.
+    """
     d = Path(root) / sample / stage
     d.mkdir(parents=True, exist_ok=True)
     return d

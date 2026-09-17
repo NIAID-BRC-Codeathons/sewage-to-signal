@@ -133,6 +133,21 @@ print('pyrodigal', pyrodigal.__version__); print('duckdb', duckdb.__version__)"
       "import run; from stage import registry; r = registry(); \
 assert len(r) >= 7, f'only {len(r)} stages discovered: {r.names}'; \
 print('stages discovered:', ', '.join(r.names))"
+    echo "--- ducklake ---"
+    # Installed at build time on purpose: a compute node usually has no route to
+    # the extension repository, and a runtime INSTALL would fail there rather
+    # than here. Attaching a throwaway lake proves the whole path, not just the
+    # download.
+    /opt/venv/bin/python -c "
+import duckdb, tempfile, os
+d = tempfile.mkdtemp()
+con = duckdb.connect(':memory:')
+con.execute('INSTALL ducklake'); con.execute('LOAD ducklake')
+con.execute(f\"ATTACH 'ducklake:{d}/m.ducklake' AS lake (DATA_PATH '{d}/files/')\")
+con.execute('CREATE TABLE lake.t (sample VARCHAR, n INTEGER)')
+con.execute(\"INSERT INTO lake.t VALUES ('x', 1)\")
+assert con.execute('SELECT count(*) FROM lake.t').fetchone()[0] == 1
+print('ducklake attach + write: ok')"
 
 %labels
     Name        wastewater-sae

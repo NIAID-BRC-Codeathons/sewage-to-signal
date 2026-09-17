@@ -12,8 +12,8 @@ its input with a predicate over them.
 The sequence is a column because it makes any subset reconstructible: a
 predicate is enough to rebuild the exact FASTA any stage was given, which is
 strictly more auditable than the fixed handful of subsets the pipeline used to
-materialise. The protein FASTA is still written, for tools outside this
-pipeline.
+materialise. A protein FASTA is still written to the work directory, for tools
+outside this pipeline.
 
 The hash is ``sha1`` of the sequence, and it is what makes cross-sample
 predicates possible - ``gene_id`` is per-assembly, so without it "also dark in
@@ -26,26 +26,27 @@ import argparse
 import time
 from pathlib import Path
 
-from common import (StageResult, is_current, read_fasta, workdir, write_fasta,
-                    write_fragment, write_manifest)
-from entities import GENE_COLUMN_HELP as COLUMN_HELP, gene_row, gene_schema
-from stage import Column, Param, Stage
+import lake
+from common import StageResult, read_fasta, workdir, write_fasta
+from entities import gene_columns, gene_row, gene_schema, write_rows
+from stage import Param, Stage
 
 
 def run(
     contigs: Path,
     out_dir: Path,
     sample: str,
+    con=None,
     min_aa: int = 60,
     keep_partial: bool = True,
     force: bool = False,
 ) -> StageResult:
     contigs = Path(contigs)
-    out = Path(out_dir) / f"{sample}.genes.parquet"
     faa = Path(out_dir) / f"{sample}.proteins.faa"
     params = {"min_aa": min_aa, "keep_partial": keep_partial}
-    if not force and is_current(out, [contigs], params):
-        return StageResult("s03_genes", out, {}, skipped=True,
+    deps = [lake.fingerprint(contigs)]
+    if not force and lake.is_current(con, sample, "s03_genes", params, deps):
+        return StageResult("s03_genes", faa, {}, skipped=True,
                            produced={"gene": None})
 
     import pyarrow as pa
@@ -74,7 +75,7 @@ def run(
 
     write_fasta(faa, records)
     table = pa.Table.from_pylist(rows, schema=gene_schema())
-    frag = write_fragment(out, table, "gene", role="base", help=COLUMN_HELP)
+    n = write_rows(con, "gene", sample, table, STAGE)
 
     stats = {
         "contigs": n_contigs, "genes_called": n_called, "genes_kept": len(rows),
@@ -82,10 +83,9 @@ def run(
         "mean_aa": round(sum(r["aa_len"] for r in rows) / len(rows), 1) if rows else 0,
     }
     el = time.time() - t0
-    write_manifest(out, [contigs], params, stats,
-                   tools={"pyrodigal": pyrodigal.__version__}, seconds=el,
-                   tables=[frag], stage="s03_genes")
-    return StageResult("s03_genes", out, stats, seconds=el, produced={"gene": None})
+    lake.record_run(con, sample, "s03_genes", params, deps, None, stats,
+                    tools={"pyrodigal": pyrodigal.__version__}, seconds=el, rows=n)
+    return StageResult("s03_genes", faa, stats, seconds=el, produced={"gene": None})
 
 
 STAGE = Stage(
@@ -98,17 +98,7 @@ STAGE = Stage(
     produces="gene",
     order=30,
     roles=("gene_source",),
-    adds=(
-        Column("gene_id", "string", COLUMN_HELP["gene_id"]),
-        Column("contig", "string", COLUMN_HELP["contig"]),
-        Column("begin", "int64", COLUMN_HELP["begin"]),
-        Column("end", "int64", COLUMN_HELP["end"]),
-        Column("strand", "string", COLUMN_HELP["strand"]),
-        Column("partial", "bool", COLUMN_HELP["partial"]),
-        Column("aa_len", "int32", COLUMN_HELP["aa_len"]),
-        Column("seq_sha1", "string", COLUMN_HELP["seq_sha1"]),
-        Column("seq", "string", COLUMN_HELP["seq"]),
-    ),
+    adds=gene_columns(),
     params=(
         Param("min_aa", int, 60, group="genes",
               help="drop genes shorter than this many amino acids"),

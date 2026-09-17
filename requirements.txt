@@ -17,10 +17,11 @@ huggingface-hub==0.36.2
 pyarrow==25.0.1
 pandas==3.0.5
 numpy==2.5.3
-# Stages annotate entity levels by writing parquet column fragments, and a
-# level is read back as the join of those fragments. DuckDB does that join,
-# pushes predicates into the parquet, and makes a selection that references
-# another sample an ordinary SQL subquery rather than hand-written plumbing.
+# The store. Every sample's rows live in one DuckLake database - real tables,
+# real types, ACID, snapshots - with parquet underneath, so the parallel writes
+# in container/run_batch.sh still work. The ducklake extension is DuckDB's own
+# and is fetched by `INSTALL ducklake`, not by pip; the container image installs
+# it at build time because compute nodes are usually offline.
 duckdb==1.5.5
 
 # Bioinformatics — all pure wheels, no external binaries

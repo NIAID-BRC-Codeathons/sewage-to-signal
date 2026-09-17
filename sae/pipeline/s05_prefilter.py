@@ -44,9 +44,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from common import (StageResult, is_current, read_fasta, workdir,
-                    write_fragment, write_manifest)
-from entities import fasta_records, table_from_fasta
+import lake
+from common import StageResult, read_fasta, workdir
+from entities import fasta_records, table_from_fasta, write_rows
 from stage import Column, Param, Stage, Tool
 
 CATEGORIES = ("known", "partial", "dark")
@@ -186,6 +186,7 @@ def run(
     rows,
     out_dir: Path,
     sample: str,
+    con=None,
     source: Path | None = None,
     where: str | None = None,
     hmm: Path | None = None,
@@ -198,7 +199,6 @@ def run(
     force: bool = False,
 ) -> StageResult:
     out_dir = Path(out_dir)
-    out = out_dir / f"{sample}.classification.parquet"
 
     backend = "pyhmmer" if hmm else ("pyswrd" if ref else "none")
     params = {
@@ -207,10 +207,10 @@ def run(
         "bit_cutoffs": bit_cutoffs, "where": where,
         "reference": str(hmm or ref) if (hmm or ref) else None,
     }
-    deps = ([Path(source)] if source else []) \
-        + ([Path(hmm)] if hmm else []) + ([Path(ref)] if ref else [])
-    if not force and is_current(out, deps, params):
-        return StageResult("s05_prefilter", out, {"backend": backend},
+    deps = [lake.fingerprint(p) for p in
+            ([source] if source else []) + ([hmm] if hmm else []) + ([ref] if ref else [])]
+    if not force and lake.is_current(con, sample, "s05_prefilter", params, deps):
+        return StageResult("s05_prefilter", out_dir, {"backend": backend},
                            skipped=True, produced={"gene": None})
 
     import pyarrow as pa
@@ -232,22 +232,22 @@ def run(
         a.classify(confident_evalue, min_coverage)
 
     counts = {c: 0 for c in CATEGORIES}
-    rows = []
+    rows_out = []
     for gid, _ in records:
         a = assigned[gid]
         counts[a.category] += 1
-        rows.append({
+        rows_out.append({
             "gene_id": gid, "category": a.category, "family": a.family,
             "family_acc": a.family_acc, "evalue": a.evalue,
             "coverage": a.coverage, "n_domains": a.n_domains,
         })
-    table = pa.Table.from_pylist(rows, schema=pa.schema([
+    table = pa.Table.from_pylist(rows_out, schema=pa.schema([
         ("gene_id", pa.string()), ("category", pa.string()),
         ("family", pa.string()), ("family_acc", pa.string()),
         ("evalue", pa.float64()), ("coverage", pa.float64()),
         ("n_domains", pa.int32()),
     ]))
-    frag = write_fragment(out, table, "gene", where=where, help=COLUMN_HELP)
+    write_rows(con, "gene", sample, table, STAGE)
 
     n = len(records)
     n_analyze = n - counts["known"]
@@ -259,9 +259,9 @@ def run(
         "analyzed_frac": round(n_analyze / n, 4) if n else 0.0,
     }
     el = time.time() - t0
-    write_manifest(out, deps, params, stats, seconds=el, tables=[frag],
-                   stage="s05_prefilter")
-    return StageResult("s05_prefilter", out, stats, seconds=el,
+    lake.record_run(con, sample, "s05_prefilter", params, deps, where, stats,
+                    seconds=el, rows=len(rows_out))
+    return StageResult("s05_prefilter", out_dir, stats, seconds=el,
                        produced={"gene": None})
 
 

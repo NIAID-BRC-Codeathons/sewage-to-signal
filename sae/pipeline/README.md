@@ -10,12 +10,24 @@ s01_qc → s02_assemble → s03_genes → s04_derep → s05_prefilter → s06_em
                           + rep_id   + category, family          + summary, clusters
 ```
 
-Stages up to `s03` pass **files**. From `s03` on they pass **rows**: `s03` emits
-one row per gene, and everything after it adds *columns* to those rows rather
-than writing a filtered copy. What a stage reads is a SQL predicate over those
-columns — `is_representative AND category <> 'known'` is the GPU stage's default
-— which is why dereplication and triage are labels here rather than filters.
-See `entities.py` for the model and `stage.py` for how a stage describes itself.
+Stages up to `s03` pass **files**. From `s03` on they pass **rows** in a
+**DuckLake database** — `data/sae.ducklake`, which is the data. `gene`,
+`feature_hit`, `feature` and `cluster_hit` are real tables with real types and a
+`sample` column; `s03` inserts gene rows and everything after it adds *columns*
+to them. What a stage reads is a SQL predicate over those columns —
+`is_representative AND category <> 'known'` is the GPU stage's default — which
+is why dereplication and triage are labels here rather than filters.
+
+Because every table carries `sample`, a cohort question is ordinary SQL:
+
+```bash
+python run.py --sql "
+  SELECT seq_sha1, count(DISTINCT sample) n FROM gene
+  WHERE category = 'dark' GROUP BY seq_sha1 HAVING n >= 3 ORDER BY n DESC"
+```
+
+See `lake.py` for the store, `entities.py` for the levels, and `stage.py` for
+how a stage describes itself.
 
 ## Why this shape
 
@@ -168,22 +180,47 @@ the same thing.
 
 ### Entity levels
 
-| Level | Key | Written by | Then annotated by |
+| Level | Key (with `sample`) | Rows created by | Columns added by |
 |---|---|---|---|
 | `gene` | `gene_id` | s03_genes (or s00_ingest) | s04_derep, s05_prefilter, s06_embed |
 | `feature_hit` | `gene_id, feature_id` | s06_embed | — |
 | `feature` | `feature_id` | s06_embed | s07_match |
 | `cluster_hit` | `feature_id, cluster_rep_protein_hash` | s07_match | — |
 
-Each stage writes only its own columns, as its own parquet fragment under its
-own directory; the level is the join of those fragments, assembled on demand.
-So a stage can be re-run, with different parameters or a different selection,
-without rewriting anybody else's output — and a reader discovers the columns
-from the manifests rather than from a schema it was told.
+A stage that creates rows replaces that sample's rows; a stage that annotates
+`UPDATE`s only the columns it declares. That is what lets s04, s05 and s06 all
+write to `gene` without coordinating, and it means re-running one of them with
+different parameters leaves the others' columns alone.
+
+`sample` is part of every key, because `gene_id` is per-assembly and means
+nothing on its own once every sample shares a table.
 
 `gene` carries `seq`, so any predicate reconstitutes the exact FASTA a stage
 was given. That replaced `nr.faa` and the four classification FASTAs, which
 existed only to hand the next stage a subset somebody had chosen in advance.
+
+The schema is generated from the registry: `Stage.adds` declares the columns a
+stage owns and `ALTER TABLE ADD COLUMN` adds them, so a new stage needs no
+migration. `stage_run` records what ran with what, replacing the per-output
+`manifest.json` sidecars — provenance is a query now.
+
+### Where the lake lives
+
+```bash
+SAE_LAKE=data/sae.ducklake                        # default: local
+SAE_LAKE=postgres:dbname=sae host=db.internal \
+SAE_LAKE_DATA=s3://sae-cohort/lake/               # shared catalog + object store
+```
+
+A local catalog is a DuckDB file, so it is one writer **or** many readers and
+the lock is held for as long as the connection — which is why nothing holds the
+store across compute, and why `run_batch.sh`'s parallel slots still work
+(measured: 8 writers, 0 failures, a reader getting in on every poll). Keep it
+off Lustre/NFS. A Postgres catalog removes both the filesystem constraint and
+the reader/writer exclusion.
+
+Existing work directories load with `backfill.py`, which reads both the
+fragment-parquet layout and the older FASTA/TSV runs.
 
 ## Stages
 

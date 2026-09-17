@@ -18,7 +18,8 @@ import time
 from pathlib import Path
 
 from stage import Param, Stage, Tool
-from common import MissingTool, StageResult, is_current, read_fasta, which, workdir, write_manifest
+import lake
+from common import MissingTool, StageResult, read_fasta, which, workdir
 
 INSTALL_HINT = (
     "Install an assembler, e.g.\n"
@@ -33,6 +34,7 @@ def run(
     fastq: Path,
     out_dir: Path,
     sample: str,
+    con=None,
     fastq2: Path | None = None,
     min_contig: int = 500,
     threads: int = 4,
@@ -43,10 +45,10 @@ def run(
     fastq = Path(fastq)
     out = Path(out_dir) / f"{sample}.contigs.fa"
     paired = fastq2 is not None
-    deps = [fastq] + ([Path(fastq2)] if paired else [])
+    deps = [lake.fingerprint(f) for f in [fastq] + ([fastq2] if paired else [])]
     params = {"min_contig": min_contig, "assembler": assembler,
               "threads": threads, "paired": paired}
-    if not force and is_current(out, deps, params):
+    if not force and lake.is_current(con, sample, "s02_assemble", params, deps):
         return StageResult("s02_assemble", out, {}, skipped=True)
 
     tool = assembler
@@ -92,7 +94,8 @@ def run(
         "n50": n50, "longest": lengths[0] if lengths else 0,
     }
     el = time.time() - t0
-    write_manifest(out, deps, params, stats, tools={tool: "external"}, seconds=el)
+    lake.record_run(con, sample, "s02_assemble", params, deps, None, stats,
+                    tools={tool: "external"}, seconds=el)
     return StageResult("s02_assemble", out, stats, seconds=el)
 
 

@@ -1,46 +1,43 @@
-"""Entity levels, column fragments, and predicates over them.
+"""Entity levels: what a row is, and how a stage writes columns onto one.
 
-The pipeline used to pass files: each stage read a FASTA and wrote a smaller
-FASTA. That works, but it hides what most stages are actually doing. ``s05``
-does not transform proteins - it *labels* them, and then writes four FASTAs
-purely to hand the next stage a subset. ``s04`` is the same: its real output is
-a ``gene -> representative`` mapping, and ``nr.faa`` exists only to be somebody
-else's input.
+An **entity level** is a kind of row - a gene, an SAE feature, a feature hit.
+A stage either
 
-So the interface is a table, not a file. An **entity level** is a kind of row
-(a gene, an SAE feature, a feature hit). A stage either
+* **creates** rows in a level (it consumes something else and emits these), or
+* **annotates** a level - same rows, new columns.
 
-* **annotates** a level - same rows in, new *columns* out; or
-* **emits** a level - new rows, carrying a parent id back to the level above.
+Both are tables in the lake (see ``lake.py``); creating is an INSERT and
+annotating is an UPDATE of just the columns that stage declares. Nothing here
+reconstructs a table from files any more: the store holds it.
 
-Each stage writes its columns as its own parquet **fragment**, never rewriting
-anybody else's. The logical table for a level is the base fragment LEFT JOINed
-to every annotation fragment, assembled on demand. That keeps the existing
-one-directory-per-stage layout, keeps each stage independently re-runnable, and
-means a stage can be added without touching any reader.
+Levels are declared here rather than by the stages, because a level is a shared
+vocabulary - two stages annotating ``gene`` have to agree on what a gene is.
+Stages declare which level they read and write and what columns they add; the
+DDL is generated from those declarations.
 
-Reading is SQL, over DuckDB. Every sample in every work root is registered as a
-schema, so a predicate can reach across samples:
+Selection is SQL over the level, and because every table carries ``sample``,
+a cohort question is an ordinary query:
 
     # within a sample
     category <> 'known' AND is_representative AND aa_len > 200
 
-    # across samples - genes here that were also dark in CHI-A
-    seq_sha1 IN (SELECT seq_sha1 FROM "CHI-A".gene WHERE category = 'dark')
+    # genes here that another sample also found dark
+    seq_sha1 IN (SELECT seq_sha1 FROM gene
+                 WHERE sample = 'CHI-A' AND category = 'dark')
 
-Levels are declared here rather than by the stages, because a level is a shared
-vocabulary: two stages annotating ``gene`` have to agree on what a gene is.
-Stages declare which level they read and write, and what columns they add.
+    # the question a 381-run cohort exists to ask
+    seq_sha1 IN (SELECT seq_sha1 FROM gene WHERE category = 'dark'
+                 GROUP BY seq_sha1 HAVING count(DISTINCT sample) >= 3)
 """
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Iterable, Sequence
 
 from common import read_fasta
+from lake import quote
 
 # Reads and contigs stay files. A per-read table is the one place this model
 # does not pay: CASPER is ~400 billion reads, and nothing downstream wants to
@@ -51,7 +48,7 @@ from common import read_fasta
 
 @dataclass(frozen=True)
 class Level:
-    """A kind of row. ``key`` is what makes a row unique within a sample."""
+    """A kind of row. ``key`` is what makes a row unique *within a sample*."""
 
     name: str
     key: tuple[str, ...]
@@ -60,8 +57,13 @@ class Level:
     summary: str = ""
 
     @property
-    def key_sql(self) -> str:
-        return ", ".join(f'"{k}"' for k in self.key)
+    def full_key(self) -> tuple[str, ...]:
+        """The key including ``sample`` - what is unique across the whole store.
+
+        ``gene_id`` is per-assembly, so it means nothing on its own once every
+        sample lives in one table. Every join and every update keys on this.
+        """
+        return ("sample", *self.key)
 
 
 LEVELS: dict[str, Level] = {
@@ -93,255 +95,152 @@ def is_level(port: str) -> bool:
     return port in LEVELS
 
 
-# --------------------------------------------------------------------------
-# fragments
-# --------------------------------------------------------------------------
-@dataclass
-class Fragment:
-    """One stage's contribution of columns to one level."""
-
-    path: Path
-    level: str
-    key: tuple[str, ...]
-    role: str                      # "base" (defines rows) or "annotation"
-    columns: list[dict]            # [{"name", "type", "help"}]
-    stage: str = ""
-    written: str | None = None
-    where: str | None = None       # predicate the producing stage selected on
-
-    @property
-    def added(self) -> list[str]:
-        """Columns this fragment contributes, excluding the join key."""
-        return [c["name"] for c in self.columns if c["name"] not in self.key]
-
-    def to_json(self) -> dict:
-        return {
-            "path": str(self.path), "level": self.level, "key": list(self.key),
-            "role": self.role, "columns": self.columns, "stage": self.stage,
-            "written": self.written, "where": self.where,
-        }
-
-
-def describe_table(table, level: str, role: str, *, where: str | None = None,
-                   help: dict[str, str] | None = None) -> dict:
-    """Manifest entry for a pyarrow table a stage just wrote.
-
-    Types come from the table itself rather than a declaration, so a stage
-    cannot drift from what it actually produced.
-    """
-    lv = LEVELS[level]
-    help = help or {}
-    return {
-        "level": level,
-        "key": list(lv.key),
-        "role": role,
-        "where": where,
-        "columns": [{"name": f.name, "type": str(f.type), "help": help.get(f.name, "")}
-                    for f in table.schema],
-    }
-
-
-def fragments(sample_dir: Path, level: str | None = None) -> list[Fragment]:
-    """Every fragment under a sample, discovered from stage manifests.
-
-    Nothing here knows the stage list: it reads whatever manifests are on disk,
-    so a work directory written by a pipeline this process has never heard of
-    still describes itself completely.
-    """
-    out: list[Fragment] = []
-    if not Path(sample_dir).is_dir():
-        return out
-    for stage_dir in sorted(p for p in Path(sample_dir).iterdir() if p.is_dir()):
-        for mf in sorted(stage_dir.glob("*.manifest.json")):
-            try:
-                doc = json.loads(mf.read_text())
-            except (json.JSONDecodeError, OSError):
-                continue
-            for t in doc.get("tables") or []:
-                if level and t.get("level") != level:
-                    continue
-                p = Path(t["path"]) if t.get("path") else \
-                    stage_dir / str(mf.name).replace(".manifest.json", "")
-                if not p.is_absolute():
-                    p = stage_dir / p
-                if not p.is_file():
-                    continue
-                out.append(Fragment(
-                    path=p, level=t["level"], key=tuple(t.get("key") or ()),
-                    role=t.get("role", "annotation"), columns=t.get("columns") or [],
-                    stage=doc.get("stage") or stage_dir.name,
-                    written=doc.get("written"), where=t.get("where"),
-                ))
-    out.sort(key=lambda f: (f.role != "base", f.written or "", f.stage))
-    return out
-
-
-def levels_present(sample_dir: Path) -> list[str]:
-    seen = []
-    for f in fragments(sample_dir):
-        if f.level not in seen:
-            seen.append(f.level)
-    return seen
-
-
-# --------------------------------------------------------------------------
-# assembling a level into one queryable view
-# --------------------------------------------------------------------------
-@dataclass
-class Assembled:
-    """A level's fragments resolved into a single SELECT."""
-
-    level: str
-    sql: str
-    columns: list[dict]            # name, type, stage, help - provenance per column
-    collisions: list[str] = field(default_factory=list)
-    base: Fragment | None = None
-    parts: list[Fragment] = field(default_factory=list)
-
-
-def _q(p: Path) -> str:
-    return "read_parquet('" + str(p).replace("'", "''") + "')"
-
-
-def assemble(sample_dir: Path, level: str) -> Assembled | None:
-    """Base LEFT JOIN every annotation fragment, in write order.
-
-    A column claimed by two stages is kept from the first writer and reported
-    as a collision rather than silently shadowed - the alternative is a
-    predicate that quietly means something other than it says.
-    """
-    parts = fragments(sample_dir, level)
-    if not parts:
-        return None
-    lv = LEVELS.get(level) or Level(level, tuple(parts[0].key))
-    base = next((f for f in parts if f.role == "base"), parts[0])
-    rest = [f for f in parts if f is not base]
-
-    taken = {k: base.stage for k in lv.key}
-    cols: list[dict] = []
-    for c in base.columns:
-        taken.setdefault(c["name"], base.stage)
-        cols.append({**c, "stage": base.stage})
-
-    select = ["b.*"]
-    collisions: list[str] = []
-    joins: list[str] = []
-    for i, f in enumerate(rest):
-        alias = f"a{i}"
-        joins.append(
-            f'LEFT JOIN {_q(f.path)} AS {alias} ON '
-            + " AND ".join(f'b."{k}" = {alias}."{k}"' for k in lv.key)
-        )
-        for c in f.columns:
-            n = c["name"]
-            if n in lv.key:
-                continue
-            if n in taken:
-                collisions.append(f"{n} (kept from {taken[n]}, also written by {f.stage})")
-                continue
-            taken[n] = f.stage
-            select.append(f'{alias}."{n}"')
-            cols.append({**c, "stage": f.stage})
-
-    sql = (f"SELECT {', '.join(select)} FROM {_q(base.path)} AS b "
-           + " ".join(joins)).strip()
-    return Assembled(level=level, sql=sql, columns=cols, collisions=collisions,
-                     base=base, parts=parts)
-
-
-# --------------------------------------------------------------------------
-# querying
-# --------------------------------------------------------------------------
 class NoSuchLevel(KeyError):
     pass
 
 
-def connect(sample_dir: Path, roots: Sequence[Path] = ()) -> Any:
-    """A DuckDB connection with this sample's levels as plain views.
+# --------------------------------------------------------------------------
+# writing
+# --------------------------------------------------------------------------
+def write_rows(con, level: str, sample: str, table, stage) -> int:
+    """Write one stage's contribution to one level, for one sample.
 
-    Sibling samples are registered as schemas, so a predicate can reference
-    ``"CHI-A".gene`` and compare one sample against another. Only samples that
-    actually have fragments are registered, and only as views over parquet -
-    nothing is copied.
+    A stage that *creates* rows replaces this sample's rows wholesale, so
+    re-running it is idempotent rather than cumulative. A stage that
+    *annotates* updates only the columns it declares, leaving every other
+    stage's columns untouched - which is what lets s04, s05 and s06 all write
+    to ``gene`` without coordinating.
+
+    The caller holds the lake; see ``lake.open``. Keep the window short.
     """
-    import duckdb
+    lv = LEVELS[level]
+    declared = [c.name for c in stage.columns_for(level)]
+    have = set(table.column_names)
+    missing = [c for c in declared if c not in have]
+    if missing:
+        raise ValueError(
+            f"{stage.name} declares {missing} on {level} but did not write them")
 
-    # In-memory and thrown away per query. Every view is a read over parquet,
-    # so nothing a predicate does can outlive the call - which is most of why
-    # accepting one over HTTP is tolerable. The rest is ``guard_predicate``.
-    con = duckdb.connect(":memory:")
-    sample_dir = Path(sample_dir)
-
-    for lvl in levels_present(sample_dir):
-        a = assemble(sample_dir, lvl)
-        if a:
-            con.execute(f'CREATE OR REPLACE VIEW "{lvl}" AS {a.sql}')
-
-    seen: set[str] = set()
-    for root in roots:
-        if not Path(root).is_dir():
-            continue
-        for other in sorted(p for p in Path(root).iterdir() if p.is_dir()):
-            if other.name.startswith(".") or other.name in seen:
-                continue
-            present = levels_present(other)
-            if not present:
-                continue
-            seen.add(other.name)
-            con.execute(f'CREATE SCHEMA IF NOT EXISTS "{other.name}"')
-            for lvl in present:
-                a = assemble(other, lvl)
-                if a:
-                    con.execute(
-                        f'CREATE OR REPLACE VIEW "{other.name}"."{lvl}" AS {a.sql}')
-    return con
+    con.register("_incoming", table)
+    try:
+        if level == stage.consumes:
+            return _annotate(con, lv, sample, declared)
+        return _insert(con, lv, sample, table)
+    finally:
+        con.unregister("_incoming")
 
 
-def select(sample_dir: Path, level: str, where: str | None = None,
+def _insert(con, lv: Level, sample: str, table) -> int:
+    cols = [c for c in table.column_names if c != "sample"]
+    con.execute(f"DELETE FROM {quote(lv.name)} WHERE sample = ?", [sample])
+    con.execute(
+        f"INSERT INTO {quote(lv.name)} (sample, {', '.join(quote(c) for c in cols)}) "
+        f"SELECT ?, {', '.join(quote(c) for c in cols)} FROM _incoming", [sample])
+    return table.num_rows
+
+
+def _annotate(con, lv: Level, sample: str, declared: list[str]) -> int:
+    """UPDATE just this stage's columns, matched on the level's full key."""
+    if not declared:
+        return 0
+    sets = ", ".join(f"{quote(c)} = _incoming.{quote(c)}" for c in declared)
+    on = " AND ".join(f"{quote(lv.name)}.{quote(k)} = _incoming.{quote(k)}"
+                      for k in lv.key)
+    con.execute(
+        f"UPDATE {quote(lv.name)} SET {sets} FROM _incoming "
+        f"WHERE {quote(lv.name)}.sample = ? AND {on}", [sample])
+    return con.execute("SELECT count(*) FROM _incoming").fetchone()[0]
+
+
+# --------------------------------------------------------------------------
+# reading
+# --------------------------------------------------------------------------
+def select(con, level: str, where: str | None = None,
            columns: Iterable[str] | None = None, limit: int | None = None,
-           roots: Sequence[Path] = ()):
-    """Rows of ``level`` matching ``where``, as a pyarrow table.
+           sample: str | None = None):
+    """Rows of ``level`` as a pyarrow table.
 
-    ``where`` is a SQL boolean expression over the level's columns. It is
-    user-supplied and evaluated, so callers that accept it from a network
-    request must be read-only - see ``guard_predicate``.
+    ``sample=None`` means the whole cohort. ``where`` is a SQL boolean
+    expression over the level's columns; it is user-supplied and evaluated, so
+    callers taking it from a network request must pass it through
+    ``guard_predicate`` first.
     """
-    con = connect(sample_dir, roots)
-    try:
-        if level not in [r[0] for r in con.execute(
-                "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = 'main'").fetchall()]:
-            raise NoSuchLevel(f"sample has no {level!r} table yet")
-        cols = ", ".join(f'"{c}"' for c in columns) if columns else "*"
-        sql = f'SELECT {cols} FROM "{level}"'
-        if where:
-            sql += f" WHERE ({where})"
-        if limit:
-            sql += f" LIMIT {int(limit)}"
-        # .arrow() hands back a RecordBatchReader, which is lazy over a
-        # connection this function is about to close. Read it now.
-        return con.execute(sql).arrow().read_all()
-    finally:
-        con.close()
+    cols = ", ".join(quote(c) for c in columns) if columns else "*"
+    sql = f"SELECT {cols} FROM {quote(level)}"
+    clauses, params = [], []
+    if sample is not None:
+        clauses.append("sample = ?")
+        params.append(sample)
+    if where:
+        clauses.append(f"({where})")
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    # .arrow() hands back a lazy reader over a connection the caller is about
+    # to detach; read it now.
+    return con.execute(sql, params).arrow().read_all()
 
 
-def count(sample_dir: Path, level: str, where: str | None = None,
-          roots: Sequence[Path] = ()) -> int:
-    con = connect(sample_dir, roots)
-    try:
-        sql = f'SELECT count(*) FROM "{level}"'
-        if where:
-            sql += f" WHERE ({where})"
-        return int(con.execute(sql).fetchone()[0])
-    finally:
-        con.close()
+def count(con, level: str, where: str | None = None,
+          sample: str | None = None) -> int:
+    sql = f"SELECT count(*) FROM {quote(level)}"
+    clauses, params = [], []
+    if sample is not None:
+        clauses.append("sample = ?")
+        params.append(sample)
+    if where:
+        clauses.append(f"({where})")
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    return int(con.execute(sql, params).fetchone()[0])
 
 
+def columns_of(con, level: str) -> list[dict]:
+    """The level's columns, with the stage that owns each one."""
+    from stage import registry
+
+    owner = {}
+    for st in registry():
+        for c in st.columns_for(level):
+            owner.setdefault(c.name, (st.name, c.help))
+    rows = con.execute(
+        "SELECT column_name, data_type FROM information_schema.columns "
+        "WHERE table_name = ? ORDER BY ordinal_position", [level]).fetchall()
+    out = []
+    for name, typ in rows:
+        stage_name, help_text = owner.get(name, ("", ""))
+        out.append({"name": name, "type": typ, "stage": stage_name,
+                    "help": help_text})
+    return out
+
+
+def levels_present(con, sample: str | None = None) -> list[str]:
+    """Levels that actually hold rows, for a sample or for the whole store."""
+    out = []
+    for name in LEVELS:
+        try:
+            if count(con, name, sample=sample) > 0:
+                out.append(name)
+        except Exception:
+            continue
+    return out
+
+
+def samples(con) -> list[str]:
+    return [r[0] for r in con.execute(
+        "SELECT DISTINCT sample FROM gene ORDER BY sample").fetchall()]
+
+
+# --------------------------------------------------------------------------
+# predicates
+# --------------------------------------------------------------------------
 # Statements that would write, attach or shell out. A predicate is an
 # expression, so any of these appearing in one means it is not a predicate.
 _FORBIDDEN = (
-    "attach", "copy", "create", "delete", "drop", "export", "insert",
+    "attach", "copy", "delete", "drop", "export", "insert",
     "install", "load", "pragma", "set ", "update", "call", "system",
+    "create",
 )
 
 
@@ -349,9 +248,8 @@ def guard_predicate(where: str) -> str:
     """Reject anything that is not a read-only boolean expression.
 
     DuckDB will happily run ``COPY ... TO`` or ``INSTALL`` from inside a WHERE
-    clause via a subquery, and this server writes files. So predicates arriving
-    over HTTP are checked here and the connection that runs them is a
-    throwaway in-memory one over read-only parquet views.
+    clause via a subquery, and the web server writes files. So predicates
+    arriving over HTTP are checked here and evaluated on a read-only attach.
     """
     if not where or not where.strip():
         return ""
@@ -360,9 +258,24 @@ def guard_predicate(where: str) -> str:
         raise ValueError("a predicate is one expression; ';' is not allowed")
     low = " " + s.lower().replace("(", " ( ").replace(",", " , ") + " "
     for word in _FORBIDDEN:
-        if f" {word.strip()} " in low or low.startswith(f" {word.strip()} "):
+        if f" {word.strip()} " in low:
             raise ValueError(f"{word.strip()!r} is not allowed in a predicate")
     return s
+
+
+def columns_named(where: str, known: Sequence[str]) -> set[str]:
+    """Which known column names a predicate mentions.
+
+    Used to decide whether a stage's default selection can apply at all: a
+    default naming a column no stage has filled yet is dropped rather than
+    silently matching nothing.
+    """
+    import re
+
+    if not where:
+        return set()
+    words = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", where))
+    return {c for c in known if c in words}
 
 
 # --------------------------------------------------------------------------
@@ -396,6 +309,22 @@ def gene_schema():
     ])
 
 
+def gene_columns():
+    """The gene level's base columns, as stage declarations.
+
+    Both writers of the gene base - calling genes from contigs, and importing a
+    protein FASTA - take these from here rather than writing their own list.
+    The store's DDL is generated from the declarations, so a stage that declared
+    `aa_len` as a string would make it a string for everybody: the first
+    declaration wins, and there is no reason for two writers of the same rows to
+    have two opinions about their types.
+    """
+    from stage import Column
+
+    return tuple(Column(f.name, str(f.type), GENE_COLUMN_HELP.get(f.name, ""))
+                 for f in gene_schema())
+
+
 def gene_row(gene_id: str, seq: str, **extra) -> dict:
     """One gene-level row, with the hash filled in."""
     import hashlib
@@ -419,8 +348,8 @@ def fasta_records(table, id_col: str = "gene_id", seq_col: str = "seq"):
     """
     if seq_col not in table.column_names:
         raise ValueError(
-            f"{seq_col!r} is not a column of this table; the level's base "
-            f"fragment has to carry sequences for this stage to run")
+            f"{seq_col!r} is not a column of this table; the level has to carry "
+            f"sequences for this stage to run")
     ids = table.column(id_col).to_pylist()
     seqs = table.column(seq_col).to_pylist()
     return [(i, s) for i, s in zip(ids, seqs) if s]
@@ -430,7 +359,7 @@ def table_from_fasta(path: Path):
     """Gene-level rows straight from a FASTA.
 
     Only for running a stage standalone from the command line, where there is
-    no work directory to select from. The driver never uses this.
+    no store to select from. The driver never uses this.
     """
     import pyarrow as pa
 

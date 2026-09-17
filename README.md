@@ -47,11 +47,11 @@ description.
 * **`sae/sae_testing_script.py`** — one query sequence (protein or nucleotide),
   end to end, with human-readable feature descriptions.
 * **`sae/pipeline/`** — modular stages from reads to candidate clusters,
-  resumable, each writing a provenance manifest. Stages describe themselves, so
-  the runnable path is planned from what you have to what you want rather than
-  being a fixed list. From gene calling on they *annotate* — adding columns to
-  an entity level — and each one picks its input with a SQL predicate over
-  those columns.
+  resumable. Stages describe themselves, so the runnable path is planned from
+  what you have to what you want rather than being a fixed list. From gene
+  calling on they *annotate* — adding columns to rows in **one DuckLake
+  database** — and each one picks its input with a SQL predicate over those
+  columns, including across samples.
 * **`sae/web/`** — progress dashboard, artifact browser, and run launcher. It
   holds no list of stages: the form is generated from the pipeline's own
   description of itself.
@@ -179,6 +179,20 @@ another sample:
     --where s06_embed="category = 'dark' AND aa_len > 200"
 ```
 
+**Asking the cohort a question.** Every sample is in one store, so this is SQL:
+
+```bash
+./sae/.venv/bin/python sae/pipeline/run.py --sql "
+  SELECT sample, count(*) FILTER (category='dark') AS dark
+  FROM gene GROUP BY sample ORDER BY dark DESC"
+
+# or point anything at it
+duckdb -c "INSTALL ducklake; LOAD ducklake;
+           ATTACH 'ducklake:data/sae.ducklake' AS lake
+             (DATA_PATH 'data/sae.ducklake.files/', READ_ONLY);
+           SELECT count(*) FROM lake.gene"
+```
+
 **From raw reads.** Needs an assembler, so use the container; `/data` and
 `/work` are bind mounts onto `data/` and `./work`.
 
@@ -241,9 +255,12 @@ sae/
   README.md                   caveats, benchmarks, model choice
   codeathon_proposal.html     project proposal
   pipeline/                   stages + run.py, README
-    entities.py               entity levels, column fragments, predicates
+    lake.py                   the store: schema, provenance, how to hold it
+    entities.py               entity levels and how a stage writes columns
     stage.py                  stage descriptors, registry, planner
+    backfill.py               load pre-store work directories into the lake
     s0*.py                    one stage each; a file here is a stage
+data/sae.ducklake             the data — every sample, every level
   web/                        progress dashboard + run launcher (stdlib only)
 chicago_wastewater_sra*.{md,csv,txt}   cohort definition and accession list
 ```
