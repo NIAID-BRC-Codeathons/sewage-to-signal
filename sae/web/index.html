@@ -9,10 +9,20 @@
     --bg:#f7f7f5; --panel:#fff; --line:#e2e2dd; --ink:#1c1c1a; --dim:#6b6b64;
     --accent:#2f6f4f; --warn:#9a5b12; --bad:#a33a2a; --run:#2c5d8a;
     --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    /* UMAP scatter. Deliberately not the status tokens: --accent and --warn
+       already mean "done" and "warning", and reusing them put grey --dim on
+       the "known" class, where it both collided with the corpus cloud and
+       left known-vs-partial at a normal-vision deltaE of 10.7 — a pair
+       full-colour readers cannot separate. These three validate on all pairs
+       in both modes, which is what a scatter needs. */
+    --map-surface:#f0f0f0; --map-context:#4b4b44;
+    --map-known:#2a78d6; --map-partial:#eb6834; --map-dark:#1baf7a;
   }
   @media (prefers-color-scheme:dark){ :root:not([data-theme="light"]){
     --bg:#16161a; --panel:#1e1e23; --line:#32323a; --ink:#e8e8e4; --dim:#9a9a92;
     --accent:#6dbd8f; --warn:#d9a05b; --bad:#e08472; --run:#79aede;
+    --map-surface:#151518; --map-context:#9a9a92;
+    --map-known:#3987e5; --map-partial:#d95926; --map-dark:#199e70;
   }}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--ink);
@@ -95,7 +105,7 @@
   .map-bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
            font:11px var(--mono);color:var(--dim);margin-bottom:6px}
   .map svg{width:100%;height:auto;display:block;border:1px solid var(--line);
-           border-radius:5px;background:var(--bg)}
+           border-radius:5px;background:var(--map-surface)}
   .map circle{cursor:pointer}
   .key{display:inline-flex;gap:4px;align-items:center}
   .key i{width:9px;height:9px;border-radius:50%;display:inline-block}
@@ -196,8 +206,10 @@ let jobScript = {}, jobPane = "output";
 // Feature map: s06's top-K vectors reduced to 2D. Fetched only when asked,
 // because t-SNE over a thousand proteins takes seconds.
 let mapRun = null, mapMode = "reference", mapData = null, mapErr = null, mapHover = null;
-const GROUP_COLOR = {dark: "var(--accent)", partial: "var(--warn)",
-                     known: "var(--dim)"};
+// Fixed slot order, read as the known -> partial -> dark gradient the
+// pipeline reports; never cycled or reassigned by how many groups a run has.
+const GROUP_COLOR = {known: "var(--map-known)", partial: "var(--map-partial)",
+                     dark: "var(--map-dark)"};
 
 const esc = v => String(v == null ? "" : v)
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -323,12 +335,17 @@ function renderMap(run) {
   const sx = v => pad + (x1 === x0 ? 0.5 : (v - x0) / (x1 - x0)) * (W - 2 * pad);
   // SVG y grows downward; flip so the plot reads the usual way up.
   const sy = v => H - pad - (y1 === y0 ? 0.5 : (v - y0) / (y1 - y0)) * (H - 2 * pad);
+  // The corpus is backdrop, so it stays neutral — no series is grey now, so
+  // grey reads unambiguously as "not this run". It was --line at 0.55, which
+  // on the white panel was a contrast of about 1.05 against its own
+  // background: present in the DOM and invisible on screen.
   const ctx = (mapData.context || []).map(p =>
     `<circle cx="${sx(p.x).toFixed(1)}" cy="${sy(p.y).toFixed(1)}" r="1.6"
-      fill="var(--line)" fill-opacity="0.55"/>`).join("");
+      fill="var(--map-context)" fill-opacity="0.4"/>`).join("");
   const dots = mapData.points.map(p =>
     `<circle cx="${sx(p.x).toFixed(1)}" cy="${sy(p.y).toFixed(1)}" r="2.6"
-      fill="${GROUP_COLOR[p.group] || "var(--dim)"}" fill-opacity="0.75"
+      fill="${GROUP_COLOR[p.group] || "var(--map-context)"}" fill-opacity="0.85"
+      stroke="var(--map-surface)" stroke-width="1"
       data-dot="${esc(p.id)}${p.group ? " · " + esc(p.group) : ""}"><title>${esc(p.id)}${
       p.group ? " (" + esc(p.group) + ")" : ""}</title></circle>`).join("");
   return `<div class="map">${bar}<svg viewBox="0 0 ${W} ${H}"
