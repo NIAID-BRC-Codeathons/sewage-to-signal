@@ -17,12 +17,22 @@
        in both modes, which is what a scatter needs. */
     --map-surface:#f0f0f0; --map-context:#4b4b44;
     --map-known:#2a78d6; --map-partial:#eb6834; --map-dark:#1baf7a;
+    /* Overlay of two samples. A separate pair, not a reuse of the class
+       colours: an overlay colours by *sample*, so borrowing "known" blue for
+       sample A would have the same swatch mean two things across two modes of
+       the same plot. Violet/amber over magenta/teal because the latter
+       collapses under deuteranopia (simulated deltaE 3.6, indistinguishable);
+       this pair holds a simulated deltaE of at least 27 under deuter-, prot-
+       and tritanopia in both themes, and both stay separable from the corpus
+       grey. */
+    --map-a:#7b4fd0; --map-b:#c79000;
   }
   @media (prefers-color-scheme:dark){ :root:not([data-theme="light"]){
     --bg:#16161a; --panel:#1e1e23; --line:#32323a; --ink:#e8e8e4; --dim:#9a9a92;
     --accent:#6dbd8f; --warn:#d9a05b; --bad:#e08472; --run:#79aede;
     --map-surface:#151518; --map-context:#9a9a92;
     --map-known:#3987e5; --map-partial:#d95926; --map-dark:#199e70;
+    --map-a:#9b7ae8; --map-b:#d9a93a;
   }}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--ink);
@@ -107,6 +117,7 @@
   .map svg{width:100%;height:auto;display:block;border:1px solid var(--line);
            border-radius:5px;background:var(--map-surface)}
   .map circle{cursor:pointer}
+  .map-bar select{width:auto;padding:3px 6px;font:11px var(--mono)}
   .key{display:inline-flex;gap:4px;align-items:center}
   .key i{width:9px;height:9px;border-radius:50%;display:inline-block}
   .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
@@ -206,10 +217,16 @@ let jobScript = {}, jobPane = "output";
 // Feature map: s06's top-K vectors reduced to 2D. Fetched only when asked,
 // because t-SNE over a thousand proteins takes seconds.
 let mapRun = null, mapMode = "reference", mapData = null, mapErr = null, mapHover = null;
+// The second run drawn in the same layout, or null for one run on its own.
+let mapB = null;
+// Every run in the last /api/state, so the compare picker can offer the other
+// ones. renderMap is reached through renderDetail and is not passed the list.
+let allRuns = [];
 // Fixed slot order, read as the known -> partial -> dark gradient the
 // pipeline reports; never cycled or reassigned by how many groups a run has.
 const GROUP_COLOR = {known: "var(--map-known)", partial: "var(--map-partial)",
                      dark: "var(--map-dark)"};
+const SIDE_COLOR = {a: "var(--map-a)", b: "var(--map-b)"};
 
 const esc = v => String(v == null ? "" : v)
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -297,38 +314,26 @@ function renderPreview() {
   return `<div class="preview">${head}${body}</div>`;
 }
 
-function renderMap(run) {
-  const open = mapRun === run.id;
-  const bar = `<div class="map-bar">
-      <span class="seg">${[["reference", "shared map"], ["run", "this run only"]]
-        .map(([m, label]) =>
-        `<button data-map="${esc(run.id)}" data-mode="${m}"
-          class="${open && mapMode === m ? "on" : ""}">${label}</button>`).join("")}</span>
-      ${open && mapData ? `<span>${mapData.n} proteins · ${mapData.shared_features}`
-        + `/${mapData.distinct_features} features shared `
-        + `(${Math.round(mapData.shared_frac * 100)}%)</span>` : ""}
-      ${open && mapData && mapData.reference
-        ? `<span class="key"><i style="background:var(--line)"></i>`
-          + `${mapData.reference.n} reference</span>` : ""}
-      ${open && mapData && mapData.mode === "run"
-        ? `<span class="msg err">fitted on this run alone — not comparable `
-          + `with other runs</span>` : ""}
-      ${open && mapData && mapData.reference && mapData.reference.version_drift
-        ? `<span class="msg err">reference built with different library `
-          + `versions</span>` : ""}
-      ${open && mapData ? Object.keys(GROUP_COLOR)
-        .filter(g => mapData.groups.includes(g))
-        .map(g => `<span class="key"><i style="background:${GROUP_COLOR[g]}"></i>${g}</span>`)
-        .join("") : ""}
-      ${mapHover ? `<span class="name">${esc(mapHover)}</span>` : ""}
-    </div>`;
-  if (!open) return `<div class="map">${bar}<p class="empty">Plot this run's
-    SAE features on the shared UMAP layout.</p></div>`;
-  if (mapErr) return `<div class="map">${bar}<p class="msg err">${esc(mapErr)}</p></div>`;
-  if (!mapData) return `<div class="map">${bar}<p class="empty">projecting…</p></div>`;
+// Drawing sample A and then sample B buries whichever was drawn first under
+// whichever is larger, which reads as "B is everywhere" no matter what is
+// there. Merge the two in proportion so occlusion falls evenly on both.
+function interleave(points) {
+  const a = points.filter(p => p.side === "a");
+  const b = points.filter(p => p.side === "b");
+  if (!a.length || !b.length) return points;
+  const out = [];
+  let i = 0, j = 0;
+  while (i < a.length || j < b.length) {
+    if (j >= b.length ||
+        (i < a.length && (i + 0.5) / a.length <= (j + 0.5) / b.length)) out.push(a[i++]);
+    else out.push(b[j++]);
+  }
+  return out;
+}
 
+function mapScatter(d, fill, label, opacity) {
   const W = 760, H = 420, pad = 26;
-  const all = mapData.points.concat(mapData.context || []);
+  const all = d.points.concat(d.context || []);
   const xs = all.map(p => p.x), ys = all.map(p => p.y);
   const x0 = Math.min(...xs), x1 = Math.max(...xs);
   const y0 = Math.min(...ys), y1 = Math.max(...ys);
@@ -339,17 +344,84 @@ function renderMap(run) {
   // grey reads unambiguously as "not this run". It was --line at 0.55, which
   // on the white panel was a contrast of about 1.05 against its own
   // background: present in the DOM and invisible on screen.
-  const ctx = (mapData.context || []).map(p =>
+  const ctx = (d.context || []).map(p =>
     `<circle cx="${sx(p.x).toFixed(1)}" cy="${sy(p.y).toFixed(1)}" r="1.6"
       fill="var(--map-context)" fill-opacity="0.4"/>`).join("");
-  const dots = mapData.points.map(p =>
+  const dots = interleave(d.points).map(p =>
     `<circle cx="${sx(p.x).toFixed(1)}" cy="${sy(p.y).toFixed(1)}" r="2.6"
-      fill="${GROUP_COLOR[p.group] || "var(--map-context)"}" fill-opacity="0.85"
+      fill="${fill(p)}" fill-opacity="${opacity}"
       stroke="var(--map-surface)" stroke-width="1"
-      data-dot="${esc(p.id)}${p.group ? " · " + esc(p.group) : ""}"><title>${esc(p.id)}${
-      p.group ? " (" + esc(p.group) + ")" : ""}</title></circle>`).join("");
-  return `<div class="map">${bar}<svg viewBox="0 0 ${W} ${H}"
-      role="img" aria-label="2D UMAP of SAE feature vectors">${ctx}${dots}</svg></div>`;
+      data-dot="${esc(label(p))}"><title>${esc(label(p))}</title></circle>`).join("");
+  return `<svg viewBox="0 0 ${W} ${H}" role="img"
+      aria-label="2D UMAP of SAE feature vectors">${ctx}${dots}</svg>`;
+}
+
+function renderMap(run) {
+  const open = mapRun === run.id;
+  const cmp = open ? mapB : null;
+  // Only a run that reached s06 has anything to draw.
+  const others = allRuns.filter(r => r.id !== run.id &&
+    (r.stages["s06_embed"] || {}).state === "done");
+  const by = open && mapData && mapData.samples
+    ? Object.fromEntries(mapData.samples.map(s => [s.side, s])) : null;
+  const thinned = by && mapData.samples.some(s => s.subsampled);
+
+  const bar = `<div class="map-bar">
+      <span class="seg">${[["reference", "shared map"],
+                           ["run", cmp ? "these two only" : "this run only"]]
+        .map(([m, label]) =>
+        `<button data-map="${esc(run.id)}" data-mode="${m}"
+          class="${open && mapMode === m ? "on" : ""}">${label}</button>`).join("")}</span>
+      ${others.length ? `<select data-cmp="${esc(run.id)}"
+          title="draw a second run's proteins in the same layout">
+          <option value="">compare with…</option>
+          ${others.map(r => `<option value="${esc(r.id)}"` +
+            `${r.id === cmp ? " selected" : ""}>${esc(r.sample)}</option>`).join("")}
+        </select>` : ""}
+      ${open && mapData ? `<span>${mapData.n} proteins · ${mapData.shared_features}`
+        + `/${mapData.distinct_features} features shared `
+        + `(${Math.round(mapData.shared_frac * 100)}%)</span>` : ""}
+      ${open && mapData && mapData.reference
+        ? `<span class="key"><i style="background:var(--line)"></i>`
+          + `${mapData.reference.n} reference</span>` : ""}
+      ${open && mapData && mapData.mode === "run"
+        ? `<span class="msg err">fitted on this run alone — not comparable `
+          + `with other runs</span>` : ""}
+      ${open && mapData && mapData.mode === "pair"
+        ? `<span class="msg err">fitted on these two alone — comparable with `
+          + `each other, with nothing else</span>` : ""}
+      ${open && mapData && mapData.reference && mapData.reference.version_drift
+        ? `<span class="msg err">reference built with different library `
+          + `versions</span>` : ""}
+      ${thinned ? `<span class="msg err">thinned to fit the plot — not every `
+        + `protein is drawn</span>` : ""}
+      ${open && mapData && by
+        ? ["a", "b"].map(s => `<span class="key"><i style="background:` +
+            `${SIDE_COLOR[s]}"></i>${esc(by[s].sample)} (${by[s].n})</span>`).join("")
+        : open && mapData ? Object.keys(GROUP_COLOR)
+            .filter(g => mapData.groups.includes(g))
+            .map(g => `<span class="key"><i style="background:${GROUP_COLOR[g]}"></i>${g}</span>`)
+            .join("") : ""}
+      ${mapHover ? `<span class="name">${esc(mapHover)}</span>` : ""}
+    </div>`;
+  if (!open) return `<div class="map">${bar}<p class="empty">Plot this run's
+    SAE features on the shared UMAP layout${others.length
+      ? `, on their own or against another run` : ""}.</p></div>`;
+  if (mapErr) return `<div class="map">${bar}<p class="msg err">${esc(mapErr)}</p></div>`;
+  if (!mapData) return `<div class="map">${bar}<p class="empty">projecting…</p></div>`;
+
+  // Colour by sample when two are drawn: six series (two samples x three
+  // classes) is more than a scatter can carry, and which sample a protein came
+  // from is the question the overlay exists to answer. The class stays in the
+  // hover text, so nothing is lost, only demoted.
+  const fill = by ? p => SIDE_COLOR[p.side] || "var(--map-context)"
+                  : p => GROUP_COLOR[p.group] || "var(--map-context)";
+  const label = by
+    ? p => `${p.id} · ${(by[p.side] || {}).sample || p.side}` +
+           (p.group ? ` · ${p.group}` : "")
+    : p => p.id + (p.group ? ` · ${p.group}` : "");
+  return `<div class="map">${bar}${mapScatter(mapData, fill, label,
+    by ? 0.7 : 0.85)}</div>`;
 }
 
 function renderDetail(run) {
@@ -383,12 +455,14 @@ async function loadArtifacts(runId) {
   delete pendingArtifacts[runId];
 }
 
-async function loadMap(runId, mode) {
-  if (mapRun === runId && mapMode === mode && (mapData || mapErr)) return;
-  mapRun = runId; mapMode = mode; mapData = null; mapErr = null; refresh();
+async function loadMap(runId, mode, b) {
+  b = b || null;
+  if (mapRun === runId && mapMode === mode && mapB === b && (mapData || mapErr)) return;
+  mapRun = runId; mapMode = mode; mapB = b; mapData = null; mapErr = null; refresh();
   try {
     mapData = await api(`/api/projection?run=${encodeURIComponent(runId)}` +
-                        `&mode=${encodeURIComponent(mode)}`);
+                        `&mode=${encodeURIComponent(mode)}` +
+                        (b ? `&b=${encodeURIComponent(b)}` : ""));
   } catch (e) { mapErr = e.message; }
   refresh();
 }
@@ -407,6 +481,7 @@ async function selectFile(run, stage, file) {
 
 function renderRuns(runs, jobs) {
   const el = $("runs");
+  allRuns = runs;
   if (!runs.length) {
     paint(el, '<p class="empty">No runs found in the work roots.</p>');
     return;
@@ -427,12 +502,23 @@ function renderRuns(runs, jobs) {
   if (!paint(el, html)) { if (openRun) loadArtifacts(openRun); return; }
   el.querySelectorAll(".run").forEach(n => n.onclick = () => {
     openRun = openRun === n.dataset.id ? null : n.dataset.id;
-    if (!openRun) { sel = null; selData = null; mapRun = null; mapData = null; }
+    if (!openRun) {
+      sel = null; selData = null; mapRun = null; mapB = null; mapData = null;
+    }
     refresh();
   });
   el.querySelectorAll("[data-map]").forEach(n => n.onclick = ev => {
     ev.stopPropagation();
-    loadMap(n.dataset.map, n.dataset.mode);
+    loadMap(n.dataset.map, n.dataset.mode,
+            mapRun === n.dataset.map ? mapB : null);
+  });
+  el.querySelectorAll("[data-cmp]").forEach(n => {
+    n.onclick = ev => ev.stopPropagation();     // do not collapse the run
+    n.onchange = ev => {
+      ev.stopPropagation();
+      loadMap(n.dataset.cmp, mapRun === n.dataset.cmp ? mapMode : "reference",
+              n.value || null);
+    };
   });
   el.querySelectorAll("circle[data-dot]").forEach(n => {
     n.onmouseenter = () => { mapHover = n.dataset.dot; refresh(); };

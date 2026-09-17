@@ -234,6 +234,34 @@ def _groups_from_classification(tsv: Path) -> dict[str, str]:
     return out
 
 
+def _fit_layout(m):
+    """The fallback fit, for when there is no reference map to borrow.
+
+    Same parameters as ``reference_map.build``, so a picture fitted here and
+    one transformed into the corpus differ by what they were fitted on and by
+    nothing else.
+    """
+    import umap
+    return umap.UMAP(n_components=2, metric="cosine", random_state=0,
+                     n_neighbors=max(2, min(15, m.shape[0] - 1)),
+                     min_dist=0.1).fit_transform(m)
+
+
+def _cap(ids, m, limit):
+    """Thin a sample to `limit` rows by a deterministic stride."""
+    if len(ids) <= limit:
+        return ids, m, False
+    step = -(-len(ids) // limit)                  # ceil, so the result fits
+    return ids[::step], m[::step], True
+
+
+def _points(ids, xy, groups: dict, side: str | None) -> list[dict]:
+    return [{"id": g, "x": round(float(xy[i][0]), 3),
+             "y": round(float(xy[i][1]), 3), "group": groups.get(g),
+             **({"side": side} if side else {})}
+            for i, g in enumerate(ids)]
+
+
 def _summarise(mf: Path) -> dict | None:
     try:
         d = json.loads(mf.read_text())
@@ -496,8 +524,11 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/artifacts":
             return self._artifacts((q.get("run") or [""])[0])
         if u.path == "/api/projection":
+            # `b` overlays a second run in the same layout. Optional, so the
+            # single-run URL is unchanged.
             return self._projection((q.get("run") or [""])[0],
-                                    (q.get("mode") or ["reference"])[0])
+                                    (q.get("mode") or ["reference"])[0],
+                                    (q.get("b") or [""])[0])
         if u.path == "/api/preview":
             try:
                 limit = int((q.get("limit") or ["0"])[0]) or PREVIEW_ROWS
@@ -604,27 +635,59 @@ class Handler(BaseHTTPRequestHandler):
                 self.cfg["reference_error"] = str(exc)
         return self.cfg["reference"]
 
-    def _projection(self, run_id: str, mode: str):
-        if mode not in ("reference", "run"):
-            return self._err(400, "mode must be reference or run")
-        try:
-            run_dir = self._run_dir(run_id)
-        except ValueError as exc:
-            return self._err(404, str(exc))
+    def _features(self, run_id: str):
+        """A run's s06 output as (dir, gene ids, L2-normalised sparse matrix).
 
+        ValueError means "no such run, or nothing to plot in it" and is the
+        caller's 404; ImportError is let through so a missing dependency is
+        reported as one rather than as a bad request.
+        """
+        run_dir = self._run_dir(run_id)
         found = sorted((run_dir / "s06_embed").glob("*.sae_features.parquet"))
         if not found:
-            return self._err(404, "this run has no s06_embed output")
+            raise ValueError(f"{run_dir.name} has no s06_embed output")
+        ids, m = sparse_features(found[0])
+        return run_dir, ids, normalise(m)
+
+    def _classes(self, run_dir: Path) -> dict[str, str]:
+        found = sorted((run_dir / "s05_prefilter").glob("*.classification.tsv"))
+        return _groups_from_classification(next(iter(found), run_dir / "missing"))
+
+    def _projection(self, run_id: str, mode: str, b_id: str = ""):
+        """One run's proteins in 2D, or two runs drawn in the same 2D.
+
+        The overlay is the reason the layout is fixed rather than fitted per
+        run: coordinates that mean the same thing across runs are what make two
+        samples drawn together readable rather than decorative.
+        """
+        if mode not in ("reference", "run"):
+            return self._err(400, "mode must be reference or run")
+        if b_id and b_id == run_id:
+            return self._err(400, "cannot compare a run with itself")
         try:
-            ids, m = sparse_features(found[0])
+            run_dir, ids, m = self._features(run_id)
+            other = self._features(b_id) if b_id else None
         except ImportError as exc:
             return self._err(501, f"projection needs scipy and pyarrow: {exc}")
+        except ValueError as exc:
+            return self._err(404, str(exc))
         except Exception as exc:
             return self._err(422, f"cannot read features: {exc}")
-        if len(ids) < 2:
-            return self._err(422, f"need at least 2 proteins, got {len(ids)}")
+        if len(ids) < 2 or (other is not None and len(other[1]) < 2):
+            return self._err(422, "need at least 2 proteins in each run")
 
-        m = normalise(m)
+        # Two samples can double the point count, so cap what is drawn - by a
+        # stride rather than a random draw, so the same pair always yields the
+        # same picture instead of reshuffling on every request.
+        limit = MAX_PROJECTION_POINTS // (2 if other else 1)
+        ids, m, cut_a = _cap(ids, m, limit)
+        cut_b = False
+        if other is not None:
+            b_dir, b_ids, b_m = other
+            b_ids, b_m, cut_b = _cap(b_ids, b_m, limit)
+
+        from scipy.sparse import vstack
+
         ref = self._reference() if mode == "reference" else None
         context: list = []
         try:
@@ -632,18 +695,26 @@ class Handler(BaseHTTPRequestHandler):
                 # Fixed layout: place these proteins in the corpus's space, so
                 # coordinates mean the same thing across runs and re-runs.
                 xy = ref["reducer"].transform(m)
+                b_xy = ref["reducer"].transform(b_m) if other is not None else None
                 used = "reference"
                 step = max(1, len(ref["ids"]) // MAX_CONTEXT_POINTS)
                 context = [{"x": round(float(x), 3), "y": round(float(y), 3)}
                            for x, y in ref["xy"][::step]]
+            elif other is not None:
+                # No shared layout to borrow, so fit one over exactly these two
+                # samples. That is internally comparable - the two sit in one
+                # space - and comparable with nothing else.
+                if len(ids) + len(b_ids) < 4:
+                    return self._err(422, "need at least 4 proteins across the "
+                                          "two runs to fit a layout")
+                both = _fit_layout(vstack([m, b_m]))
+                xy, b_xy = both[:len(ids)], both[len(ids):]
+                used = "pair"
             else:
-                import umap
                 if len(ids) < 4:
                     return self._err(422, "need at least 4 proteins to fit a "
                                           "layout; build a reference map instead")
-                xy = umap.UMAP(n_components=2, metric="cosine", random_state=0,
-                               n_neighbors=max(2, min(15, len(ids) - 1)),
-                               min_dist=0.1).fit_transform(m)
+                xy, b_xy = _fit_layout(m), None
                 used = "run"
         except ImportError:
             return self._err(501, "umap-learn is not installed in this "
@@ -652,18 +723,17 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             return self._err(422, f"projection failed: {exc}")
 
-        groups = _groups_from_classification(
-            next(iter(sorted((run_dir / "s05_prefilter").glob("*.classification.tsv"))),
-                 run_dir / "missing"))
-        points = [{"id": g, "x": round(float(xy[i][0]), 3),
-                   "y": round(float(xy[i][1]), 3), "group": groups.get(g)}
-                  for i, g in enumerate(ids)]
+        points = _points(ids, xy, self._classes(run_dir),
+                         "a" if other is not None else None)
+        if other is not None:
+            points += _points(b_ids, b_xy, self._classes(b_dir), "b")
 
         # With top-K over a 16,384-wide codebook two proteins may share no
         # features at all, and then the layout is noise. Say so rather than let
         # it be read as biology.
         import numpy as np
-        counts = np.bincount(m.tocoo().col, minlength=16384)
+        allm = vstack([m, b_m]) if other is not None else m
+        counts = np.bincount(allm.tocoo().col, minlength=16384)
         distinct = int((counts > 0).sum())
         shared = int((counts > 1).sum())
         body = {
@@ -673,6 +743,15 @@ class Handler(BaseHTTPRequestHandler):
             "distinct_features": distinct, "shared_features": shared,
             "shared_frac": round(shared / distinct, 3) if distinct else 0.0,
         }
+        if other is not None:
+            body["samples"] = [
+                {"side": "a", "run": run_id, "sample": run_dir.name,
+                 "n": len(ids), "subsampled": cut_a},
+                {"side": "b", "run": b_id, "sample": b_dir.name,
+                 "n": len(b_ids), "subsampled": cut_b},
+            ]
+        elif cut_a:
+            body["subsampled"] = True
         if ref is not None:
             body["reference"] = {
                 "n": ref["n"], "built": ref["built"],

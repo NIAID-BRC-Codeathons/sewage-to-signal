@@ -62,7 +62,7 @@ run plots it in 2D, coloured by the `s05` class — the same kind of picture as
 the ESM Atlas map, at a scale that needs no tiling.
 
 ```
-GET /api/projection?run=<id>&mode=reference|run
+GET /api/projection?run=<id>&mode=reference|run[&b=<id>]
 ```
 
 **UMAP only.** It is the one method here with a `transform`, and that is what
@@ -104,6 +104,38 @@ own have incomparable coordinates, which is the problem this exists to solve.
 It is gitignored on purpose: our corpus today is "whatever is in `work/`",
 which is not reproducible, so committing one would enshrine an arbitrary
 sample. A corpus worth sharing should be defined first.
+
+### Two samples at once
+
+`&b=<run id>` draws a second run's proteins in the same layout — the **compare
+with…** picker beside the mode buttons. This is what the fixed layout is *for*:
+two samples only overlay meaningfully if their coordinates already mean the
+same thing, which is exactly the property a per-run fit destroys.
+
+The overlay colours by **sample** rather than by s05 class. Two samples times
+three classes is six series, which a scatter of several thousand points cannot
+carry; the class stays in the hover text, so it is demoted rather than lost.
+The two sample colours are a separate pair from the class colours for the same
+reason — reusing "known" blue for sample A would make one swatch mean two
+different things across two modes of the same plot.
+
+Points are merged in proportion rather than drawn sample-by-sample. Drawing all
+of A and then all of B buries A under whichever sample is larger, and the
+picture then reads as "B is everywhere" regardless of what is there.
+
+With `mode=run` and a `b`, the fallback fits UMAP over **both** samples
+together rather than over one. That is a real comparison — the two sit in one
+space — but a private one: those coordinates match no other run and not the
+shared map either, and the panel says so. It is the honest option when there is
+no reference map to borrow.
+
+Two runs can double the point count, so the total drawn is capped
+(`MAX_PROJECTION_POINTS`) by a deterministic stride, and the panel says when it
+thinned. A stride rather than a random draw, so re-opening a comparison shows
+the same picture instead of reshuffling.
+
+A run has to have reached `s06_embed` to appear in the picker, and a run cannot
+be compared with itself.
 
 ### Reading it
 
