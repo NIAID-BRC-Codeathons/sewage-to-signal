@@ -184,9 +184,27 @@
      circles are never re-rendered and the layout cannot shift under the
      cursor. */
   .atlas svg{width:100%;height:auto;display:block;border:1px solid var(--line);
-             border-radius:5px;background:var(--map-surface)}
+             border-radius:5px;background:var(--map-surface);cursor:crosshair;
+             /* A drag is a selection, so the browser must not read it as a
+                text or image drag and hand back a ghost of the plot. */
+             user-select:none;-webkit-user-select:none}
   .atlas .bg circle{fill:var(--map-context);fill-opacity:.18}
   .atlas.hot .bg circle{fill-opacity:.07}
+  /* Selection. Rings rather than fills, so a selected point still shows the
+     colour the plot is coloured by underneath it - what was picked and what
+     it is are two different questions and the plot answers both at once. */
+  .atlas #atlas-sel circle{fill:none;stroke:var(--ink);stroke-width:1;
+                           stroke-opacity:.8}
+  .atlas .band{fill:var(--ink);fill-opacity:.06;stroke:var(--ink);
+               stroke-width:1;stroke-dasharray:3 3;stroke-opacity:.6;
+               pointer-events:none}
+  .pick{margin-top:8px;border-top:1px dashed var(--line);padding-top:8px}
+  .pick .map-bar{margin-bottom:6px}
+  .pick button{padding:3px 9px;font:11px var(--mono);font-weight:600}
+  .pick .seg button{font-weight:400}
+  .pick .ghost{background:var(--bg);color:var(--dim);border-color:var(--line)}
+  .pick .ghost:hover{color:var(--ink);border-color:var(--dim)}
+  .pick .seq{color:var(--dim)}
   .samples{display:flex;gap:4px;flex-wrap:wrap;margin:8px 0 6px}
   .samples .s{font:11px var(--mono);padding:3px 9px;border-radius:99px;
               border:1px solid var(--line);color:var(--dim);cursor:pointer;
@@ -1151,6 +1169,13 @@ async function loadPipeline() {
 // ---------------------------------------------------------------------------
 let atlasData = null, atlasErr = null, atlasColor = "", atlasHi = null,
     atlasPending = false, atlasStale = false;
+// Selecting on the atlas. `atlasSel` is indices into `atlasData.points`, which
+// is the same order the server derives from the store, so a pick travels as a
+// few kilobytes of integers rather than as thousands of gene ids. `atlasPick`
+// is what came back for it - the rows and their sequences.
+let atlasSel = null, atlasPick = null, atlasPickErr = null,
+    atlasPickPending = false, atlasPickView = "table", atlasDrag = null,
+    atlasPickNote = "";
 // Available layouts, from /api/maps. A layout is a file on disk, so this is
 // whatever has been built - nothing here names one.
 let MAPS = [], MAPS_DEFAULT = "", atlasMap = "";
@@ -1231,12 +1256,20 @@ function renderAtlas() {
            thing you were pointing at moved as you pointed at it. -->
       <div class="whatrow"><span id="atlas-what">${ATLAS_IDLE}</span></div>
       <svg viewBox="0 0 ${ATLAS_W} ${ATLAS_H}" role="img"
-           aria-label="Every SAE embedding in the store, one sample highlighted">
-        <g class="bg">${bg}</g><g id="atlas-hi"></g></svg>
+           aria-label="Every SAE embedding in the store, one sample highlighted;
+                       drag a box to select proteins">
+        <g class="bg">${bg}</g><g id="atlas-sel"></g><g id="atlas-hi"></g>
+        <rect id="atlas-band" class="band" x="0" y="0" width="0" height="0"/>
+      </svg>
       <div class="map-bar" id="atlas-legend">${renderLegend(d)}</div>
+      <!-- Painted on its own, never as part of the markup above: selecting
+           must not re-render 30,000 background circles. -->
+      <div class="pick" id="atlas-pick"></div>
     </div>`);
   bindAtlas();
   if (atlasHi != null) lightSample(atlasHi);
+  drawPicked();
+  renderPick();
 }
 
 // Hover is a write to one element, not a re-render, so it stays instant even
@@ -1251,6 +1284,7 @@ function lightSample(i) {
     layer.innerHTML = "";
     plot.classList.remove("hot");
     $("atlas-what").textContent = ATLAS_IDLE;
+    if (!atlasSel) renderPick();     // the "select all of …" offer goes with it
     return;
   }
   const {sx, sy} = atlasScale(d);
@@ -1266,6 +1300,10 @@ function lightSample(i) {
   $("atlas-what").textContent =
     `${d.samples[i]} — ${d.counts[i]} embeddings` +
     (d.color ? `, coloured by ${d.color}` : "");
+  // Only while nothing is selected: the panel is then one line, and rebuilding
+  // it on hover is a diffed write to one element. With a selection on it, it
+  // holds a table, and hovering a chip has no business rebuilding that.
+  if (!atlasSel) renderPick();
 }
 
 function bindAtlas() {
@@ -1296,17 +1334,300 @@ function bindAtlas() {
   };
   const again = $("atlas-rebuild");
   if (again) again.onclick = () => { atlasStale = false; loadAtlas(true); };
+  // Two handlers on the <svg>, never any on the circles inside it: one
+  // listener costs nothing and 30,000 cost the first paint. The mouseup that
+  // ends the drag is on the window, registered once - see below - because a
+  // box drawn from near the edge usually ends outside the plot.
+  const svg = $("atlas").querySelector("svg");
+  if (svg) {
+    svg.onmousedown = e => {
+      if (e.button !== 0) return;
+      const at = atlasAt(e);
+      if (!at) return;
+      atlasDrag = {from: at, to: at, add: e.shiftKey};
+      drawBand();
+      e.preventDefault();          // or the browser drags a ghost of the plot
+    };
+    svg.onmousemove = e => {
+      if (!atlasDrag) return;
+      atlasDrag.to = atlasAt(e) || atlasDrag.to;
+      drawBand();
+    };
+  }
+}
+
+// Registered once against the window rather than per render against the plot,
+// so a drag that leaves the plot still lands and repainting the atlas does not
+// stack another listener on every pass.
+window.addEventListener("mouseup", e => {
+  if (!atlasDrag) return;
+  const drag = atlasDrag;
+  atlasDrag = null;
+  drag.to = atlasAt(e) || drag.to;
+  drawBand();
+  pickBox(drag);
+});
+window.addEventListener("keydown", e => {
+  if (e.key === "Escape" && atlasSel) clearPick();
+});
+
+// ---------------------------------------------------------------------------
+// Selecting on the atlas.
+//
+// The pick itself never leaves the browser: every point is already here, so a
+// rectangle is a loop over an array, not a request. What the server is asked
+// for is the one thing the plot does not carry - the amino acid sequences, and
+// the columns the gene level holds about each protein.
+//
+// Indices into `atlasData.points` are what travels, because the server builds
+// the same order from the store at the same snapshot. The snapshot goes with
+// them, so a selection made against an atlas the store has since moved past is
+// refused rather than answered with a different set of proteins.
+// ---------------------------------------------------------------------------
+// Below this, in viewBox units, a drag is a click. Without it every stray
+// click on the plot would select whatever single point sat under the cursor.
+const DRAG_MIN = 4;
+
+function atlasAt(e) {
+  const svg = $("atlas") && $("atlas").querySelector("svg");
+  if (!svg) return null;
+  const r = svg.getBoundingClientRect();
+  if (!r.width || !r.height) return null;
+  return [(e.clientX - r.left) / r.width * ATLAS_W,
+          (e.clientY - r.top) / r.height * ATLAS_H];
+}
+
+// One element, four attributes, per mousemove. Rendering the band as markup
+// would put it through paint() and rebuild the panel under the cursor.
+function drawBand() {
+  const el = $("atlas-band");
+  if (!el) return;
+  if (!atlasDrag) {
+    el.setAttribute("width", 0); el.setAttribute("height", 0);
+    return;
+  }
+  const [a, b] = [atlasDrag.from, atlasDrag.to];
+  el.setAttribute("x", Math.min(a[0], b[0]).toFixed(1));
+  el.setAttribute("y", Math.min(a[1], b[1]).toFixed(1));
+  el.setAttribute("width", Math.abs(a[0] - b[0]).toFixed(1));
+  el.setAttribute("height", Math.abs(a[1] - b[1]).toFixed(1));
+}
+
+// Rings, into their own layer, so the sample highlight and the colour under a
+// point both survive being selected.
+function drawPicked() {
+  const layer = $("atlas-sel"), d = atlasData;
+  if (!layer) return;
+  if (!d || !atlasSel || !atlasSel.length) { layer.innerHTML = ""; return; }
+  const {sx, sy} = atlasScale(d);
+  layer.innerHTML = atlasSel.map(i => {
+    const p = d.points[i];
+    return p ? `<circle cx="${sx(p.x).toFixed(1)}" cy="${sy(p.y).toFixed(1)}"`
+      + ` r="2.5"/>` : "";
+  }).join("");
+}
+
+function setPick(indices, add) {
+  atlasPickNote = "";
+  if (add && atlasSel) {
+    const all = new Set(atlasSel);
+    for (const i of indices) all.add(i);
+    atlasSel = [...all].sort((m, n) => m - n);
+  } else {
+    atlasSel = indices;
+  }
+  atlasPick = null; atlasPickErr = null;
+  drawPicked();
+  if (atlasSel.length) loadPick(); else renderPick();
+}
+
+function clearPick(note) {
+  atlasSel = null; atlasPick = null; atlasPickErr = null;
+  atlasPickPending = false;
+  atlasPickNote = note || "";
+  drawPicked();
+  renderPick();
+}
+
+function pickBox(drag) {
+  const d = atlasData;
+  if (!d) return;
+  const [a, b] = [drag.from, drag.to];
+  const x0 = Math.min(a[0], b[0]), x1 = Math.max(a[0], b[0]);
+  const y0 = Math.min(a[1], b[1]), y1 = Math.max(a[1], b[1]);
+  // A click clears. It is the first thing anyone tries to get out of a
+  // selection, and an empty box would be a strange thing to have selected.
+  if (x1 - x0 < DRAG_MIN && y1 - y0 < DRAG_MIN) return clearPick();
+  const {sx, sy} = atlasScale(d);
+  const hit = [];
+  for (let i = 0; i < d.points.length; i++) {
+    const p = d.points[i], px = sx(p.x), py = sy(p.y);
+    if (px >= x0 && px <= x1 && py >= y0 && py <= y1) hit.push(i);
+  }
+  // An empty box over a sparse patch is the one outcome that otherwise looks
+  // like a broken control: the panel would go back to its hint and read as
+  // "nothing happened". Say which it was.
+  if (!hit.length && !(drag.add && atlasSel && atlasSel.length))
+    return clearPick("nothing in that box");
+  setPick(hit, drag.add);
+}
+
+function pickRequest(indices) {
+  return {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    // `limit` as well as the snapshot: the cap decides which proteins are on
+    // the plot at all, so a selection resolved against a different one would
+    // resolve to different proteins.
+    body: JSON.stringify({indices, snapshot: atlasData.snapshot,
+                          limit: atlasData.limit}),
+  };
+}
+
+async function loadPick() {
+  const want = atlasSel;
+  if (!want || !want.length || !atlasData) return;
+  atlasPickPending = true; atlasPickErr = null;
+  renderPick();
+  try {
+    const got = await api("/api/selection", pickRequest(want));
+    if (atlasSel !== want) return;          // a newer box is already in flight
+    atlasPick = got;
+  } catch (e) {
+    if (atlasSel !== want) return;
+    atlasPick = null; atlasPickErr = e.message;
+  }
+  atlasPickPending = false;
+  renderPick();
+}
+
+// A POST, because the selection is a list rather than something that fits in a
+// URL, and the answer is a file rather than JSON - so it goes around api().
+async function downloadPick(btn) {
+  if (!atlasSel || !atlasSel.length) return;
+  const was = btn.textContent;
+  btn.disabled = true; btn.textContent = "preparing…";
+  try {
+    const r = await fetch("/api/selection?format=fasta", pickRequest(atlasSel));
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      throw new Error(d.error || ("HTTP " + r.status));
+    }
+    const url = URL.createObjectURL(await r.blob());
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `atlas-selection-${atlasSel.length}.faa`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    btn.disabled = false; btn.textContent = was;
+  } catch (e) {
+    atlasPickErr = e.message;
+    renderPick();                    // replaces the button, so nothing to undo
+  }
+}
+
+function renderPick() {
+  const el = $("atlas-pick");
+  if (!el) return;
+  if (!atlasSel || !atlasSel.length) {
+    // The empty state is the only place this says it exists: a plot gives no
+    // sign that dragging on it does anything.
+    const lit = atlasHi != null && atlasData
+      ? `<button id="pick-sample" class="ghost">select all of ` +
+        `${esc(atlasData.samples[atlasHi])}</button>` : "";
+    const said = atlasPickNote ? `<b>${esc(atlasPickNote)}</b>` : "";
+    paint(el, `<div class="map-bar">${said}<span>drag a box on the plot to ` +
+      `select proteins and read or download their sequences — shift-drag adds ` +
+      `to a selection, a click clears it</span>${lit}</div>`);
+    return bindPick();
+  }
+  const d = atlasPick;
+  const head = `<div class="map-bar"><b>${atlasSel.length} selected</b>` +
+    (d ? d.samples.map(s =>
+      `<span>${esc(s.name)} ${s.n}</span>`).join("") : "") +
+    `<span class="seg">` +
+      `<button data-view="table"${atlasPickView === "table" ? ' class="on"' : ""}>` +
+      `table</button><button data-view="fasta"` +
+      `${atlasPickView === "fasta" ? ' class="on"' : ""}>fasta</button></span>` +
+    `<button id="pick-dl">download FASTA</button>` +
+    `<button id="pick-clear" class="ghost">clear</button></div>`;
+
+  let body;
+  if (atlasPickErr) {
+    body = `<p class="msg err">${esc(atlasPickErr)}</p>`;
+  } else if (!d) {
+    body = `<p class="empty">reading the sequences&hellip;</p>`;
+  } else {
+    // What the panel is not showing is as much a part of the answer as what
+    // it is: a box over a thinned atlas selects the points drawn, not every
+    // protein in the region, and the download is not capped where the table
+    // is.
+    const notes = [];
+    if (d.truncated)
+      notes.push(`showing the first ${d.shown} of ${d.n} — the download ` +
+        `carries up to ${d.fasta_cap.toLocaleString()}`);
+    if (d.missing)
+      notes.push(`${d.missing} have no stored sequence`);
+    if (d.thinned)
+      notes.push(`the atlas is thinned, so a box selects the points drawn ` +
+        `rather than every protein in the region`);
+    const note = notes.length
+      ? `<div class="map-bar"><span>${notes.map(esc).join(" · ")}</span></div>`
+      : "";
+    if (atlasPickView === "fasta") {
+      body = note + `<div class="scroll" data-key="pick-fasta"><pre>` +
+        `${esc(d.fasta || "")}</pre></div>`;
+    } else {
+      body = note + `<div class="scroll" data-key="pick-table"><table><tr>` +
+        d.columns.map(c => `<th>${esc(c)}</th>`).join("") + `</tr>` +
+        d.rows.map(r => `<tr>` + d.columns.map(c =>
+          `<td title="${esc(r[c])}"${c === "seq" ? ' class="seq"' : ""}>` +
+          `${esc(r[c] == null ? "—" : r[c])}</td>`).join("") +
+          `</tr>`).join("") + `</table></div>`;
+    }
+  }
+  paint(el, head + body);
+  bindPick();
+}
+
+function bindPick() {
+  const el = $("atlas-pick");
+  if (!el) return;
+  el.querySelectorAll("[data-view]").forEach(b => {
+    b.onclick = () => { atlasPickView = b.dataset.view; renderPick(); };
+  });
+  const dl = $("pick-dl");
+  if (dl) dl.onclick = () => downloadPick(dl);
+  const clr = $("pick-clear");
+  if (clr) clr.onclick = () => clearPick();
+  // The one selection a drag cannot make comfortably: a whole sample, whose
+  // points are scattered across the layout by construction.
+  const all = $("pick-sample");
+  if (all) all.onclick = () => {
+    const i = atlasHi;
+    if (i == null || !atlasData) return;
+    const hit = [];
+    atlasData.points.forEach((p, j) => { if (p.i === i) hit.push(j); });
+    setPick(hit, false);
+  };
 }
 
 async function loadAtlas(force) {
   if (atlasPending || (atlasData && !force)) return;
   atlasPending = true;
+  const was = atlasData && atlasData.snapshot;
   try {
     const q = new URLSearchParams();
     if (atlasColor) q.set("color", atlasColor);
     if (atlasMap) q.set("map", atlasMap);
     atlasData = await api("/api/atlas" + (q.toString() ? "?" + q : ""));
     atlasErr = null; atlasStale = false;
+    // A selection is indices into a point set. Recolouring or re-projecting
+    // keeps that set, so the selection survives both; a new snapshot does not,
+    // and holding on to it would mean selected rings drawn over proteins
+    // nobody picked.
+    if (was != null && atlasData.snapshot !== was) clearPick();
   } catch (e) {
     atlasErr = e.message; atlasData = null;
   }

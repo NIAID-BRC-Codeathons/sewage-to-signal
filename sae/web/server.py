@@ -125,6 +125,16 @@ MAX_PROJECTION_POINTS = 20000
 # not the store's: these are plain SVG circles with no handlers, and past
 # roughly this many the first paint starts to drag.
 MAX_ATLAS_POINTS = 30000
+# Selecting on the atlas. A drag is resolved in the browser and arrives here
+# as indices into the layout the browser was handed - not as gene ids and not
+# as a predicate. The ids behind those indices are derived from the store
+# deterministically at a snapshot, so index `i` means the same protein on both
+# sides for as long as that snapshot holds; the request carries the snapshot so
+# a stale one is refused rather than answered with the wrong proteins. It also
+# keeps a 30,000-point selection to a few kilobytes of integers.
+MAX_SELECTION_SHOWN = 200        # rows sent back for the panel to display
+MAX_SELECTION_FASTA = 20000      # sequences one download may carry
+SELECT_CHUNK = 500               # gene ids per IN list, so the SQL stays sane
 # How many projections to keep placed at once, so switching between them is
 # free after the first visit to each.
 # Enough for every layout on disk plus "fit on this cohort", so a demo can
@@ -371,6 +381,32 @@ def _points(ids, xy, rows: dict, column: str | None, domain: dict | None,
             p["side"] = side
         out.append(p)
     return out
+
+
+def _fasta_record(row: dict, names: list[str], width: int = 60) -> str:
+    """One FASTA record for a selected protein, wrapped like the pipeline's.
+
+    The header is ``sample|gene_id`` followed by every non-empty column the
+    gene level holds, as ``key=value``. Listing them all rather than a chosen
+    few is the same rule the rest of this server follows: nothing here knows
+    what a stage's columns mean, so a download from a store with a taxon call
+    in it carries the taxon call without anyone adding it.
+
+    Whitespace is stripped from values because it would split the header into
+    fields that were never there.
+    """
+    fields = []
+    for n in names:
+        if n == "gene_id" or row.get(n) is None:
+            continue
+        v = "_".join(str(row[n]).split())
+        if v:
+            fields.append(f"{n}={v}")
+    seq = row["seq"]
+    head = f">{row['sample']}|{row['gene_id']}"
+    lines = [head + (" " + " ".join(fields) if fields else "")]
+    lines += [seq[i:i + width] for i in range(0, len(seq), width)]
+    return "\n".join(lines) + "\n"
 
 
 def _summarise(mf: Path) -> dict | None:
@@ -711,11 +747,18 @@ class Handler(BaseHTTPRequestHandler):
             super().log_message(fmt, *args)
 
     # -- helpers
-    def _send(self, code: int, body: bytes, ctype: str):
+    def _send(self, code: int, body: bytes, ctype: str,
+              filename: str | None = None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if filename:
+            # The one response meant to become a file on disk rather than a
+            # value in the page. The name is composed here, never echoed from
+            # the request, so there is nothing in it to escape.
+            self.send_header("Content-Disposition",
+                             f'attachment; filename="{filename}"')
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
@@ -842,6 +885,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._upload((q.get("name") or [""])[0])
         if u.path == "/api/run":
             return self._launch()
+        if u.path == "/api/selection":
+            # A read, so no write guard: it resolves picked points to the rows
+            # behind them and hands back their sequences.
+            return self._selection((q.get("format") or ["json"])[0])
         if u.path == "/api/cancel":
             if not self._guard_writes():
                 return
@@ -1334,6 +1381,152 @@ class Handler(BaseHTTPRequestHandler):
             "samples": samples, "counts": counts,
             "color": column, "domain": domain, "columns": usable,
             "thinned": built["thinned"],
+            # Echoed so a selection can name the layout it was made on. The
+            # cap is what decides which proteins are in `points` at all, so a
+            # selection resolved against a different one would resolve to
+            # different proteins.
+            "limit": limit,
+        })
+
+    def _gene_seqs(self, keys: list[str]) -> dict[str, str]:
+        """key -> amino acid sequence, read from the store a chunk at a time.
+
+        ``seq`` is the one gene column the atlas deliberately does not cache:
+        it is megabytes of amino acids that nothing on the plot can show, and
+        it is wanted only for the handful of proteins a selection covers. So
+        it is fetched here, per selection, rather than carried by every point.
+
+        Keyed by sample because ``gene_id`` is unique only within one - two
+        samples can both hold a ``gene_1``, and a query that forgot the sample
+        would hand back the wrong protein's sequence.
+        """
+        by_sample: dict[str, list[str]] = {}
+        for k in keys:
+            sample, _, gene = k.partition(metadata.KEY_SEP)
+            by_sample.setdefault(sample, []).append(gene)
+        out: dict[str, str] = {}
+        with lake.read(self.cfg["lake"], budget=10) as con:
+            for sample, gids in by_sample.items():
+                for i in range(0, len(gids), SELECT_CHUNK):
+                    lits = ", ".join("'" + g.replace("'", "''") + "'"
+                                     for g in gids[i:i + SELECT_CHUNK])
+                    t = entities.select(con, "gene", where=f"gene_id IN ({lits})",
+                                        columns=["gene_id", "seq"], sample=sample)
+                    for gid, seq in zip(t.column("gene_id").to_pylist(),
+                                        t.column("seq").to_pylist()):
+                        if seq:
+                            out[metadata.cohort_key(sample, gid)] = seq
+        return out
+
+    def _selection(self, fmt: str):
+        """Picked atlas points, resolved to the rows and sequences behind them.
+
+        Two shapes from one route, because they answer the same question at
+        two sizes: ``json`` is what the panel shows - a couple of hundred rows
+        with every column the gene level carries - and ``fasta`` is the whole
+        selection as a file. Splitting them into two routes would have meant
+        two copies of the index-to-protein resolution, which is the only part
+        that can go subtly wrong.
+        """
+        if entities is None:
+            return self._err(503, "the pipeline registry is unavailable")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            return self._err(400, "body must be JSON")
+        if not isinstance(body, dict):
+            return self._err(400, "body must be a JSON object")
+        raw = body.get("indices")
+        if not isinstance(raw, list) or not raw:
+            return self._err(400, "indices must be a non-empty array")
+        if len(raw) > MAX_ATLAS_POINTS:
+            return self._err(413, "more indices than the atlas has points")
+        try:
+            limit = int(body.get("limit") or MAX_ATLAS_POINTS)
+        except (TypeError, ValueError):
+            limit = MAX_ATLAS_POINTS
+        limit = max(500, min(limit, MAX_ATLAS_POINTS))
+
+        try:
+            stamp, ids, _m, thinned, descs, rows = self._atlas_data(limit)
+        except ValueError as exc:
+            return self._err(404, str(exc))
+        except ImportError as exc:
+            return self._err(501, f"the atlas needs scipy and umap-learn: {exc}")
+        except Exception as exc:
+            return self._err(422, f"cannot read the atlas: {exc}")
+
+        # A selection is only meaningful against the point set it was drawn
+        # on. Refusing a stale one is the whole reason the snapshot travels
+        # with it: silently answering would hand back other proteins.
+        want = body.get("snapshot")
+        if want is not None and want != stamp:
+            return self._err(409, "the store has changed since this atlas was "
+                                  "drawn - rebuild it and select again")
+
+        keys, seen = [], set()
+        for i in raw:
+            try:
+                j = int(i)
+            except (TypeError, ValueError):
+                return self._err(400, "indices must be integers")
+            if not 0 <= j < len(ids):
+                return self._err(400, "an index is outside this atlas")
+            if ids[j] not in seen:                # a box may be added twice
+                seen.add(ids[j])
+                keys.append(ids[j])
+
+        # Over every picked point, not just the ones sent back: a box that
+        # covers 4,000 proteins should say which samples they came from even
+        # though the panel shows 200 of them.
+        tally: dict[str, int] = {}
+        for k in keys:
+            name = k.partition(metadata.KEY_SEP)[0]
+            tally[name] = tally.get(name, 0) + 1
+        samples = [{"name": s, "n": n} for s, n in
+                   sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+        cap = MAX_SELECTION_FASTA if fmt == "fasta" else MAX_SELECTION_SHOWN
+        shown = keys[:cap]
+        try:
+            seqs = self._gene_seqs(shown)
+        except Exception as exc:
+            return self._err(503, f"cannot read the store: {exc}")
+
+        # Every column the gene level carries, in the store's own order, plus
+        # the two the atlas drops from its cache - `sample`, which the point
+        # carried instead, and `seq`, which is what all of this is for. No
+        # column is named here, so a stage added tomorrow is another column in
+        # the table and another field in the FASTA header with no change.
+        names = [d["name"] for d in descs]
+        out = []
+        for k in shown:
+            sample, _, gene = k.partition(metadata.KEY_SEP)
+            row = dict(rows.get(k) or {})
+            row.pop("sample", None)
+            r = {"sample": sample, **{n: row.get(n) for n in names},
+                 "seq": seqs.get(k)}
+            if r.get("gene_id") is None:       # no gene row behind the point
+                r["gene_id"] = gene
+            out.append(r)
+        missing = sum(1 for r in out if not r["seq"])
+
+        text = "".join(_fasta_record(r, names) for r in out if r["seq"])
+        if fmt == "fasta":
+            return self._send(200, text.encode(), "text/x-fasta; charset=utf-8",
+                              filename=f"atlas-selection-{len(out) - missing}.faa")
+        return self._json({
+            "snapshot": stamp, "limit": limit, "n": len(keys),
+            "shown": len(out), "truncated": len(keys) > len(out),
+            "cap": cap, "fasta_cap": MAX_SELECTION_FASTA,
+            "thinned": thinned, "missing": missing, "samples": samples,
+            "columns": ["sample", *names, "seq"], "rows": out,
+            # The same records the download would carry, for the rows sent.
+            # Rendered once, here, so what the page shows and what lands on
+            # disk cannot drift apart - the alternative was a second FASTA
+            # writer in JavaScript that had to agree with this one.
+            "fasta": text,
         })
 
     def _projection(self, run_id: str, mode: str, b_id: str = "",

@@ -126,6 +126,44 @@ threadsafe: two projections at once terminate the process rather than merely
 contending. This is a `ThreadingHTTPServer`, so two tabs are enough. Every
 layout goes through one lock.
 
+### Selecting on it
+
+Dragging a box on the atlas selects the points inside it; shift-drag adds a
+second box, a click clears, and `Escape` clears. `POST /api/selection` turns
+that into the rows behind those points — every column the gene level carries,
+plus the amino acid sequences — as JSON for the panel or, with `?format=fasta`,
+as a download.
+
+**The pick never leaves the browser.** Every point is already there, so a
+rectangle is a loop over an array rather than a request; what the server is
+asked for is the one thing the plot does not carry. `seq` is deliberately not in
+the atlas's cached metadata: it is megabytes of amino acids nothing on the plot
+can show, wanted only for the handful of proteins a selection covers.
+
+**What travels is indices**, not gene ids and not a predicate. The ids behind
+them are derived from the store deterministically at a snapshot, so index `i`
+means the same protein on both sides — and a 30,000-point selection stays a few
+kilobytes of integers. The request carries the snapshot and the point cap with
+it, because both decide which proteins are in the layout at all; a selection
+made against an atlas the store has since moved past is refused rather than
+answered with different proteins. Recolouring or re-projecting keeps the point
+set, so a selection survives both.
+
+The panel shows the first 200 rows and the download carries up to 20,000. The
+FASTA the panel displays is rendered by the server, in the same call, from the
+same function the download uses — the alternative was a second FASTA writer in
+JavaScript that had to agree with this one. Headers are `sample|gene_id`
+followed by every non-empty gene column as `key=value`, which is the same rule
+the rest of this server follows: nothing here knows what a stage's columns mean,
+so a store with a taxon call in it downloads with the taxon call in the header
+and no one had to add it.
+
+A box over a thinned atlas selects the points *drawn*, not every protein in the
+region, and the panel says so rather than leaving it to be assumed. Selecting a
+whole sample is the one pick a drag cannot make comfortably — its points are
+scattered across the layout by construction — so lighting a sample offers a
+button for it.
+
 ## The feature map
 
 `s06` writes long-format `(gene_id, feature_id, activation)` with top-K per
@@ -470,8 +508,11 @@ bound to localhost, and should not be exposed. Beyond that:
 | `GET /api/plan?have=&want=&skip=` | the stages that would run, from the driver's own planner |
 | `GET /api/artifacts?run=` | files in each stage directory, with shape and size |
 | `GET /api/projection?run=&mode=&b=&color=&filter=` | the feature map: layout, colour domain, filterable columns |
+| `GET /api/atlas?color=&limit=&map=` | every embedding in the store in one layout, with the snapshot and cap a selection has to quote back |
+| `GET /api/maps` | the layouts on disk, and which one is the default |
 | `GET /api/preview?run=&stage=&file=&limit=` | one artifact as text, table or json |
 | `GET /api/log?id=` | tail of a job's log |
 | `GET /api/script?id=` | the script the job was run as |
 | `POST /api/upload?name=` | raw body is the file; no multipart, so no `cgi` |
 | `POST /api/run` | JSON `{sample, input_kind, input_path, input_path2?, target?, params?, where?, only?, skip?, force?}` — `params` and `where` are keyed by stage name |
+| `POST /api/selection[?format=fasta]` | JSON `{indices, snapshot?, limit?}` — atlas points resolved to their gene rows and sequences; `format=fasta` returns the whole selection as a download |
