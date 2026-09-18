@@ -42,7 +42,7 @@ HERE = Path(__file__).resolve().parent
 
 # Modules that are infrastructure rather than stages.
 _NOT_STAGES = {"common", "entities", "lake", "stage", "run", "backfill",
-               "import_projection"}
+               "import_projection", "import_features"}
 
 
 @dataclass(frozen=True)

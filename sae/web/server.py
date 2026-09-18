@@ -321,12 +321,17 @@ def _transform(ref, m):
 
 
 def _cap_per_sample(ids, m, limit):
-    """Thin to `limit` rows while keeping every sample represented.
+    """Thin to `limit` rows, sharing the budget fairly between samples.
 
-    A flat stride over the cohort would thin each sample in proportion to its
-    size, which is fine until the smallest sample rounds to nothing. Here the
-    budget is shared out proportionally with a floor, so a nine-gene sample
-    still appears.
+    Proportional shares do not work once one sample dwarfs the rest: a 522,000
+    peptide run against four of a couple of thousand takes 95% of the budget
+    and the others land on a floor of 200, which is not a view of a cohort.
+
+    So: water-filling. Every sample gets an equal share; whatever a small
+    sample cannot use is redistributed among the ones that can. Small samples
+    come through whole and the large ones are thinned to fit, which is the way
+    round you want - the giant sample is the one that loses least by being
+    sampled.
     """
     import numpy as np
 
@@ -335,16 +340,23 @@ def _cap_per_sample(ids, m, limit):
     groups: dict[str, list[int]] = {}
     for i, key in enumerate(ids):
         groups.setdefault(key.split("\x1f", 1)[0], []).append(i)
-    floor = min(200, limit // max(1, len(groups)))
+
+    budget, remaining = limit, sorted(groups.values(), key=len)
+    quota: dict[int, int] = {}
+    for n_left, members in enumerate(remaining):
+        share = budget // (len(remaining) - n_left)
+        take = min(len(members), share)
+        quota[id(members)] = take
+        budget -= take
+
     keep: list[int] = []
-    for members in groups.values():
-        share = min(len(members), max(floor, round(limit * len(members) / len(ids))))
-        if share >= len(members):
+    for members in remaining:
+        take = quota[id(members)]
+        if take >= len(members):
             keep.extend(members)
             continue
-        # Evenly spaced picks rather than a stride: a stride can only halve,
-        # so asking for 93% of a sample would hand back 50%.
-        pick = np.unique(np.linspace(0, len(members) - 1, share).round().astype(int))
+        # Evenly spaced picks rather than a stride: a stride can only halve.
+        pick = np.unique(np.linspace(0, len(members) - 1, take).round().astype(int))
         keep.extend(members[i] for i in pick)
     keep.sort()
     return [ids[i] for i in keep], m[np.asarray(keep)], True
@@ -1364,17 +1376,17 @@ class Handler(BaseHTTPRequestHandler):
             return None
         import numpy as np
 
-        xy, miss = np.zeros((len(ids), 2), dtype=np.float32), 0
+        xy = np.zeros((len(ids), 2), dtype=np.float32)
+        placed = np.zeros(len(ids), dtype=bool)
         for i, key in enumerate(ids):
             sample, _, gene = key.partition(metadata.KEY_SEP)
             hit = found.get((sample, gene))
-            if hit is None:
-                miss += 1
-            else:
+            if hit is not None:
                 xy[i] = (hit[0], hit[1])
-        if miss == len(ids):
+                placed[i] = True
+        if not placed.any():
             return None                      # names nothing we are drawing
-        return xy, miss
+        return xy, placed
 
     def _atlas_layout(self, limit: int, map_name: str | None = None):
         """Coordinates for one layout. Only this part differs between maps."""
@@ -1384,11 +1396,18 @@ class Handler(BaseHTTPRequestHandler):
         hit = cache.get(ckey)
         missing = 0
         if hit and hit[0] == stamp:
-            xy, mode, missing = hit[1]
+            ids, xy, mode, missing = hit[1]
         else:
             stored = self._stored_xy(map_name or "", ids)
             if stored is not None:
-                xy, missing = stored
+                xy, placed = stored
+                missing = int((~placed).sum())
+                if missing:
+                    # Drop them rather than drawing them at the origin, where
+                    # tens of thousands of unplaced points read as a dense
+                    # cluster that is not there. The count is reported instead.
+                    ids = [k for k, ok in zip(ids, placed) if ok]
+                    xy = xy[placed]
                 mode = "stored"
             else:
                 ref = None if map_name == "fit" else self._reference(map_name)
@@ -1403,7 +1422,7 @@ class Handler(BaseHTTPRequestHandler):
             # and re-transforming 30,000 points into a dense map costs a
             # minute - paying that on every toggle would make the comparison
             # not worth making. Coordinates only, so each entry is small.
-            cache[ckey] = (stamp, (xy, mode, missing))
+            cache[ckey] = (stamp, (ids, xy, mode, missing))
             for old in list(cache)[:-ATLAS_CACHE_KEEP]:
                 cache.pop(old, None)
 
