@@ -41,7 +41,8 @@ from entities import FILE_KINDS, LEVELS, is_level
 HERE = Path(__file__).resolve().parent
 
 # Modules that are infrastructure rather than stages.
-_NOT_STAGES = {"common", "entities", "lake", "stage", "run", "backfill"}
+_NOT_STAGES = {"common", "entities", "lake", "stage", "run", "backfill",
+               "import_projection"}
 
 
 @dataclass(frozen=True)

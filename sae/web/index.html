@@ -1132,6 +1132,11 @@ async function loadMaps() {
     const d = await api("/api/maps");
     MAPS = (d.maps || []).filter(m => !m.error);
     MAPS_DEFAULT = d.default || "";
+    // The atlas can finish drawing before this list arrives - it is a join
+    // against the store now, so it is fast - and the picker would then be
+    // stuck showing only "fit on this cohort". Redraw once the layouts are
+    // known.
+    if (atlasData) renderAtlas();
   } catch { MAPS = []; }
 }
 
@@ -1214,6 +1219,9 @@ function renderAtlas() {
     const what = m.sources && m.sources.length > 1
       ? ` · ${m.sources.map(x => x.name.replace(/\.parquet$/, "")).join(" + ")}`
       : "";
+    // How many of the points it can place by lookup rather than by
+    // transforming - the difference between instant and a minute.
+    const cohort = m.by_role && m.by_role.cohort;
     return `<option value="${esc(m.name)}"${m.name === (d.map || MAPS_DEFAULT)
       ? " selected" : ""}>${esc(m.name)} (${m.n.toLocaleString()} pts${what})` +
       `</option>`;
@@ -1247,7 +1255,16 @@ function renderAtlas() {
   paint(el, `<div class="atlas" id="atlas-plot">
       <div class="map-bar">${projector}${picker}</div>
       <div class="map-bar">${note}
-        <span>${d.mode === "reference" ? "shared layout" : "fitted on the cohort"}</span>
+        <span title="${d.mode === "stored"
+            ? "coordinates kept in the store, so this is a lookup rather than a projection"
+            : d.mode === "reference"
+              ? "placed into a saved layout by transforming"
+              : "fitted over these points alone"}">${
+          d.mode === "stored" ? "from the store"
+            : d.mode === "reference" ? "shared layout" : "fitted on the cohort"}</span>
+        ${d.missing ? `<span class="bad" title="these points were embedded after
+          this projection was fitted, so it has no coordinates for them">${
+          d.missing} points not in this projection</span>` : ""}
         ${stale}</div>
       <div class="samples">${chips}</div>
       <!-- Its own row, and a fixed height. This text changes on every hover

@@ -146,6 +146,17 @@ class LakeBusy(RuntimeError):
     """Someone else held the lake for longer than we were willing to wait."""
 
 
+# What contention looks like. Anything else is a configuration problem and
+# will fail identically on the next attempt.
+_LOCK_HINTS = ("lock", "being used by another", "conflicting lock",
+               "already open", "permission denied", "resource busy")
+
+
+def _is_lock_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(h in text for h in _LOCK_HINTS)
+
+
 def _base(target: str, files: str):
     import duckdb
 
@@ -219,18 +230,31 @@ def _attached(target, read_only: bool, budget: float) -> Iterator:
         files += "/"
 
     con = _base(target, files)
-    opts = f"DATA_PATH {_sql_str(files)}"
+    # OVERRIDE_DATA_PATH because the catalog records where its parquet was when
+    # it was created, as an absolute path - so a lake copied anywhere else
+    # refuses to attach. We always know where the files are (beside the
+    # catalog, or wherever SAE_LAKE_DATA says), so the recorded path is not
+    # information we need. Without this, handing someone a dump of the store
+    # does not work, which is most of the point of keeping things in it.
+    opts = f"DATA_PATH {_sql_str(files)}, OVERRIDE_DATA_PATH true"
     if read_only:
         opts += ", READ_ONLY"
     stmt = f"ATTACH {_sql_str(attach_target(target))} AS lake ({opts})"
 
-    deadline, attempt, last = time.monotonic() + budget, 0, None
+    deadline, attempt = time.monotonic() + budget, 0
     while True:
         try:
             con.execute(stmt)
             break
-        except Exception as exc:                  # the lock is held; wait and retry
-            last = exc
+        except Exception as exc:
+            # Only contention is worth waiting out. A misconfiguration fails
+            # the same way every time, so retrying it just turns an instant,
+            # accurate error into a slow, misleading one - this used to spend
+            # the whole budget on a wrong DATA_PATH and then blame another
+            # process for holding the lock.
+            if not _is_lock_error(exc):
+                con.close()
+                raise
             if time.monotonic() >= deadline:
                 con.close()
                 raise LakeBusy(
@@ -325,6 +349,35 @@ def ensure_schema(con, registry, levels) -> dict[str, list[str]]:
             rows_written BIGINT,
             snapshot_id BIGINT,
             written TIMESTAMP
+        )""")
+
+    # Projections. A layout is coordinates, and coordinates are a table - so
+    # they live here rather than beside the store in a pickle. That is what
+    # makes a dump of the lake enough: whoever opens it sees the same
+    # dashboard, with the same maps to choose from, and no 109 MB joblib to
+    # pass around separately.
+    #
+    # Only the coordinates are kept, not the fitted reducer. Drawing a point
+    # that was in the fit is a join; placing one that was not needs the
+    # reducer, and a pickled estimator is version-fragile in a way a table is
+    # not. A sample added after a projection was fitted simply has no
+    # coordinates in it, which the UI reports rather than guesses at.
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS projection (
+            name VARCHAR NOT NULL,
+            sample VARCHAR NOT NULL,
+            gene_id VARCHAR NOT NULL,
+            x FLOAT, y FLOAT,
+            role VARCHAR          -- 'cohort' or 'anchor'
+        )""")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS projection_meta (
+            name VARCHAR NOT NULL,
+            n BIGINT,
+            built TIMESTAMP,
+            params VARCHAR,
+            sources VARCHAR,
+            note VARCHAR
         )""")
 
     out: dict[str, list[str]] = {}
@@ -469,6 +522,70 @@ def runs(con, sample: str | None = None) -> list[dict]:
             "seconds": r[7], "rows": r[8], "snapshot": r[9], "written": r[10],
         })
     return out
+
+
+# --------------------------------------------------------------------------
+# projections
+# --------------------------------------------------------------------------
+def store_projection(con, name: str, rows, n: int, params: dict,
+                     sources: list, note: str = "") -> int:
+    """Replace one projection's coordinates. `rows` is an arrow table.
+
+    Columns: sample, gene_id, x, y, role. Replacing wholesale rather than
+    merging, so re-importing a refitted layout cannot leave half the old one
+    behind.
+    """
+    import json
+
+    con.execute("DELETE FROM projection WHERE name = ?", [name])
+    con.execute("DELETE FROM projection_meta WHERE name = ?", [name])
+    con.register("_proj", rows)
+    try:
+        con.execute(
+            "INSERT INTO projection (name, sample, gene_id, x, y, role) "
+            "SELECT ?, sample, gene_id, x, y, role FROM _proj", [name])
+    finally:
+        con.unregister("_proj")
+    con.execute(
+        "INSERT INTO projection_meta VALUES (?, ?, now()::TIMESTAMP, ?, ?, ?)",
+        [name, n, json.dumps(params, default=str),
+         json.dumps(sources, default=str), note])
+    return rows.num_rows
+
+
+def projections(con) -> list[dict]:
+    """Every projection in the store, with what it was fitted on."""
+    import json
+
+    out = []
+    try:
+        rows = con.execute(
+            "SELECT name, n, built::VARCHAR, params, sources, note "
+            "FROM projection_meta ORDER BY built DESC").fetchall()
+    except Exception:
+        return []
+    for name, n, built, params, sources, note in rows:
+        def _j(v, d):
+            try:
+                return json.loads(v) if v else d
+            except (TypeError, ValueError):
+                return d
+        counts = dict(con.execute(
+            "SELECT role, count(*) FROM projection WHERE name = ? GROUP BY role",
+            [name]).fetchall())
+        out.append({"name": name, "n": n, "built": built,
+                    "params": _j(params, {}), "sources": _j(sources, []),
+                    "note": note, "stored": sum(counts.values()),
+                    "by_role": counts})
+    return out
+
+
+def projection_xy(con, name: str) -> dict:
+    """(sample, gene_id) -> (x, y, role) for one projection."""
+    rows = con.execute(
+        "SELECT sample, gene_id, x, y, role FROM projection WHERE name = ?",
+        [name]).fetchall()
+    return {(s, g): (x, y, r) for s, g, x, y, r in rows}
 
 
 def register_sample(con, sample: str, source_kind: str = "",

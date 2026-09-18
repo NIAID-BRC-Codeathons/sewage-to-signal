@@ -1101,14 +1101,45 @@ class Handler(BaseHTTPRequestHandler):
         return self._json({"run": run_id, "stages": out})
 
     def _maps(self) -> list[dict]:
-        """Every layout on disk, described. Cheap: summaries are cached.
+        """Every projection that can be offered, the store's first.
 
-        A layout is available because its file is there, so building a new one
-        is all it takes to offer it - nothing here holds a list.
+        A projection kept in the store needs nothing else to be usable - which
+        is the point: hand someone a dump of the lake and they get the same
+        picker with the same layouts, no 100 MB pickles to pass alongside.
+        Listing them is a query, so this stays cheap enough to call on load.
+
+        A `.joblib` on disk that the store does not have is still offered,
+        because it can place points by transforming even though it cannot do it
+        by lookup. One that the store *does* have is not listed twice.
         """
+        out, seen = [], set()
+        if lake is not None:
+            try:
+                with lake.read(self.cfg["lake"], budget=5) as con:
+                    for pr in lake.projections(con):
+                        seen.add(pr["name"])
+                        out.append({
+                            "name": pr["name"], "n": pr["n"] or pr["stored"],
+                            "built": pr["built"], "note": pr["note"],
+                            "params": pr["params"],
+                            # What it was fitted on, by name - that is the
+                            # difference a person is choosing between. Role
+                            # counts are carried separately rather than
+                            # standing in for it.
+                            "sources": [{"name": Path(x).stem, "n": None}
+                                        for x in (pr["sources"] or [])]
+                                       or [{"name": k, "n": v} for k, v
+                                           in sorted(pr["by_role"].items())],
+                            "by_role": pr["by_role"],
+                            "where": "store", "stored": pr["stored"],
+                        })
+            except Exception as exc:
+                self.cfg["maps_error"] = str(exc)[:200]
+
         cache = self.cfg.setdefault("map_summaries", {})
-        out = []
         for path in reference_map.discover(self.cfg["reference_dir"]):
+            if path.stem in seen:
+                continue
             key = (str(path), path.stat().st_mtime)
             if key not in cache:
                 try:
@@ -1119,7 +1150,7 @@ class Handler(BaseHTTPRequestHandler):
                     cache[key] = {"name": path.stem, "path": str(path),
                                   "error": str(exc)[:200]}
             if cache[key]:
-                out.append(cache[key])
+                out.append({**cache[key], "where": "file"})
         return out
 
     def _reference(self, name: str | None = None):
@@ -1309,34 +1340,76 @@ class Handler(BaseHTTPRequestHandler):
         cache[limit] = (stamp, (ids, m, thinned, descs, rows))
         return stamp, ids, m, thinned, descs, rows
 
+    def _stored_xy(self, map_name: str, ids):
+        """Coordinates for these points from the store, if it has them.
+
+        A projection kept in the lake is a table, so placing a point is a
+        lookup rather than a UMAP transform - no minute of waiting, and no
+        pickled estimator needed at all. Returns None when the store has no
+        such projection or when it names none of these points, which is what
+        happens to a layout fitted against a cohort that has since been renamed.
+        """
+        if lake is None or not map_name or map_name == "fit":
+            return None
+        try:
+            with lake.read(self.cfg["lake"], budget=5) as con:
+                known = {r[0] for r in con.execute(
+                    "SELECT name FROM projection_meta").fetchall()}
+                if map_name not in known:
+                    return None
+                found = lake.projection_xy(con, map_name)
+        except Exception:
+            return None
+        if not found:
+            return None
+        import numpy as np
+
+        xy, miss = np.zeros((len(ids), 2), dtype=np.float32), 0
+        for i, key in enumerate(ids):
+            sample, _, gene = key.partition(metadata.KEY_SEP)
+            hit = found.get((sample, gene))
+            if hit is None:
+                miss += 1
+            else:
+                xy[i] = (hit[0], hit[1])
+        if miss == len(ids):
+            return None                      # names nothing we are drawing
+        return xy, miss
+
     def _atlas_layout(self, limit: int, map_name: str | None = None):
         """Coordinates for one layout. Only this part differs between maps."""
         stamp, ids, m, thinned, descs, rows = self._atlas_data(limit)
         cache = self.cfg.setdefault("atlas_xy", {})
         ckey = (limit, map_name or "")
         hit = cache.get(ckey)
+        missing = 0
         if hit and hit[0] == stamp:
-            xy, mode = hit[1]
+            xy, mode, missing = hit[1]
         else:
-            ref = None if map_name == "fit" else self._reference(map_name)
-            try:
-                if ref is not None:
-                    xy, mode = _transform(ref, m), "reference"
-                else:
+            stored = self._stored_xy(map_name or "", ids)
+            if stored is not None:
+                xy, missing = stored
+                mode = "stored"
+            else:
+                ref = None if map_name == "fit" else self._reference(map_name)
+                try:
+                    if ref is not None:
+                        xy, mode = _transform(ref, m), "reference"
+                    else:
+                        xy, mode = _fit_layout(m), "cohort"
+                except Exception:
                     xy, mode = _fit_layout(m), "cohort"
-            except Exception:
-                xy, mode = _fit_layout(m), "cohort"
             # Keep several. Comparing layouts is the reason a chooser exists,
             # and re-transforming 30,000 points into a dense map costs a
             # minute - paying that on every toggle would make the comparison
             # not worth making. Coordinates only, so each entry is small.
-            cache[ckey] = (stamp, (xy, mode))
+            cache[ckey] = (stamp, (xy, mode, missing))
             for old in list(cache)[:-ATLAS_CACHE_KEEP]:
                 cache.pop(old, None)
 
         return {"ids": ids, "xy": xy, "mode": mode, "descs": descs,
                 "rows": rows, "thinned": thinned, "total": len(ids),
-                "stamp": stamp, "map": map_name or ""}
+                "stamp": stamp, "map": map_name or "", "missing": missing}
 
     def _atlas(self, color: str, limit: int, map_name: str = ""):
         """The cohort as a backdrop, with per-sample membership carried along.
@@ -1381,6 +1454,10 @@ class Handler(BaseHTTPRequestHandler):
             "samples": samples, "counts": counts,
             "color": column, "domain": domain, "columns": usable,
             "thinned": built["thinned"],
+            # Points the chosen layout has no stored coordinates for - a sample
+            # embedded after it was fitted. Reported rather than hidden: they
+            # would otherwise be drawn at the origin and read as a real cluster.
+            "missing": built.get("missing", 0),
             # Echoed so a selection can name the layout it was made on. The
             # cap is what decides which proteins are in `points` at all, so a
             # selection resolved against a different one would resolve to
