@@ -127,7 +127,9 @@ MAX_PROJECTION_POINTS = 20000
 MAX_ATLAS_POINTS = 30000
 # How many projections to keep placed at once, so switching between them is
 # free after the first visit to each.
-ATLAS_CACHE_KEEP = 3
+# Enough for every layout on disk plus "fit on this cohort", so a demo can
+# move between them without paying for a re-transform. Coordinates only.
+ATLAS_CACHE_KEEP = 6
 
 # UMAP is numba, and numba's default `workqueue` threading layer is not
 # threadsafe: called from two Python threads at once it does not raise, it
@@ -1217,22 +1219,21 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return None
 
-    def _atlas_layout(self, limit: int, map_name: str | None = None):
-        """Every embedding in the store, in one 2D layout. Cached per snapshot.
+    def _atlas_data(self, limit: int):
+        """The cohort's activations and metadata, thinned. Independent of map.
 
-        The expensive half - reading half a million activations and running
-        UMAP over them - depends only on what is in the store, so it is keyed
-        on the snapshot id and survives every colour change and every hover.
-        Colour is applied per request from the cached coordinates.
+        Reading half a million activations and building the sparse matrix costs
+        the same whichever layout places the result, and the gene metadata is
+        identical across all of them - so it is cached once per snapshot rather
+        than once per layout. Before this split, holding three layouts meant
+        holding three copies of the same 14,000-gene metadata.
         """
-        cache = self.cfg.setdefault("atlas_cache", {})
-        # The layout depends on which map placed it, so that is part of the key.
-        ckey = (limit, map_name or "")
+        cache = self.cfg.setdefault("atlas_data", {})
         with lake.read(self.cfg["lake"], budget=10) as con:
             stamp = lake.snapshot_id(con)
-            hit = cache.get(ckey)
+            hit = cache.get(limit)
             if hit and hit[0] == stamp:
-                return hit[1]
+                return (stamp, *hit[1])
             # gene_id is unique only within a sample, so the matrix is keyed on
             # both - otherwise two samples' genes would collapse into one row.
             t = entities.select(
@@ -1252,33 +1253,43 @@ class Handler(BaseHTTPRequestHandler):
             keyed.select(["key", "feature_id", "activation"])
                  .rename_columns(["gene_id", "feature_id", "activation"]))
         m = normalise(m)
-
         # Thin per sample rather than over the whole cohort, so a small sample
         # is not rounded away by a large one - the point of the view is that
         # every sample is on it.
         ids, m, thinned = _cap_per_sample(ids, m, limit)
 
-        ref = None if map_name == "fit" else self._reference(map_name)
-        try:
-            if ref is not None:
-                xy, mode = _transform(ref, m), "reference"
-            else:
-                xy, mode = _fit_layout(m), "cohort"
-        except Exception:
-            xy, mode = _fit_layout(m), "cohort"
+        cache.clear()                       # one snapshot's worth is enough
+        cache[limit] = (stamp, (ids, m, thinned, descs, rows))
+        return stamp, ids, m, thinned, descs, rows
 
-        built = {"ids": ids, "xy": xy, "mode": mode, "descs": descs,
-                 "rows": rows, "thinned": thinned, "total": len(ids),
-                 "stamp": stamp, "map": map_name or ""}
-        # Keep a few, not one. Comparing layouts is the reason a chooser
-        # exists, and re-transforming 30,000 points into the dense map costs a
-        # minute - paying that on every toggle would make the comparison not
-        # worth making. Oldest out first; each entry is coordinates and
-        # metadata, not the matrix.
-        cache[ckey] = (stamp, built)
-        for old in list(cache)[:-ATLAS_CACHE_KEEP]:
-            cache.pop(old, None)
-        return built
+    def _atlas_layout(self, limit: int, map_name: str | None = None):
+        """Coordinates for one layout. Only this part differs between maps."""
+        stamp, ids, m, thinned, descs, rows = self._atlas_data(limit)
+        cache = self.cfg.setdefault("atlas_xy", {})
+        ckey = (limit, map_name or "")
+        hit = cache.get(ckey)
+        if hit and hit[0] == stamp:
+            xy, mode = hit[1]
+        else:
+            ref = None if map_name == "fit" else self._reference(map_name)
+            try:
+                if ref is not None:
+                    xy, mode = _transform(ref, m), "reference"
+                else:
+                    xy, mode = _fit_layout(m), "cohort"
+            except Exception:
+                xy, mode = _fit_layout(m), "cohort"
+            # Keep several. Comparing layouts is the reason a chooser exists,
+            # and re-transforming 30,000 points into a dense map costs a
+            # minute - paying that on every toggle would make the comparison
+            # not worth making. Coordinates only, so each entry is small.
+            cache[ckey] = (stamp, (xy, mode))
+            for old in list(cache)[:-ATLAS_CACHE_KEEP]:
+                cache.pop(old, None)
+
+        return {"ids": ids, "xy": xy, "mode": mode, "descs": descs,
+                "rows": rows, "thinned": thinned, "total": len(ids),
+                "stamp": stamp, "map": map_name or ""}
 
     def _atlas(self, color: str, limit: int, map_name: str = ""):
         """The cohort as a backdrop, with per-sample membership carried along.
