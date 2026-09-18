@@ -125,6 +125,9 @@ MAX_PROJECTION_POINTS = 20000
 # not the store's: these are plain SVG circles with no handlers, and past
 # roughly this many the first paint starts to drag.
 MAX_ATLAS_POINTS = 30000
+# How many projections to keep placed at once, so switching between them is
+# free after the first visit to each.
+ATLAS_CACHE_KEEP = 3
 
 # UMAP is numba, and numba's default `workqueue` threading layer is not
 # threadsafe: called from two Python threads at once it does not raise, it
@@ -248,6 +251,7 @@ def preview(p: Path, limit: int) -> dict:
 # reference-map builder so a run is projected exactly as the corpus was fitted.
 from launcher import (Job, failure_hint,  # noqa: E402
                       load_jobs, make_launcher, save_job, script_text)
+import reference_map                                                        # noqa: E402
 from reference_map import load as load_reference                            # noqa: E402
 from reference_map import normalise, sparse_from_table                      # noqa: E402
 import metadata                                           # noqa: E402
@@ -276,10 +280,32 @@ def _fit_layout(m):
                          min_dist=0.1).fit_transform(m)
 
 
+# Densifying the whole matrix at once is 2.1 GB at cohort scale, which is fine
+# on a workstation and not fine everywhere. Transform in slices instead: the
+# layout is per-row, so the result is identical and the peak is bounded.
+DENSE_CHUNK = 4000
+
+
 def _transform(ref, m):
-    """Place rows in the reference layout. Same lock, same reason."""
+    """Place rows in the reference layout. Same lock, same reason.
+
+    A map fitted on a dense matrix will not accept a sparse one - and above
+    ~4096 points fitting dense is the only way to get a layout that survives
+    being saved and loaded again, so this is the normal case for any map built
+    over a real cohort.
+    """
+    import numpy as np
+
+    dense = ref.get("input_form") == "dense"
     with _LAYOUT_LOCK:
-        return ref["reducer"].transform(m)
+        if not dense:
+            return ref["reducer"].transform(m)
+        out = []
+        for i in range(0, m.shape[0], DENSE_CHUNK):
+            block = m[i:i + DENSE_CHUNK]
+            out.append(ref["reducer"].transform(
+                np.asarray(block.todense(), dtype=np.float32)))
+        return np.vstack(out) if len(out) > 1 else out[0]
 
 
 def _cap_per_sample(ids, m, limit):
@@ -782,14 +808,21 @@ class Handler(BaseHTTPRequestHandler):
                                     (q.get("mode") or ["reference"])[0],
                                     (q.get("b") or [""])[0],
                                     (q.get("color") or [""])[0],
-                                    (q.get("filter") or [""])[0])
+                                    (q.get("filter") or [""])[0],
+                                    (q.get("map") or [""])[0])
+        if u.path == "/api/maps":
+            return self._json({
+                "maps": self._maps(),
+                "default": Path(self.cfg["reference_path"]).stem,
+            })
         if u.path == "/api/atlas":
             try:
                 limit = int((q.get("limit") or ["0"])[0]) or MAX_ATLAS_POINTS
             except ValueError:
                 limit = MAX_ATLAS_POINTS
             return self._atlas((q.get("color") or [""])[0],
-                               max(500, min(limit, MAX_ATLAS_POINTS)))
+                               max(500, min(limit, MAX_ATLAS_POINTS)),
+                               (q.get("map") or [""])[0])
         if u.path == "/api/preview":
             try:
                 limit = int((q.get("limit") or ["0"])[0]) or PREVIEW_ROWS
@@ -1018,15 +1051,56 @@ class Handler(BaseHTTPRequestHandler):
                 out[stage] = files
         return self._json({"run": run_id, "stages": out})
 
-    def _reference(self):
-        """The shared layout, loaded once. None when there is no map yet."""
-        if "reference" not in self.cfg:
+    def _maps(self) -> list[dict]:
+        """Every layout on disk, described. Cheap: summaries are cached.
+
+        A layout is available because its file is there, so building a new one
+        is all it takes to offer it - nothing here holds a list.
+        """
+        cache = self.cfg.setdefault("map_summaries", {})
+        out = []
+        for path in reference_map.discover(self.cfg["reference_dir"]):
+            key = (str(path), path.stat().st_mtime)
+            if key not in cache:
+                try:
+                    ref = self._reference(path.stem)
+                    cache[key] = (reference_map.summarise(path, ref)
+                                  if ref else None)
+                except Exception as exc:
+                    cache[key] = {"name": path.stem, "path": str(path),
+                                  "error": str(exc)[:200]}
+            if cache[key]:
+                out.append(cache[key])
+        return out
+
+    def _reference(self, name: str | None = None):
+        """One layout by name, loaded once and kept. None when there is none.
+
+        `name` is a file stem, so it is whatever the chooser listed. Falling
+        back to the default rather than erroring keeps a stale bookmark or a
+        deleted map from breaking the page.
+        """
+        loaded = self.cfg.setdefault("references", {})
+        chosen = self._map_path(name)
+        if chosen is None:
+            return None
+        key = str(chosen)
+        if key not in loaded:
             try:
-                self.cfg["reference"] = load_reference(self.cfg["reference_path"])
+                loaded[key] = load_reference(chosen)
             except Exception as exc:
-                self.cfg["reference"] = None
-                self.cfg["reference_error"] = str(exc)
-        return self.cfg["reference"]
+                loaded[key] = None
+                self.cfg.setdefault("reference_errors", {})[key] = str(exc)
+        return loaded[key]
+
+    def _map_path(self, name: str | None) -> Path | None:
+        """Resolve a layout name to a file, or the default when it does not."""
+        if name:
+            for p in reference_map.discover(self.cfg["reference_dir"]):
+                if p.stem == name:
+                    return p
+        default = Path(self.cfg["reference_path"])
+        return default if default.is_file() else None
 
     def _features(self, run_id: str):
         """A sample's feature hits as (sample, gene ids, L2-normalised matrix).
@@ -1097,7 +1171,7 @@ class Handler(BaseHTTPRequestHandler):
         """
         from scipy.sparse import vstack
 
-        ref = self._reference() if mode == "reference" else None
+        ref = self._reference(map_name) if mode == "reference" else None
         context: list = []
         try:
             if ref is not None:
@@ -1143,7 +1217,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return None
 
-    def _atlas_layout(self, limit: int):
+    def _atlas_layout(self, limit: int, map_name: str | None = None):
         """Every embedding in the store, in one 2D layout. Cached per snapshot.
 
         The expensive half - reading half a million activations and running
@@ -1152,9 +1226,11 @@ class Handler(BaseHTTPRequestHandler):
         Colour is applied per request from the cached coordinates.
         """
         cache = self.cfg.setdefault("atlas_cache", {})
+        # The layout depends on which map placed it, so that is part of the key.
+        ckey = (limit, map_name or "")
         with lake.read(self.cfg["lake"], budget=10) as con:
             stamp = lake.snapshot_id(con)
-            hit = cache.get(limit)
+            hit = cache.get(ckey)
             if hit and hit[0] == stamp:
                 return hit[1]
             # gene_id is unique only within a sample, so the matrix is keyed on
@@ -1182,7 +1258,7 @@ class Handler(BaseHTTPRequestHandler):
         # every sample is on it.
         ids, m, thinned = _cap_per_sample(ids, m, limit)
 
-        ref = self._reference()
+        ref = None if map_name == "fit" else self._reference(map_name)
         try:
             if ref is not None:
                 xy, mode = _transform(ref, m), "reference"
@@ -1193,12 +1269,18 @@ class Handler(BaseHTTPRequestHandler):
 
         built = {"ids": ids, "xy": xy, "mode": mode, "descs": descs,
                  "rows": rows, "thinned": thinned, "total": len(ids),
-                 "stamp": stamp}
-        cache.clear()                       # one layout at a time is plenty
-        cache[limit] = (stamp, built)
+                 "stamp": stamp, "map": map_name or ""}
+        # Keep a few, not one. Comparing layouts is the reason a chooser
+        # exists, and re-transforming 30,000 points into the dense map costs a
+        # minute - paying that on every toggle would make the comparison not
+        # worth making. Oldest out first; each entry is coordinates and
+        # metadata, not the matrix.
+        cache[ckey] = (stamp, built)
+        for old in list(cache)[:-ATLAS_CACHE_KEEP]:
+            cache.pop(old, None)
         return built
 
-    def _atlas(self, color: str, limit: int):
+    def _atlas(self, color: str, limit: int, map_name: str = ""):
         """The cohort as a backdrop, with per-sample membership carried along.
 
         Everything is sent once and hovering is done in the browser: the
@@ -1208,7 +1290,7 @@ class Handler(BaseHTTPRequestHandler):
         if entities is None:
             return self._err(503, "the pipeline registry is unavailable")
         try:
-            built = self._atlas_layout(limit)
+            built = self._atlas_layout(limit, map_name or None)
         except ValueError as exc:
             return self._err(404, str(exc))
         except ImportError as exc:
@@ -1236,7 +1318,7 @@ class Handler(BaseHTTPRequestHandler):
         for p in points:
             counts[p["i"]] += 1
         return self._json({
-            "snapshot": built["stamp"],
+            "snapshot": built["stamp"], "map": built.get("map") or "",
             "mode": built["mode"], "n": len(points), "points": points,
             "samples": samples, "counts": counts,
             "color": column, "domain": domain, "columns": usable,
@@ -1244,7 +1326,7 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _projection(self, run_id: str, mode: str, b_id: str = "",
-                    color: str = "", filt: str = ""):
+                    color: str = "", filt: str = "", map_name: str = ""):
         """One run's proteins in 2D, or two runs drawn in the same 2D.
 
         The overlay is the reason the layout is fixed rather than fitted per
@@ -1561,6 +1643,9 @@ def main():
     Handler.cfg = {
         "roots": roots, "data": data, "uploads": uploads, "python": a.python,
         "reference_path": a.reference,
+        # Layouts are discovered here rather than listed, so building one makes
+        # it selectable.
+        "reference_dir": Path(a.reference).parent,
         "lake": a.lake or lake.default_target(REPO) if lake else None,
         "runner": runner,
         # Mirrors run.sh's bind table, so a host path can be rewritten to the

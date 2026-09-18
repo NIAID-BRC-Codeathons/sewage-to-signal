@@ -141,6 +141,40 @@ def load(path: Path) -> dict | None:
     return ref
 
 
+def summarise(path: Path, ref: dict) -> dict:
+    """What a chooser needs to tell one layout from another, without loading it.
+
+    `source` records which input file each point came from, so a map fitted
+    with a pathogen panel can say so - that is the difference a person is
+    actually choosing between.
+    """
+    from collections import Counter
+    by_source = Counter(ref.get("source") or [])
+    return {
+        "name": path.stem,
+        "path": str(path),
+        "n": ref.get("n"),
+        "built": ref.get("built"),
+        "inputs": [Path(i).name for i in (ref.get("inputs") or [])],
+        "sources": [{"name": k, "n": v} for k, v in sorted(by_source.items())],
+        "params": ref.get("params") or {},
+        # Above ~4096 points UMAP builds a pynndescent index, and the sparse
+        # form of it does not survive pickling with the pinned versions. Maps
+        # fitted dense to get round that need dense input to transform.
+        "input_form": ref.get("input_form", "sparse"),
+        "note": ref.get("note"),
+        "version_drift": ref.get("version_drift"),
+    }
+
+
+def discover(directory: Path) -> list[Path]:
+    """Every layout in a directory, newest first. A map is a file being there."""
+    d = Path(directory)
+    if not d.is_dir():
+        return []
+    return sorted(d.glob("*.joblib"), key=lambda p: -p.stat().st_mtime)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)

@@ -1109,6 +1109,14 @@ async function runCount(node) {
   } catch (e) { el.textContent = e.message; el.className = "hint bad"; }
 }
 
+async function loadMaps() {
+  try {
+    const d = await api("/api/maps");
+    MAPS = (d.maps || []).filter(m => !m.error);
+    MAPS_DEFAULT = d.default || "";
+  } catch { MAPS = []; }
+}
+
 async function loadPipeline() {
   PIPELINE = await api("/api/pipeline");
   $("fast").onchange = renderOptions;
@@ -1143,6 +1151,9 @@ async function loadPipeline() {
 // ---------------------------------------------------------------------------
 let atlasData = null, atlasErr = null, atlasColor = "", atlasHi = null,
     atlasPending = false, atlasStale = false;
+// Available layouts, from /api/maps. A layout is a file on disk, so this is
+// whatever has been built - nothing here names one.
+let MAPS = [], MAPS_DEFAULT = "", atlasMap = "";
 const ATLAS_W = 900, ATLAS_H = 460, ATLAS_PAD = 22;
 const ATLAS_IDLE = "hover a sample to light it up";
 
@@ -1170,6 +1181,22 @@ function renderAtlas() {
       `<option value="${esc(c.name)}"${c.name === d.color ? " selected" : ""}>` +
       `${esc(c.name)}</option>`).join("") + `</select>`;
 
+  // Which layout placed these points. A shared layout means coordinates are
+  // comparable across runs; fitting on the cohort is internally comparable and
+  // comparable with nothing else, so it is named as such rather than offered
+  // as just another option.
+  const mapOpts = MAPS.map(m => {
+    const what = m.sources && m.sources.length > 1
+      ? ` · ${m.sources.map(x => x.name.replace(/\.parquet$/, "")).join(" + ")}`
+      : "";
+    return `<option value="${esc(m.name)}"${m.name === (d.map || MAPS_DEFAULT)
+      ? " selected" : ""}>${esc(m.name)} (${m.n.toLocaleString()} pts${what})` +
+      `</option>`;
+  }).join("");
+  const projector = `<span>projection</span><select id="atlas-map">${mapOpts}` +
+    `<option value="fit"${d.map === "fit" ? " selected" : ""}>` +
+    `fit on this cohort (not comparable to other runs)</option></select>`;
+
   const chips = d.samples.map((name, i) =>
     `<span class="s" data-sample="${i}" title="${esc(name)}: ` +
     `${d.counts[i]} embedded proteins"><b>${esc(name)}</b>` +
@@ -1193,7 +1220,8 @@ function renderAtlas() {
     : "";
 
   paint(el, `<div class="atlas" id="atlas-plot">
-      <div class="map-bar">${picker}${note}
+      <div class="map-bar">${projector}${picker}</div>
+      <div class="map-bar">${note}
         <span>${d.mode === "reference" ? "shared layout" : "fitted on the cohort"}</span>
         ${stale}</div>
       <div class="samples">${chips}</div>
@@ -1254,6 +1282,18 @@ function bindAtlas() {
   };
   const sel = $("atlas-colour");
   if (sel) sel.onchange = () => { atlasColor = sel.value; loadAtlas(true); };
+  const mp = $("atlas-map");
+  if (mp) mp.onchange = () => {
+    atlasMap = mp.value; atlasHi = null;
+    // Placing 30,000 points in a layout fitted on a cohort takes about a
+    // minute the first time and nothing at all after, so say so rather than
+    // look hung.
+    atlasData = null; atlasErr = null;
+    paint($("atlas"), `<p class="empty">projecting every embedding into ` +
+      `<b>${esc(mp.value)}</b>… the first time takes up to a minute; ` +
+      `it is cached after that.</p>`);
+    loadAtlas(true);
+  };
   const again = $("atlas-rebuild");
   if (again) again.onclick = () => { atlasStale = false; loadAtlas(true); };
 }
@@ -1262,8 +1302,10 @@ async function loadAtlas(force) {
   if (atlasPending || (atlasData && !force)) return;
   atlasPending = true;
   try {
-    atlasData = await api("/api/atlas" +
-      (atlasColor ? "?color=" + encodeURIComponent(atlasColor) : ""));
+    const q = new URLSearchParams();
+    if (atlasColor) q.set("color", atlasColor);
+    if (atlasMap) q.set("map", atlasMap);
+    atlasData = await api("/api/atlas" + (q.toString() ? "?" + q : ""));
     atlasErr = null; atlasStale = false;
   } catch (e) {
     atlasErr = e.message; atlasData = null;
@@ -1345,6 +1387,7 @@ $("go").onclick = async () => {
   $("go").disabled = false;
 };
 
+loadMaps().catch(() => {});
 loadPipeline().catch(e => {
   $("msg").className = "msg err";
   $("msg").textContent = "cannot read the pipeline description: " + e.message;

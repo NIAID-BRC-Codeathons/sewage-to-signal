@@ -22,7 +22,9 @@ data/pfam/
 # Fitted reference layout. Derived, and a pickle whose validity depends on
 # library versions — build with sae/web/reference_map.py, share the file
 # deliberately rather than by committing one built from a laptop's scratch.
-data/reference_map.joblib
+# Fitted UMAP layouts. Derived, and large - the cohort+pathogen map is 56 MB.
+# Rebuilt from the store rather than committed.
+data/*.joblib
 
 # The store. Derived from inputs that are themselves fetched, and it grows with
 # every run, so it is rebuilt rather than committed: `backfill.py` loads an
