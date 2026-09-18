@@ -26,6 +26,11 @@ data/pfam/
 # Rebuilt from the store rather than committed.
 data/*.joblib
 
+# Lake dumps made for sharing. Derived, and large enough to notice.
+*.ducklake
+*.ducklake.files/
+sae-lake*.tgz
+
 # The store. Derived from inputs that are themselves fetched, and it grows with
 # every run, so it is rebuilt rather than committed: `backfill.py` loads an
 # existing work/ into it, and re-running a sample refills it.
